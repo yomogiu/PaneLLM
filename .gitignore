@@ -1,0 +1,15 @@
+.venv/
+broker/.data/
+__pycache__/
+*.py[cod]
+
+.DS_Store
+.env
+.env.*
+!.env.example
+
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.vscode/
+.idea/
