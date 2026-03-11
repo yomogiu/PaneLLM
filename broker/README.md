@@ -22,7 +22,7 @@ Optional environment variables:
 - `LLAMA_API_KEY` (optional)
 - `OPENAI_API_KEY` (enables Codex Responses mode)
 - `OPENAI_BASE_URL` (default `https://api.openai.com/v1`)
-- `OPENAI_CODEX_MODEL` (default `gpt-5.3-codex-spark`)
+- `OPENAI_CODEX_MODEL` (default `gpt-5.3-codex`)
 - `OPENAI_CODEX_REASONING_EFFORT` (default `medium`)
 - `OPENAI_CODEX_MAX_OUTPUT_TOKENS` (default `1800`)
 - `CODEX_COMMAND` (optional legacy fallback command)

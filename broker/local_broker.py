@@ -562,7 +562,7 @@ def load_config() -> BrokerConfig:
     llama_api_key = os.environ.get("LLAMA_API_KEY")
     openai_api_key = os.environ.get("OPENAI_API_KEY")
     openai_base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    openai_codex_model = os.environ.get("OPENAI_CODEX_MODEL", "gpt-5.3-codex-spark")
+    openai_codex_model = os.environ.get("OPENAI_CODEX_MODEL", "gpt-5.3-codex")
     openai_codex_reasoning_effort = os.environ.get("OPENAI_CODEX_REASONING_EFFORT", "medium")
     openai_codex_max_output_tokens = int(os.environ.get("OPENAI_CODEX_MAX_OUTPUT_TOKENS", "1800"))
     codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
