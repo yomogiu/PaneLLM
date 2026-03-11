@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Secure Assistant Chat</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button
+            id="history-toggle-btn"
+            class="ghost icon-button history-toggle"
+            aria-expanded="false"
+            aria-controls="history-panel"
+            aria-label="Toggle chat history"
+            title="Chats"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 5.5A1.5 1.5 0 0 1 5.5 4h3A1.5 1.5 0 0 1 10 5.5v13A1.5 1.5 0 0 1 8.5 20h-3A1.5 1.5 0 0 1 4 18.5zM14 5.5A1.5 1.5 0 0 1 15.5 4h3A1.5 1.5 0 0 1 20 5.5v3A1.5 1.5 0 0 1 18.5 10h-3A1.5 1.5 0 0 1 14 8.5zm0 8A1.5 1.5 0 0 1 15.5 12h3a1.5 1.5 0 0 1 1.5 1.5v5a1.5 1.5 0 0 1-1.5 1.5h-3a1.5 1.5 0 0 1-1.5-1.5z" />
+            </svg>
+          </button>
+          <select id="backend" class="topbar-select" autocomplete="off" aria-label="Assistant backend">
+            <option value="codex" selected>Codex</option>
+            <option value="llama">llama.cpp</option>
+            <option value="mlx">MLX Local</option>
+          </select>
+        </div>
+        <div class="topbar-right">
+          <label class="toggle compact">
+            <input id="include-page-context" type="checkbox" />
+            <span>Page context</span>
+          </label>
+          <label class="toggle compact">
+            <input id="force-browser-action" type="checkbox" />
+            <span>Browser action</span>
+          </label>
+          <span id="context-usage" class="status-badge context-badge hidden">Context: --/--</span>
+          <button
+            id="new-session-btn"
+            class="ghost icon-button"
+            aria-label="Start a new chat"
+            title="New Chat"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M5 4.75A1.75 1.75 0 0 1 6.75 3h6.69a1.75 1.75 0 0 1 1.24.51l3.81 3.81A1.75 1.75 0 0 1 19 8.56v8.69A1.75 1.75 0 0 1 17.25 19H6.75A1.75 1.75 0 0 1 5 17.25zM14 4.5V8h3.5" />
+              <path d="M9 12h6M12 9v6" />
+            </svg>
+          </button>
+          <button
+            id="delete-chat-btn"
+            class="ghost icon-button danger-tone"
+            aria-label="Delete this chat"
+            title="Delete Chat"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M7 7l10 10M17 7L7 17" />
+            </svg>
+          </button>
+
+          <section id="action-confirm" class="action-confirm hidden" aria-hidden="true" aria-live="polite">
+            <p id="action-confirm-title" class="action-confirm-title">Confirm Action</p>
+            <p id="action-confirm-text" class="action-confirm-text"></p>
+            <div class="button-row action-confirm-actions">
+              <button id="action-confirm-btn" class="danger">Confirm</button>
+              <button id="action-cancel-btn" class="ghost">Cancel</button>
+            </div>
+          </section>
+        </div>
+      </header>
+
+      <nav class="main-tabs" role="tablist" aria-label="Main tabs">
+        <button
+          id="chat-tab-btn"
+          class="tab-btn active"
+          role="tab"
+          aria-selected="true"
+          aria-controls="chat-view"
+        >
+          Chat
+        </button>
+        <button
+          id="models-tab-btn"
+          class="tab-btn"
+          role="tab"
+          aria-selected="false"
+          aria-controls="models-view"
+        >
+          Models
+        </button>
+        <button
+          id="tools-tab-btn"
+          class="tab-btn"
+          role="tab"
+          aria-selected="false"
+          aria-controls="tools-view"
+        >
+          Tools
+        </button>
+      </nav>
+
+      <section id="chat-view" class="view chat-view" role="tabpanel">
+        <div id="history-backdrop" class="history-backdrop" aria-hidden="true"></div>
+
+        <aside id="history-panel" class="history-panel" aria-hidden="true">
+          <div class="history-header">
+            <h2>History</h2>
+            <div class="history-actions">
+              <button
+                id="history-pin-btn"
+                class="ghost small icon-button"
+                aria-label="Pin history panel"
+                aria-pressed="false"
+                title="Pin history"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M15.5 4.5l4 4-2.25.75-2.5 4.25-2-2-4.25 2.5.75-2.25-4-4 10-5.25zM11 14.5L6 19.5" />
+                </svg>
+              </button>
+              <button id="refresh-history-btn" class="ghost small">Refresh</button>
+              <button id="history-close-btn" class="ghost small" aria-label="Close history panel">Close</button>
+            </div>
+          </div>
+          <div id="history-list" class="history-list"></div>
+        </aside>
+
+        <section id="messages" class="messages" aria-live="polite">
+          <p id="empty-state" class="empty-state">Ask anything to start the chat.</p>
+        </section>
+
+        <section id="risk-confirm" class="risk-confirm hidden" aria-live="polite">
+          <p id="risk-text"></p>
+          <div class="button-row">
+            <button id="confirm-btn" class="danger">Confirm Action</button>
+            <button id="cancel-btn" class="ghost">Cancel</button>
+          </div>
+        </section>
+
+        <footer class="composer">
+          <textarea
+            id="prompt"
+            rows="3"
+            autocomplete="off"
+            placeholder="Message the assistant..."
+          ></textarea>
+          <div class="composer-row">
+            <button id="stop-btn" class="ghost hidden" type="button">Stop</button>
+            <button id="send-btn">Send</button>
+          </div>
+        </footer>
+      </section>
+
+      <section id="models-view" class="view models-view hidden" role="tabpanel" aria-hidden="true">
+        <section class="models-card">
+          <div class="models-head">
+            <h2>Models</h2>
+            <button id="mlx-refresh-btn" class="ghost small" type="button">Refresh</button>
+          </div>
+
+          <label class="models-field">
+            <span>Backend</span>
+            <select id="models-backend">
+              <option value="mlx" selected>MLX Local</option>
+            </select>
+          </label>
+
+          <label class="models-field">
+            <span>Model Path</span>
+            <input id="mlx-model-path" type="text" readonly />
+          </label>
+
+          <p id="mlx-runtime-status" class="models-status">MLX status unknown.</p>
+
+          <div class="button-row models-session-actions">
+            <button id="mlx-start-btn" type="button">Start MLX</button>
+            <button id="mlx-stop-btn" class="ghost" type="button">Stop MLX</button>
+            <button id="mlx-restart-btn" class="ghost" type="button">Restart MLX</button>
+          </div>
+        </section>
+
+        <section class="models-card">
+          <h3>Generation</h3>
+          <div class="models-grid">
+            <label class="models-field">
+              <span>Temperature</span>
+              <input id="mlx-temperature" type="number" step="0.05" min="0" />
+            </label>
+            <label class="models-field">
+              <span>Top P</span>
+              <input id="mlx-top-p" type="number" step="0.01" min="0" max="1" />
+            </label>
+            <label class="models-field">
+              <span>Top K</span>
+              <input id="mlx-top-k" type="number" step="1" min="1" />
+            </label>
+            <label class="models-field">
+              <span>Max Tokens</span>
+              <input id="mlx-max-tokens" type="number" step="1" min="16" />
+            </label>
+            <label class="models-field">
+              <span>Repetition Penalty</span>
+              <input id="mlx-repetition-penalty" type="number" step="0.05" min="0.1" />
+            </label>
+            <label class="models-field">
+              <span>Seed (optional)</span>
+              <input id="mlx-seed" type="number" step="1" />
+            </label>
+            <label class="models-field models-field-full">
+              <span>Reasoning</span>
+              <div class="checkbox-label">
+                <input id="mlx-enable-thinking" type="checkbox" />
+                <span>Enable Thinking (`<think>` generation)</span>
+              </div>
+            </label>
+            <label class="models-field models-field-full">
+              <span>System Prompt (optional)</span>
+              <textarea
+                id="mlx-system-prompt"
+                rows="4"
+                placeholder="You are a helpful local assistant."
+              ></textarea>
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="mlx-apply-btn" type="button">Apply Settings</button>
+          </div>
+        </section>
+
+        <section class="models-card">
+          <h3>LoRA Adapters</h3>
+          <div id="mlx-adapter-list" class="models-adapter-list"></div>
+          <div class="models-grid">
+            <label class="models-field">
+              <span>Adapter Path</span>
+              <input id="mlx-adapter-path" type="text" placeholder="/path/to/adapter" />
+            </label>
+            <label class="models-field">
+              <span>Adapter Name</span>
+              <input id="mlx-adapter-name" type="text" placeholder="optional label" />
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="mlx-load-adapter-btn" type="button">Load Adapter</button>
+            <button id="mlx-unload-adapter-btn" class="ghost" type="button">Unload Adapter</button>
+          </div>
+        </section>
+
+        <section class="models-card">
+          <h3>Runtime Trends</h3>
+          <p id="mlx-latency-trend" class="models-trend">Latency: (no data)</p>
+          <p id="mlx-tps-trend" class="models-trend">Tokens/sec: (no data)</p>
+          <p id="mlx-restart-trend" class="models-trend">Restarts: success 0 / failed 0</p>
+        </section>
+
+        <section class="models-card">
+          <h3>Inference Contract</h3>
+          <p id="mlx-contract" class="models-contract">(no contract metadata)</p>
+        </section>
+      </section>
+
+      <section id="tools-view" class="view tools-view hidden" role="tabpanel" aria-hidden="true">
+        <section class="tools-card">
+          <div class="tools-head">
+            <h2>Tools</h2>
+            <button id="tools-refresh-btn" class="ghost small" type="button">Refresh</button>
+          </div>
+          <p id="tools-policy-status" class="tools-status">Loading page policy...</p>
+          <label class="tools-field">
+            <span>Host</span>
+            <input id="tools-host-input" type="text" placeholder="example.com" />
+          </label>
+          <div class="button-row tools-actions">
+            <button id="tools-allow-btn" type="button">Allow Host</button>
+            <button id="tools-block-btn" class="ghost" type="button">Disallow Host</button>
+            <button id="tools-allow-active-btn" class="ghost" type="button">Allow Current Tab</button>
+          </div>
+        </section>
+
+        <section class="tools-card">
+          <h3>Allowlist</h3>
+          <div id="tools-allowed-list" class="tools-list"></div>
+        </section>
+
+        <section class="tools-card">
+          <h3>Disallow List</h3>
+          <div id="tools-blocked-list" class="tools-list"></div>
+        </section>
+
+        <section class="tools-card">
+          <h3>MCP Servers</h3>
+          <p class="tools-muted">Reserved for MCP server toggles and additional tool controls.</p>
+          <label class="toggle compact">
+            <input id="tools-mcp-placeholder" type="checkbox" disabled />
+            <span>Broker MCP bridge (coming soon)</span>
+          </label>
+        </section>
+      </section>
+    </main>
+    <script type="module" src="sidepanel.js"></script>
+  </body>
+</html>

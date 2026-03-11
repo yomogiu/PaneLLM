@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "PaneLLM",
+  "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwfMgOzgf0hlxQ9u9CQxyS4e2DMLVEMmkghtPC+CTyyuYyGnvE+h+yxmoYord3RP07ALcuQ9Z715D8VpUz9GWh8BSl4fc2X40OeOj3pxsA810KWRCNshRUXYnUPddQYWV3mRm7qWLbAlqGJXy/N42rO6QDQcdW4MGeQ6JKh4w9MEHJ7ER8P/MWvsO5Bz36NAJHWan36nRZj09iXIkXmkP2q+ZhDcov5kWYe8awrFNHFd8HMeGroRiJPitynf/aii1DXrQcHhJjvgI//DeqZPcpsqAvhLdBJG7MI/Jw4dnqgnS4cNwweK+6EJ1pZK/wZjcokJoM5/fFBIWd7cQ5q3/uQIDAQAB",
+  "description": "Dark vaporwave side panel that routes prompts to a localhost broker (llama-first, Codex optional).",
+  "minimum_chrome_version": "116",
+  "action": {
+    "default_title": "Open PaneLLM"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "permissions": [
+    "sidePanel",
+    "activeTab",
+    "scripting",
+    "tabs",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "https://google.com/*",
+    "https://www.google.com/*",
+    "http://arxiv.org/*",
+    "https://arxiv.org/*",
+    "http://www.arxiv.org/*",
+    "https://www.arxiv.org/*"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src http://127.0.0.1:7777 http://localhost:7777; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+  }
+}
