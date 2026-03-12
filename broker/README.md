@@ -141,8 +141,8 @@ Event feed notes:
 
 Approval policy in v1:
 
-- Auto-approve: `browser.get_tabs`, `browser.describe_session_tabs`, `browser.get_content`, `browser.scroll`, `browser.switch_tab`, `browser.focus_tab`
-- Manual approval: `browser.navigate`, `browser.open_tab`, `browser.click`, `browser.type`, `browser.press_key`, `browser.close_tab`, `browser.group_tabs`
+- Auto-approve: `browser.get_tabs`, `browser.describe_session_tabs`, `browser.get_content`, `browser.find_one`, `browser.find_elements`, `browser.wait_for`, `browser.get_element_state`, `browser.scroll`, `browser.switch_tab`, `browser.focus_tab`
+- Manual approval: `browser.navigate`, `browser.open_tab`, `browser.click`, `browser.type`, `browser.press_key`, `browser.close_tab`, `browser.group_tabs`, `browser.select_option`
 - Non-allowlisted hosts are denied before the extension executes anything
 
 ## Codex CLI fallback
@@ -355,18 +355,51 @@ MLX worker contract is explicit and versioned so future training pipelines can t
 
 ## Browser automation API
 
-The broker keeps the manual test endpoint:
+The broker exposes browser-agent config plus the manual test endpoint:
+
+- `GET /browser/config`
+- `POST /browser/config`
 
 - `POST /browser/tools/call`
+
+`/browser/config` response shape:
+
+```json
+{
+  "ok": true,
+  "browser": {
+    "agent_max_steps": 20,
+    "limits": {
+      "agent_max_steps": {
+        "min": 1,
+        "max": 40
+      }
+    }
+  }
+}
+```
+
+`POST /browser/config` request shape:
+
+```json
+{
+  "agent_max_steps": 20
+}
+```
 
 Request shape:
 
 ```json
 {
-  "name": "browser.session_create | browser.run_start | browser.run_cancel | browser.approvals_list | browser.events_replay | browser.approve | browser.navigate | browser.get_content | browser.get_tabs | browser.open_tab | browser.switch_tab | browser.close_tab | browser.focus_tab | browser.group_tabs | browser.describe_session_tabs | browser.click | browser.type | browser.press_key | browser.scroll",
+  "name": "browser.session_create | browser.run_start | browser.run_cancel | browser.approvals_list | browser.events_replay | browser.approve | browser.navigate | browser.get_content | browser.get_tabs | browser.open_tab | browser.switch_tab | browser.close_tab | browser.focus_tab | browser.group_tabs | browser.describe_session_tabs | browser.click | browser.type | browser.press_key | browser.scroll | browser.find_one | browser.find_elements | browser.wait_for | browser.get_element_state | browser.select_option",
   "arguments": {}
 }
 ```
+
+Notes:
+
+- `browser.get_content` now defaults to a compact navigation digest.
+- Pass `{"mode":"raw_html"}` in `arguments` only when raw HTML is explicitly required.
 
 Response shape:
 

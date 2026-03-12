@@ -2,6 +2,8 @@
 
 Local-first assistant stack with a localhost broker, a Chrome side panel UI, and broker-managed browser automation.
 
+Current release target: `v0.1.0`.
+
 ## Architecture
 
 ```
@@ -89,6 +91,8 @@ Chrome Side Panel (UI + user actions)
 - Required header: `X-Assistant-Client: chrome-sidepanel-v1`.
 - If `Origin` exists, it must be `chrome-extension://...`.
 - Browser/page-context actions are host-allowlisted in extension runtime.
+- Default extension allowlist: `127.0.0.1`, `localhost`, `google.com`, `www.google.com`, `arxiv.org`, `www.arxiv.org`.
+- Runtime allow/disallow hosts can be customized in the side panel **Tools** tab. Permanent defaults live in `chrome_secure_panel/background.js` and matching `manifest.json` host permissions.
 - High-risk prompts require explicit confirmation.
 - OpenAI/Codex credentials stay broker-side; extension never stores chat in persistent local storage.
 
@@ -178,7 +182,7 @@ If you call `/health` without `X-Assistant-Client`, `403` is expected.
 
 Open the side panel and check that broker status shows online. Then send a simple prompt.
 
-If you plan to let the assistant read or act on live pages, use the side panel **Tools** tab to allowlist the active host first. By default, browser actions stay limited to local hosts.
+If you plan to let the assistant read or act on live pages, check the side panel **Tools** tab first. The extension ships with a small built-in allowlist (`127.0.0.1`, `localhost`, `google.com`, `www.google.com`, `arxiv.org`, `www.arxiv.org`), and you can add or block hosts there at runtime.
 
 ### 6) Optional CLI
 

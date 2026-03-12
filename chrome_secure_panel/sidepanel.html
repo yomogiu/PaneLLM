@@ -279,6 +279,18 @@
         </section>
 
         <section class="tools-card">
+          <h3>Browser Agent</h3>
+          <p class="tools-muted">Configure the local llama/MLX browser-agent loop without changing Codex behavior.</p>
+          <label class="tools-field">
+            <span>Agent Max Steps</span>
+            <input id="tools-agent-max-steps" type="number" min="1" max="40" step="1" />
+          </label>
+          <div class="button-row tools-actions">
+            <button id="tools-browser-apply-btn" type="button">Apply Browser Settings</button>
+          </div>
+        </section>
+
+        <section class="tools-card">
           <h3>Allowlist</h3>
           <div id="tools-allowed-list" class="tools-list"></div>
         </section>

@@ -51,6 +51,11 @@ CODEX_APPROVAL_TEXT_PREVIEW_CHARS = 120
 CODEX_EVENT_POLL_MIN_TIMEOUT_MS = 0
 CODEX_EVENT_POLL_MAX_TIMEOUT_MS = 30000
 MLX_MAX_CONTEXT_CHARS_CAP = 56000
+BROWSER_AGENT_MAX_STEPS_DEFAULT = 20
+BROWSER_AGENT_MAX_STEPS_MIN = 1
+BROWSER_AGENT_MAX_STEPS_MAX = 40
+BROWSER_GET_CONTENT_MODE_NAVIGATION = "navigation"
+BROWSER_GET_CONTENT_MODE_RAW_HTML = "raw_html"
 CODEX_RUN_TERMINAL_STATUSES = {
     "completed",
     "failed",
@@ -68,6 +73,10 @@ CODEX_AUTO_APPROVE_TOOLS = {
     "browser.get_tabs",
     "browser.describe_session_tabs",
     "browser.get_content",
+    "browser.find_one",
+    "browser.find_elements",
+    "browser.wait_for",
+    "browser.get_element_state",
     "browser.scroll",
     "browser.switch_tab",
     "browser.focus_tab",
@@ -80,6 +89,7 @@ CODEX_MANUAL_APPROVAL_TOOLS = {
     "browser.press_key",
     "browser.close_tab",
     "browser.group_tabs",
+    "browser.select_option",
 }
 UNTRUSTED_INSTRUCTION_PATTERN = re.compile(
     r"("
@@ -178,6 +188,11 @@ BROWSER_TOOL_NAMES = {
     "browser.type",
     "browser.press_key",
     "browser.scroll",
+    "browser.find_one",
+    "browser.find_elements",
+    "browser.wait_for",
+    "browser.get_element_state",
+    "browser.select_option",
 }
 BROWSER_COMMAND_METHODS = {
     "browser.navigate": "navigate",
@@ -193,6 +208,11 @@ BROWSER_COMMAND_METHODS = {
     "browser.type": "type",
     "browser.press_key": "press_key",
     "browser.scroll": "scroll",
+    "browser.find_one": "find_one",
+    "browser.find_elements": "find_elements",
+    "browser.wait_for": "wait_for",
+    "browser.get_element_state": "get_element_state",
+    "browser.select_option": "select_option",
 }
 BROWSER_MLX_TOOL_NAME_ALIASES = {
     "open_page": "browser.navigate",
@@ -201,7 +221,6 @@ BROWSER_MLX_TOOL_NAME_ALIASES = {
     "goto": "browser.navigate",
 }
 BROWSER_APPROVAL_MODES = {"auto-approve", "manual", "auto-deny"}
-BROWSER_AGENT_MAX_STEPS = 6
 LLAMA_CHAT_SYSTEM_PROMPT = (
     "Answer as the assistant only. Do not emit USER:, ASSISTANT:, or SYSTEM: role labels. "
     "Do not continue the conversation by inventing additional turns. "
@@ -227,7 +246,9 @@ MLX_BROWSER_AGENT_SYSTEM_PROMPT = (
     "Canonical tool names are: "
     "`browser.navigate`, `browser.open_tab`, `browser.get_tabs`, `browser.switch_tab`, "
     "`browser.close_tab`, `browser.focus_tab`, `browser.group_tabs`, `browser.describe_session_tabs`, "
-    "`browser.click`, `browser.type`, `browser.press_key`, `browser.scroll`, `browser.get_content`. "
+    "`browser.click`, `browser.type`, `browser.press_key`, `browser.scroll`, `browser.get_content`, "
+    "`browser.find_one`, `browser.find_elements`, `browser.wait_for`, `browser.get_element_state`, "
+    "`browser.select_option`. "
     "Tool JSON must be one of these shapes: "
     "{\"name\": \"browser.navigate\", \"arguments\": {...}, \"tool_call_id\": \"id\"} or "
     "[{\"name\": \"browser.navigate\", ...}, ...]. "
@@ -239,6 +260,26 @@ MLX_BROWSER_AGENT_SYSTEM_PROMPT = (
 def normalize_mlx_tool_name(tool_name: str) -> str:
     normalized = str(tool_name or "").strip()
     return BROWSER_MLX_TOOL_NAME_ALIASES.get(normalized, normalized)
+
+
+BROWSER_LOCATOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "selector": {"type": "string"},
+        "text": {"type": "string"},
+        "label": {"type": "string"},
+        "role": {"type": "string"},
+        "placeholder": {"type": "string"},
+        "name": {"type": "string"},
+        "exact": {"type": "boolean"},
+        "visible": {"type": "boolean"},
+        "index": {"type": "integer"},
+    },
+    "required": [],
+    "additionalProperties": False,
+}
+
+
 LLAMA_BROWSER_TOOLS = [
     {
         "type": "function",
@@ -441,15 +482,116 @@ LLAMA_BROWSER_TOOLS = [
         "type": "function",
         "function": {
             "name": "browser.get_content",
-            "description": "Get page HTML or element HTML from the target tab.",
+            "description": (
+                "Get a navigation-focused page digest from the target tab. "
+                "Use mode=raw_html only when raw HTML is explicitly required."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "tabId": {"type": "integer"},
                     "selector": {"type": "string"},
+                    "mode": {
+                        "type": "string",
+                        "enum": [
+                            BROWSER_GET_CONTENT_MODE_NAVIGATION,
+                            BROWSER_GET_CONTENT_MODE_RAW_HTML,
+                        ],
+                    },
                     "maxChars": {"type": "integer"},
+                    "maxItems": {"type": "integer"},
                 },
                 "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser.find_one",
+            "description": "Find one element using a semantic locator and return element metadata.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tabId": {"type": "integer"},
+                    "locator": BROWSER_LOCATOR_SCHEMA,
+                },
+                "required": ["locator"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser.find_elements",
+            "description": "Find matching elements using a semantic locator and return bounded element metadata.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tabId": {"type": "integer"},
+                    "locator": BROWSER_LOCATOR_SCHEMA,
+                    "limit": {"type": "integer"},
+                },
+                "required": ["locator"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser.wait_for",
+            "description": "Wait for an element locator to become present, visible, hidden, or gone.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tabId": {"type": "integer"},
+                    "locator": BROWSER_LOCATOR_SCHEMA,
+                    "condition": {
+                        "type": "string",
+                        "enum": ["present", "visible", "hidden", "gone"],
+                    },
+                    "timeoutMs": {"type": "integer"},
+                    "pollMs": {"type": "integer"},
+                },
+                "required": ["locator"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser.get_element_state",
+            "description": "Resolve one semantic locator and return rich element state metadata.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tabId": {"type": "integer"},
+                    "locator": BROWSER_LOCATOR_SCHEMA,
+                },
+                "required": ["locator"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser.select_option",
+            "description": "Select an option on a matched <select> by value, text, or optionIndex.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tabId": {"type": "integer"},
+                    "locator": BROWSER_LOCATOR_SCHEMA,
+                    "value": {"type": "string"},
+                    "text": {"type": "string"},
+                    "optionIndex": {"type": "integer"},
+                },
+                "required": ["locator"],
                 "additionalProperties": False,
             },
         },
@@ -1247,6 +1389,85 @@ MLX_CHAT_CONTRACT_BASE = {
     "tokenizer_template_mode": "apply_chat_template_default_v1",
     "max_context_behavior": "tail_truncate_chars_v1",
 }
+
+
+class BrowserConfigManager:
+    def __init__(self, data_dir: Path) -> None:
+        self._lock = threading.Lock()
+        self._config_path = data_dir / "browser_config.json"
+        self._agent_max_steps = BROWSER_AGENT_MAX_STEPS_DEFAULT
+        self._load_persisted_config()
+
+    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _load_json(self, path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _normalize_agent_max_steps(self, value: Any) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError("agent_max_steps must be an integer.") from error
+        if parsed < BROWSER_AGENT_MAX_STEPS_MIN or parsed > BROWSER_AGENT_MAX_STEPS_MAX:
+            raise ValueError(
+                f"agent_max_steps must be between {BROWSER_AGENT_MAX_STEPS_MIN} and {BROWSER_AGENT_MAX_STEPS_MAX}."
+            )
+        return parsed
+
+    def _config_payload_locked(self) -> dict[str, Any]:
+        return {
+            "agent_max_steps": self._agent_max_steps,
+            "limits": {
+                "agent_max_steps": {
+                    "min": BROWSER_AGENT_MAX_STEPS_MIN,
+                    "max": BROWSER_AGENT_MAX_STEPS_MAX,
+                }
+            },
+        }
+
+    def _load_persisted_config(self) -> None:
+        payload = self._load_json(self._config_path)
+        raw_steps = payload.get("agent_max_steps", payload.get("agentMaxSteps"))
+        if raw_steps is None:
+            return
+        try:
+            self._agent_max_steps = self._normalize_agent_max_steps(raw_steps)
+        except ValueError:
+            self._agent_max_steps = BROWSER_AGENT_MAX_STEPS_DEFAULT
+
+    def _save_persisted_config_locked(self) -> None:
+        self._write_json(
+            self._config_path,
+            {
+                "agent_max_steps": self._agent_max_steps,
+            },
+        )
+
+    def config(self) -> dict[str, Any]:
+        with self._lock:
+            return self._config_payload_locked()
+
+    def agent_max_steps(self) -> int:
+        with self._lock:
+            return self._agent_max_steps
+
+    def update_config(self, updates: dict[str, Any]) -> dict[str, Any]:
+        raw_steps = updates.get("agent_max_steps", updates.get("agentMaxSteps"))
+        with self._lock:
+            if raw_steps is not None:
+                self._agent_max_steps = self._normalize_agent_max_steps(raw_steps)
+                self._save_persisted_config_locked()
+            return self._config_payload_locked()
 
 
 class MlxRuntimeManager:
@@ -2497,6 +2718,17 @@ def scan_untrusted_instruction(value: Any) -> dict[str, str] | None:
     }
 
 
+def summarize_tool_locator(tool_args: dict[str, Any]) -> str:
+    locator = tool_args.get("locator")
+    if not isinstance(locator, dict):
+        return ""
+    for key in ("selector", "label", "text", "role", "placeholder", "name"):
+        value = truncate_text(locator.get(key, ""), 80)
+        if value:
+            return f"{key}={value}"
+    return ""
+
+
 def summarize_codex_tool_action(tool_name: str, tool_args: dict[str, Any]) -> dict[str, str]:
     summary = tool_name
     host = ""
@@ -2523,7 +2755,26 @@ def summarize_codex_tool_action(tool_name: str, tool_args: dict[str, Any]) -> di
         summary = f"{tool_name} {tool_args.get('deltaY', 600)}px"
     elif tool_name == "browser.get_content":
         selector = truncate_text(tool_args.get("selector", ""), 120)
-        summary = f"{tool_name} {selector or 'document'}"
+        mode = truncate_text(
+            tool_args.get("mode", BROWSER_GET_CONTENT_MODE_NAVIGATION),
+            32,
+        )
+        summary = f"{tool_name} {mode} {selector or 'document'}".strip()
+    elif tool_name in {
+        "browser.find_one",
+        "browser.find_elements",
+        "browser.wait_for",
+        "browser.get_element_state",
+    }:
+        selector = summarize_tool_locator(tool_args)
+        summary = f"{tool_name} {selector or 'locator'}".strip()
+    elif tool_name == "browser.select_option":
+        selector = summarize_tool_locator(tool_args)
+        option_value = truncate_text(tool_args.get("value", ""), CODEX_APPROVAL_TEXT_PREVIEW_CHARS)
+        option_text = truncate_text(tool_args.get("text", ""), CODEX_APPROVAL_TEXT_PREVIEW_CHARS)
+        option_index = tool_args.get("optionIndex")
+        text_preview = option_value or option_text or str(option_index or "")
+        summary = f"{tool_name} {selector or 'locator'}".strip()
     elif tool_name in {"browser.get_tabs", "browser.describe_session_tabs"}:
         summary = tool_name
     return {
@@ -3510,6 +3761,7 @@ class CodexRunManager:
 
 CONFIG = load_config()
 CONVERSATIONS = ConversationStore(CONFIG.data_dir)
+BROWSER_CONFIG = BrowserConfigManager(CONFIG.data_dir)
 EXTENSION_RELAY = ExtensionCommandRelay(CONFIG.extension_client_stale_sec)
 BROWSER_AUTOMATION = BrowserAutomationManager(CONFIG.browser_default_domain_allowlist)
 CODEX_RUNS = CodexRunManager(CONFIG.data_dir)
@@ -4405,6 +4657,7 @@ def run_mlx_browser_agent(
     session_id: str,
     messages: list[dict[str, Any]],
     allowed_hosts: list[str],
+    max_steps: int,
     cancel_check: Any = None,
     on_text_delta: Any = None,
 ) -> str:
@@ -4437,7 +4690,7 @@ def run_mlx_browser_agent(
     ]
 
     try:
-        for _ in range(BROWSER_AGENT_MAX_STEPS):
+        for _ in range(max(1, int(max_steps))):
             if cancel_check and cancel_check():
                 raise RouteRequestCancelledError("Request cancelled by user.")
 
@@ -4517,6 +4770,7 @@ def run_llama_browser_agent(
     session_id: str,
     messages: list[dict[str, Any]],
     allowed_hosts: list[str],
+    max_steps: int,
     cancel_check: Any = None,
 ) -> str:
     if cancel_check and cancel_check():
@@ -4541,7 +4795,7 @@ def run_llama_browser_agent(
     ]
 
     try:
-        for _ in range(BROWSER_AGENT_MAX_STEPS):
+        for _ in range(max(1, int(max_steps))):
             if cancel_check and cancel_check():
                 raise RouteRequestCancelledError("Request cancelled by user.")
             response = call_llama_completion(
@@ -4968,11 +5222,13 @@ def route_request(data: dict[str, Any]) -> dict[str, Any]:
             and (prompt_requests_browser_tools(prompt) or force_browser_action)
         )
         if should_use_browser_agent:
+            agent_max_steps = BROWSER_CONFIG.agent_max_steps()
             if backend == "llama":
                 answer = run_llama_browser_agent(
                     session_id,
                     messages,
                     allowed_hosts,
+                    agent_max_steps,
                     cancel_check=cancel_check,
                 )
             else:
@@ -4980,6 +5236,7 @@ def route_request(data: dict[str, Any]) -> dict[str, Any]:
                     session_id,
                     messages,
                     allowed_hosts,
+                    agent_max_steps,
                     cancel_check=cancel_check,
                 )
         elif backend == "llama":
@@ -5205,6 +5462,16 @@ def handle_mlx_adapters_unload(_data: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, **payload}
 
 
+def handle_browser_config_get() -> dict[str, Any]:
+    return {"ok": True, "browser": BROWSER_CONFIG.config()}
+
+
+def handle_browser_config_post(data: dict[str, Any]) -> dict[str, Any]:
+    updates = dict(data) if isinstance(data, dict) else {}
+    payload = BROWSER_CONFIG.update_config(updates)
+    return {"ok": True, "browser": payload}
+
+
 def handle_browser_tool_call(data: dict[str, Any]) -> dict[str, Any]:
     tool_name = str(data.get("name", "")).strip()
     args = data.get("arguments", {})
@@ -5238,7 +5505,7 @@ def handle_browser_tool_call(data: dict[str, Any]) -> dict[str, Any]:
 
 
 class BrokerHandler(BaseHTTPRequestHandler):
-    server_version = "LocalBroker/0.1"
+    server_version = "LocalBroker/0.1.0"
 
     def log_message(self, format: str, *args: Any) -> None:
         # Keep logs minimal and avoid prompt/data logging.
@@ -5301,6 +5568,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     "browser_automation": BROWSER_AUTOMATION.health(),
                 },
             )
+            return
+        if path == "/browser/config":
+            self._send_json(HTTPStatus.OK, handle_browser_config_get())
             return
         run_id, run_action = self._run_parts(path)
         if run_id and run_action == "events":
@@ -5394,6 +5664,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 result = {"ok": accepted}
             elif path == "/browser/tools/call":
                 result = handle_browser_tool_call(data)
+            elif path == "/browser/config":
+                result = handle_browser_config_post(data)
             else:
                 run_id, run_action = self._run_parts(path)
                 if run_id and run_action == "approval":

@@ -48,12 +48,20 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "browser.get_content",
-            "description": "Get content from the current page",
+            "description": (
+                "Get a navigation-focused summary from the current page. "
+                "Use mode=raw_html only when raw HTML is explicitly required."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "selector": {"type": "string"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["navigation", "raw_html"],
+                    },
                     "maxChars": {"type": "integer"},
+                    "maxItems": {"type": "integer"},
                 },
                 "required": [],
                 "additionalProperties": False,
