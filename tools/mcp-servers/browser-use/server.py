@@ -30,6 +30,23 @@ DEFAULT_ALLOWED_HOSTS = [
 ]
 APPROVAL_MODES = {"auto-approve", "manual", "auto-deny"}
 
+BROWSER_LOCATOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "selector": {"type": "string"},
+        "text": {"type": "string"},
+        "label": {"type": "string"},
+        "role": {"type": "string"},
+        "placeholder": {"type": "string"},
+        "name": {"type": "string"},
+        "exact": {"type": "boolean"},
+        "visible": {"type": "boolean"},
+        "index": {"type": "integer"},
+    },
+    "required": [],
+    "additionalProperties": False,
+}
+
 
 PROXIED_TOOL_DEFINITIONS = [
     {
@@ -204,6 +221,81 @@ PROXIED_TOOL_DEFINITIONS = [
                 "maxChars": {"type": "integer"},
             },
             "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "browser.find_one",
+        "description": "Find one element using a semantic locator and return element metadata.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": {"type": "integer"},
+                "locator": BROWSER_LOCATOR_SCHEMA,
+            },
+            "required": ["locator"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "browser.find_elements",
+        "description": "Find matching elements using a semantic locator and return bounded element metadata.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": {"type": "integer"},
+                "locator": BROWSER_LOCATOR_SCHEMA,
+                "limit": {"type": "integer"},
+            },
+            "required": ["locator"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "browser.wait_for",
+        "description": "Wait for an element locator to become present, visible, hidden, or gone.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": {"type": "integer"},
+                "locator": BROWSER_LOCATOR_SCHEMA,
+                "condition": {
+                    "type": "string",
+                    "enum": ["present", "visible", "hidden", "gone"],
+                },
+                "timeoutMs": {"type": "integer"},
+                "pollMs": {"type": "integer"},
+            },
+            "required": ["locator"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "browser.get_element_state",
+        "description": "Resolve one semantic locator and return rich element state metadata.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": {"type": "integer"},
+                "locator": BROWSER_LOCATOR_SCHEMA,
+            },
+            "required": ["locator"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "browser.select_option",
+        "description": "Select an option on a matched select element by value, text, or optionIndex.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": {"type": "integer"},
+                "locator": BROWSER_LOCATOR_SCHEMA,
+                "value": {"type": "string"},
+                "text": {"type": "string"},
+                "optionIndex": {"type": "integer"},
+            },
+            "required": ["locator"],
             "additionalProperties": False,
         },
     },

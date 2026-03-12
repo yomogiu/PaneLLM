@@ -23,7 +23,8 @@ const state = {
   modelsBusy: false,
   toolsBusy: false,
   toolsPolicy: null,
-  toolsActiveTab: null
+  toolsActiveTab: null,
+  toolsBrowserConfig: null
 };
 
 const appEl = document.querySelector(".app");
@@ -92,6 +93,8 @@ const toolsHostInputEl = $("tools-host-input");
 const toolsAllowBtn = $("tools-allow-btn");
 const toolsBlockBtn = $("tools-block-btn");
 const toolsAllowActiveBtn = $("tools-allow-active-btn");
+const toolsAgentMaxStepsEl = $("tools-agent-max-steps");
+const toolsBrowserApplyBtn = $("tools-browser-apply-btn");
 const toolsAllowedListEl = $("tools-allowed-list");
 const toolsBlockedListEl = $("tools-blocked-list");
 
@@ -280,6 +283,10 @@ toolsBlockBtn?.addEventListener("click", async () => {
 
 toolsAllowActiveBtn?.addEventListener("click", async () => {
   await allowActiveTabHost();
+});
+
+toolsBrowserApplyBtn?.addEventListener("click", async () => {
+  await applyBrowserConfigFromInputs();
 });
 
 toolsHostInputEl?.addEventListener("keydown", async (event) => {
@@ -825,6 +832,38 @@ function normalizeToolsPolicy(policy) {
   };
 }
 
+function normalizeBrowserConfig(config) {
+  const raw = config && typeof config === "object" ? config : {};
+  const limitsRaw = raw.limits && typeof raw.limits === "object" ? raw.limits : {};
+  const stepLimitsRaw =
+    limitsRaw.agent_max_steps && typeof limitsRaw.agent_max_steps === "object"
+      ? limitsRaw.agent_max_steps
+      : {};
+  const min = Number.isInteger(Number(stepLimitsRaw.min)) ? Number(stepLimitsRaw.min) : 1;
+  const max = Number.isInteger(Number(stepLimitsRaw.max)) ? Number(stepLimitsRaw.max) : 40;
+  const configured = Number.parseInt(String(raw.agent_max_steps ?? 20), 10);
+  const agentMaxSteps = Number.isInteger(configured) ? configured : 20;
+  return {
+    agent_max_steps: agentMaxSteps,
+    limits: {
+      agent_max_steps: {
+        min,
+        max
+      }
+    }
+  };
+}
+
+function renderBrowserConfig(config) {
+  const normalized = normalizeBrowserConfig(config);
+  state.toolsBrowserConfig = normalized;
+  if (toolsAgentMaxStepsEl) {
+    toolsAgentMaxStepsEl.min = String(normalized.limits.agent_max_steps.min);
+    toolsAgentMaxStepsEl.max = String(normalized.limits.agent_max_steps.max);
+    toolsAgentMaxStepsEl.value = String(normalized.agent_max_steps);
+  }
+}
+
 function setToolsBusy(busy) {
   state.toolsBusy = busy;
   const controls = [
@@ -832,7 +871,9 @@ function setToolsBusy(busy) {
     toolsHostInputEl,
     toolsAllowBtn,
     toolsBlockBtn,
-    toolsAllowActiveBtn
+    toolsAllowActiveBtn,
+    toolsAgentMaxStepsEl,
+    toolsBrowserApplyBtn
   ];
   for (const control of controls) {
     if (control) {
@@ -998,14 +1039,19 @@ function renderToolsPolicy(policy) {
 async function refreshToolsState(showErrors = true) {
   setToolsBusy(true);
   try {
-    const [policyResult, activeResult] = await Promise.all([
+    const [policyResult, activeResult, browserConfigResult] = await Promise.all([
       sendRuntimeMessage({ type: "assistant.tools.page_hosts.get" }),
-      sendRuntimeMessage({ type: "assistant.tools.page_hosts.active_tab" })
+      sendRuntimeMessage({ type: "assistant.tools.page_hosts.active_tab" }),
+      sendRuntimeMessage({ type: "assistant.tools.browser_config.get" })
     ]);
     if (!policyResult.ok) {
       throw new Error(policyResult.error || "Failed to load tool policy.");
     }
+    if (!browserConfigResult.ok) {
+      throw new Error(browserConfigResult.error || "Failed to load browser settings.");
+    }
     renderToolsPolicy(policyResult.policy);
+    renderBrowserConfig(browserConfigResult.browser);
     state.toolsActiveTab =
       activeResult.ok && activeResult.active_tab && typeof activeResult.active_tab === "object"
         ? activeResult.active_tab
@@ -1039,6 +1085,36 @@ async function runHostPolicyAction(message, successStatus) {
   } catch (error) {
     updateToolsStatus(`Tools error: ${String(error.message || error)}`);
     return false;
+  } finally {
+    setToolsBusy(false);
+  }
+}
+
+async function applyBrowserConfigFromInputs() {
+  const limits = state.toolsBrowserConfig?.limits?.agent_max_steps || { min: 1, max: 40 };
+  const parsed = Number.parseInt(String(toolsAgentMaxStepsEl?.value || "").trim(), 10);
+  if (!Number.isInteger(parsed)) {
+    updateToolsStatus("Agent max steps must be an integer.");
+    return;
+  }
+  if (parsed < limits.min || parsed > limits.max) {
+    updateToolsStatus(`Agent max steps must be between ${limits.min} and ${limits.max}.`);
+    return;
+  }
+
+  setToolsBusy(true);
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.tools.browser_config.update",
+      agentMaxSteps: parsed
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Failed to update browser settings.");
+    }
+    renderBrowserConfig(result.browser);
+    updateToolsStatus(`Browser agent max steps set to ${result.browser?.agent_max_steps ?? parsed}.`);
+  } catch (error) {
+    updateToolsStatus(`Tools error: ${String(error.message || error)}`);
   } finally {
     setToolsBusy(false);
   }

@@ -133,6 +133,12 @@ async function handleMessage(message) {
   if (message.type === "assistant.mlx.adapters.unload") {
     return await unloadMlxAdapter();
   }
+  if (message.type === "assistant.tools.browser_config.get") {
+    return await getBrowserConfig();
+  }
+  if (message.type === "assistant.tools.browser_config.update") {
+    return await updateBrowserConfig(message);
+  }
   if (message.type === "assistant.tools.page_hosts.get") {
     return { policy: getHostPolicySnapshot() };
   }
@@ -435,6 +441,20 @@ async function loadMlxAdapter(message) {
 
 async function unloadMlxAdapter() {
   return await brokerRequest("POST", "/mlx/adapters/unload", {});
+}
+
+async function getBrowserConfig() {
+  return await brokerRequest("GET", "/browser/config");
+}
+
+async function updateBrowserConfig(message) {
+  const body = {};
+  if (Object.prototype.hasOwnProperty.call(message || {}, "agentMaxSteps")) {
+    body.agent_max_steps = message.agentMaxSteps;
+  } else if (Object.prototype.hasOwnProperty.call(message || {}, "agent_max_steps")) {
+    body.agent_max_steps = message.agent_max_steps;
+  }
+  return await brokerRequest("POST", "/browser/config", body);
 }
 
 async function brokerRequest(method, path, body = null, options = {}) {
@@ -823,6 +843,84 @@ function ensureSelector(selector) {
   return selector.trim();
 }
 
+function normalizePositiveInt(value, defaultValue, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const parsed = Number.parseInt(String(value ?? defaultValue), 10);
+  if (!Number.isInteger(parsed)) {
+    return defaultValue;
+  }
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function normalizeLocator(rawLocator, options = {}) {
+  const defaultVisible =
+    Object.prototype.hasOwnProperty.call(options, "defaultVisible") ? options.defaultVisible : true;
+  const allowVisibility =
+    Object.prototype.hasOwnProperty.call(options, "allowVisibility") ? options.allowVisibility : true;
+  if (!rawLocator || typeof rawLocator !== "object" || Array.isArray(rawLocator)) {
+    throw new Error("Missing locator.");
+  }
+
+  const normalized = {};
+  let hasLocatorField = false;
+  for (const key of ["selector", "text", "label", "role", "placeholder", "name"]) {
+    if (typeof rawLocator[key] === "string" && rawLocator[key].trim().length > 0) {
+      normalized[key] = rawLocator[key].trim();
+      hasLocatorField = true;
+    }
+  }
+
+  if (!hasLocatorField) {
+    throw new Error("Locator requires selector, text, label, role, placeholder, or name.");
+  }
+
+  normalized.exact = rawLocator.exact === true;
+  normalized.index = normalizePositiveInt(rawLocator.index, 0, { min: 0, max: 100 });
+
+  if (allowVisibility) {
+    if (rawLocator.visible === true || rawLocator.visible === false) {
+      normalized.visible = rawLocator.visible;
+    } else {
+      normalized.visible = defaultVisible;
+    }
+  } else {
+    normalized.visible = null;
+  }
+
+  return normalized;
+}
+
+function normalizeWaitCondition(value) {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (["present", "visible", "hidden", "gone"].includes(normalized)) {
+    return normalized;
+  }
+  return "visible";
+}
+
+function normalizeSelectOptionRequest(args) {
+  const normalized = {};
+  let selectedModeCount = 0;
+
+  if (typeof args.value === "string") {
+    normalized.value = args.value;
+    selectedModeCount += 1;
+  }
+  if (typeof args.text === "string") {
+    normalized.text = args.text;
+    selectedModeCount += 1;
+  }
+  if (args.optionIndex !== undefined && args.optionIndex !== null && String(args.optionIndex).trim() !== "") {
+    normalized.optionIndex = normalizePositiveInt(args.optionIndex, 0, { min: 0, max: 10_000 });
+    selectedModeCount += 1;
+  }
+
+  if (selectedModeCount !== 1) {
+    throw new Error("select_option requires exactly one of value, text, or optionIndex.");
+  }
+
+  return normalized;
+}
+
 function parseTabId(tabId) {
   const parsed = Number.parseInt(String(tabId), 10);
   if (!Number.isInteger(parsed) || parsed < 0) {
@@ -959,6 +1057,297 @@ async function runInTab(tabId, func, args = []) {
   return results?.[0]?.result ?? null;
 }
 
+function runLocatorTaskInPage(task) {
+  const TEXT_PREVIEW_LIMIT = 160;
+  const VALUE_PREVIEW_LIMIT = 120;
+
+  function normalizeText(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function preview(value, limit) {
+    const text = normalizeText(value);
+    return text.length > limit ? text.slice(0, Math.max(1, limit - 3)) + "..." : text;
+  }
+
+  function matchesText(haystack, needle, exact) {
+    const left = normalizeText(haystack).toLowerCase();
+    const right = normalizeText(needle).toLowerCase();
+    if (!right) {
+      return true;
+    }
+    return exact ? left === right : left.includes(right);
+  }
+
+  function getRole(element) {
+    const explicitRole = normalizeText(element.getAttribute?.("role"));
+    if (explicitRole) {
+      return explicitRole.toLowerCase();
+    }
+    const tag = String(element.tagName || "").toLowerCase();
+    if (tag === "a" && element.hasAttribute("href")) {
+      return "link";
+    }
+    if (tag === "button") {
+      return "button";
+    }
+    if (tag === "textarea") {
+      return "textbox";
+    }
+    if (tag === "select") {
+      return "combobox";
+    }
+    if (tag === "option") {
+      return "option";
+    }
+    if (tag === "input") {
+      const type = String(element.getAttribute("type") || "text").toLowerCase();
+      if (["button", "submit", "reset"].includes(type)) {
+        return "button";
+      }
+      if (type === "checkbox") {
+        return "checkbox";
+      }
+      if (type === "radio") {
+        return "radio";
+      }
+      return "textbox";
+    }
+    return "";
+  }
+
+  function getElementText(element) {
+    return normalizeText(element.innerText || element.textContent || "");
+  }
+
+  function getLabelText(element) {
+    const values = [];
+    const ariaLabel = normalizeText(element.getAttribute?.("aria-label"));
+    if (ariaLabel) {
+      values.push(ariaLabel);
+    }
+
+    const labelledBy = normalizeText(element.getAttribute?.("aria-labelledby"));
+    if (labelledBy) {
+      for (const id of labelledBy.split(/\s+/)) {
+        const labelNode = id ? document.getElementById(id) : null;
+        const text = normalizeText(labelNode?.innerText || labelNode?.textContent || "");
+        if (text) {
+          values.push(text);
+        }
+      }
+    }
+
+    if (element.labels && element.labels.length > 0) {
+      for (const label of Array.from(element.labels)) {
+        const text = normalizeText(label?.innerText || label?.textContent || "");
+        if (text) {
+          values.push(text);
+        }
+      }
+    }
+
+    return normalizeText(values.join(" "));
+  }
+
+  function isVisible(element) {
+    const style = window.getComputedStyle(element);
+    if (!style || style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+      return false;
+    }
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function isEditable(element) {
+    return (
+      element instanceof HTMLInputElement ||
+      element instanceof HTMLTextAreaElement ||
+      element instanceof HTMLSelectElement ||
+      element.isContentEditable === true
+    );
+  }
+
+  function isEnabled(element) {
+    if ("disabled" in element) {
+      return element.disabled !== true;
+    }
+    return normalizeText(element.getAttribute?.("aria-disabled")).toLowerCase() !== "true";
+  }
+
+  function getValuePreview(element) {
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+      return preview(element.value, VALUE_PREVIEW_LIMIT);
+    }
+    if (element instanceof HTMLSelectElement) {
+      const selected = element.selectedOptions?.[0] || null;
+      return preview(selected?.text || selected?.value || "", VALUE_PREVIEW_LIMIT);
+    }
+    if (element.isContentEditable) {
+      return preview(element.textContent || "", VALUE_PREVIEW_LIMIT);
+    }
+    return "";
+  }
+
+  function buildElementSnapshot(element) {
+    const rect = element.getBoundingClientRect();
+    const label = getLabelText(element);
+    const selectedOption = element instanceof HTMLSelectElement ? element.selectedOptions?.[0] || null : null;
+    return {
+      tagName: String(element.tagName || "").toLowerCase(),
+      role: getRole(element) || null,
+      textPreview: preview(getElementText(element), TEXT_PREVIEW_LIMIT),
+      label: label || null,
+      name: normalizeText(element.getAttribute?.("name")) || null,
+      placeholder: normalizeText(element.getAttribute?.("placeholder")) || null,
+      valuePreview: getValuePreview(element) || null,
+      visible: isVisible(element),
+      enabled: isEnabled(element),
+      editable: isEditable(element),
+      checked: "checked" in element ? element.checked === true : null,
+      selected: element instanceof HTMLOptionElement ? element.selected === true : null,
+      selectedValue: element instanceof HTMLSelectElement ? String(element.value || "") : null,
+      selectedText: selectedOption ? preview(selectedOption.text || "", TEXT_PREVIEW_LIMIT) : null,
+      optionCount: element instanceof HTMLSelectElement ? element.options.length : null,
+      href: typeof element.href === "string" && element.href ? element.href : null,
+      src: typeof element.src === "string" && element.src ? element.src : null,
+      x: Math.round(rect.left + rect.width / 2),
+      y: Math.round(rect.top + rect.height / 2),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height)
+    };
+  }
+
+  function collectCandidates(locator) {
+    if (locator.selector) {
+      return Array.from(document.querySelectorAll(locator.selector));
+    }
+    return Array.from(document.querySelectorAll("*"));
+  }
+
+  function matchesNonVisibilityFilters(element, locator) {
+    if (locator.text && !matchesText(getElementText(element), locator.text, locator.exact)) {
+      return false;
+    }
+    if (locator.label && !matchesText(getLabelText(element), locator.label, locator.exact)) {
+      return false;
+    }
+    if (locator.role && !matchesText(getRole(element), locator.role, locator.exact)) {
+      return false;
+    }
+    if (locator.placeholder && !matchesText(element.getAttribute?.("placeholder"), locator.placeholder, locator.exact)) {
+      return false;
+    }
+    if (locator.name && !matchesText(element.getAttribute?.("name"), locator.name, locator.exact)) {
+      return false;
+    }
+    return true;
+  }
+
+  function queryElements(locator) {
+    const semanticMatches = collectCandidates(locator).filter((element) =>
+      matchesNonVisibilityFilters(element, locator)
+    );
+    const visibleMatches = semanticMatches.filter((element) => isVisible(element));
+    let matches = semanticMatches;
+    if (locator.visible === true) {
+      matches = visibleMatches;
+    } else if (locator.visible === false) {
+      matches = semanticMatches.filter((element) => !isVisible(element));
+    }
+    return {
+      semanticMatches,
+      visibleMatches,
+      matches
+    };
+  }
+
+  const locator = task?.locator || {};
+  const query = queryElements(locator);
+  const semanticMatches = query.semanticMatches;
+  const visibleMatches = query.visibleMatches;
+  const matches = query.matches;
+  const selectedElement =
+    Number.isInteger(locator.index) && locator.index >= 0 ? matches[locator.index] || null : matches[0] || null;
+
+  if (task?.kind === "probe") {
+    return {
+      totalCount: semanticMatches.length,
+      visibleCount: visibleMatches.length,
+      firstMatch: semanticMatches[0] ? buildElementSnapshot(semanticMatches[0]) : null,
+      firstVisible: visibleMatches[0] ? buildElementSnapshot(visibleMatches[0]) : null
+    };
+  }
+
+  if (task?.kind === "find_one") {
+    return {
+      found: Boolean(selectedElement),
+      matchCount: matches.length,
+      visibleCount: visibleMatches.length,
+      element: selectedElement ? buildElementSnapshot(selectedElement) : null
+    };
+  }
+
+  if (task?.kind === "find_elements") {
+    const limit = Number.isInteger(task.limit) ? Math.max(1, Math.min(task.limit, 20)) : 10;
+    return {
+      matchCount: matches.length,
+      visibleCount: visibleMatches.length,
+      elements: matches.slice(0, limit).map((element) => buildElementSnapshot(element))
+    };
+  }
+
+  if (task?.kind === "get_state") {
+    return {
+      found: Boolean(selectedElement),
+      matchCount: matches.length,
+      visibleCount: visibleMatches.length,
+      element: selectedElement ? buildElementSnapshot(selectedElement) : null
+    };
+  }
+
+  if (task?.kind === "select_option") {
+    if (!selectedElement) {
+      return { ok: false, error: "locator_not_found", matchCount: matches.length };
+    }
+    if (!(selectedElement instanceof HTMLSelectElement)) {
+      return { ok: false, error: "not_select", matchCount: matches.length };
+    }
+
+    let option = null;
+    if (Number.isInteger(task.optionIndex)) {
+      option = selectedElement.options[task.optionIndex] || null;
+    } else if (typeof task.value === "string") {
+      option = Array.from(selectedElement.options).find((item) => item.value === task.value) || null;
+    } else if (typeof task.text === "string") {
+      option =
+        Array.from(selectedElement.options).find(
+          (item) => normalizeText(item.text).toLowerCase() === normalizeText(task.text).toLowerCase()
+        ) || null;
+    }
+
+    if (!option) {
+      return { ok: false, error: "option_not_found", matchCount: matches.length };
+    }
+
+    selectedElement.value = option.value;
+    option.selected = true;
+    selectedElement.dispatchEvent(new Event("input", { bubbles: true }));
+    selectedElement.dispatchEvent(new Event("change", { bubbles: true }));
+
+    return {
+      ok: true,
+      matchCount: matches.length,
+      selectedValue: option.value,
+      selectedText: preview(option.text || "", TEXT_PREVIEW_LIMIT),
+      selectedIndex: option.index,
+      element: buildElementSnapshot(selectedElement)
+    };
+  }
+
+  throw new Error(`Unsupported locator task: ${String(task?.kind || "")}`);
+}
+
 async function startBrokerCommandLoop() {
   if (relayLoopStarted) {
     return;
@@ -1049,6 +1438,16 @@ async function executeBrokerCommand(method, args) {
       return await commandScroll(args, allowedHosts);
     case "get_content":
       return await commandGetContent(args, allowedHosts);
+    case "find_one":
+      return await commandFindOne(args, allowedHosts);
+    case "find_elements":
+      return await commandFindElements(args, allowedHosts);
+    case "wait_for":
+      return await commandWaitFor(args, allowedHosts);
+    case "get_element_state":
+      return await commandGetElementState(args, allowedHosts);
+    case "select_option":
+      return await commandSelectOption(args, allowedHosts);
     default:
       throw new Error(`Unsupported command method: ${method}`);
   }
@@ -1429,42 +1828,581 @@ async function commandScroll(args, allowedHosts) {
   return result;
 }
 
+function runGetContentTaskInPage(task) {
+  const RAW_MAX_CHARS_DEFAULT = 6_000;
+  const RAW_MAX_CHARS_LIMIT = 50_000;
+  const NAV_MAX_CHARS_DEFAULT = 1_200;
+  const NAV_MAX_CHARS_LIMIT = 6_000;
+  const NAV_MAX_ITEMS_DEFAULT = 10;
+  const NAV_MAX_ITEMS_LIMIT = 20;
+  const FIELD_PREVIEW_LIMIT = 120;
+  const TEXT_PREVIEW_LIMIT = 160;
+  const HEADING_PREVIEW_LIMIT = 120;
+
+  function normalizeText(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function clipText(value, limit) {
+    const text = normalizeText(value);
+    if (!limit || text.length <= limit) {
+      return text;
+    }
+    if (limit <= 3) {
+      return text.slice(0, limit);
+    }
+    return `${text.slice(0, Math.max(1, limit - 3))}...`;
+  }
+
+  function toPositiveInt(value, fallback, min, max) {
+    const parsed = Number.parseInt(String(value ?? fallback), 10);
+    if (!Number.isInteger(parsed)) {
+      return fallback;
+    }
+    return Math.min(max, Math.max(min, parsed));
+  }
+
+  function escapeSelectorValue(value) {
+    if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
+      return CSS.escape(String(value));
+    }
+    return String(value).replace(/["\\]/g, "\\$&");
+  }
+
+  function selectorCount(selector) {
+    try {
+      return document.querySelectorAll(selector).length;
+    } catch {
+      return 0;
+    }
+  }
+
+  function uniqueAttributeSelector(tagName, attr, rawValue) {
+    const value = normalizeText(rawValue);
+    if (!value) {
+      return "";
+    }
+    const selector = `${tagName}[${attr}="${escapeSelectorValue(value)}"]`;
+    return selectorCount(selector) === 1 ? selector : "";
+  }
+
+  function getRole(element) {
+    const explicitRole = normalizeText(element.getAttribute?.("role"));
+    if (explicitRole) {
+      return explicitRole.toLowerCase();
+    }
+    const tag = String(element.tagName || "").toLowerCase();
+    if (tag === "a" && element.hasAttribute("href")) {
+      return "link";
+    }
+    if (tag === "button") {
+      return "button";
+    }
+    if (tag === "textarea") {
+      return "textbox";
+    }
+    if (tag === "select") {
+      return "combobox";
+    }
+    if (tag === "option") {
+      return "option";
+    }
+    if (tag === "input") {
+      const type = String(element.getAttribute("type") || "text").toLowerCase();
+      if (["button", "submit", "reset"].includes(type)) {
+        return "button";
+      }
+      if (type === "checkbox") {
+        return "checkbox";
+      }
+      if (type === "radio") {
+        return "radio";
+      }
+      return "textbox";
+    }
+    return "";
+  }
+
+  function isVisible(element) {
+    const style = window.getComputedStyle(element);
+    if (!style || style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+      return false;
+    }
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function isEditable(element) {
+    return (
+      element instanceof HTMLInputElement ||
+      element instanceof HTMLTextAreaElement ||
+      element instanceof HTMLSelectElement ||
+      element.isContentEditable === true
+    );
+  }
+
+  function isEnabled(element) {
+    if ("disabled" in element) {
+      return element.disabled !== true;
+    }
+    return normalizeText(element.getAttribute?.("aria-disabled")).toLowerCase() !== "true";
+  }
+
+  function getElementText(element) {
+    return normalizeText(element.innerText || element.textContent || "");
+  }
+
+  function getLabelText(element) {
+    const values = [];
+    const ariaLabel = normalizeText(element.getAttribute?.("aria-label"));
+    if (ariaLabel) {
+      values.push(ariaLabel);
+    }
+
+    const labelledBy = normalizeText(element.getAttribute?.("aria-labelledby"));
+    if (labelledBy) {
+      for (const id of labelledBy.split(/\s+/)) {
+        const labelNode = id ? document.getElementById(id) : null;
+        const text = normalizeText(labelNode?.innerText || labelNode?.textContent || "");
+        if (text) {
+          values.push(text);
+        }
+      }
+    }
+
+    if (element.labels && element.labels.length > 0) {
+      for (const label of Array.from(element.labels)) {
+        const text = normalizeText(label?.innerText || label?.textContent || "");
+        if (text) {
+          values.push(text);
+        }
+      }
+    }
+
+    return normalizeText(values.join(" "));
+  }
+
+  function getValuePreview(element) {
+    if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
+      return clipText(element.value, FIELD_PREVIEW_LIMIT);
+    }
+    if (element instanceof HTMLSelectElement) {
+      const selected = element.selectedOptions?.[0] || null;
+      return clipText(selected?.text || selected?.value || "", FIELD_PREVIEW_LIMIT);
+    }
+    if (element.isContentEditable) {
+      return clipText(element.textContent || "", FIELD_PREVIEW_LIMIT);
+    }
+    return "";
+  }
+
+  function buildSelectorHint(element) {
+    if (!(element instanceof Element)) {
+      return "";
+    }
+
+    if (element.id) {
+      const selector = `#${escapeSelectorValue(element.id)}`;
+      if (selectorCount(selector) === 1) {
+        return selector;
+      }
+    }
+
+    const tagName = String(element.tagName || "").toLowerCase() || "*";
+    const attributes = [
+      ["data-testid", element.getAttribute?.("data-testid")],
+      ["data-test", element.getAttribute?.("data-test")],
+      ["name", element.getAttribute?.("name")],
+      ["aria-label", element.getAttribute?.("aria-label")],
+      ["placeholder", element.getAttribute?.("placeholder")],
+      ["href", element.getAttribute?.("href")]
+    ];
+
+    for (const [attr, value] of attributes) {
+      const selector = uniqueAttributeSelector(tagName, attr, value);
+      if (selector) {
+        return selector;
+      }
+    }
+
+    const path = [];
+    let current = element;
+    while (current && current.nodeType === Node.ELEMENT_NODE && current !== document.body) {
+      const currentTag = String(current.tagName || "").toLowerCase();
+      if (!currentTag) {
+        break;
+      }
+
+      if (current.id) {
+        path.unshift(`#${escapeSelectorValue(current.id)}`);
+        const selector = path.join(" > ");
+        if (selectorCount(selector) === 1) {
+          return selector;
+        }
+        break;
+      }
+
+      let segment = currentTag;
+      const parent = current.parentElement;
+      if (parent) {
+        const siblings = Array.from(parent.children).filter(
+          (child) => String(child.tagName || "").toLowerCase() === currentTag
+        );
+        if (siblings.length > 1) {
+          const index = siblings.indexOf(current) + 1;
+          segment += `:nth-of-type(${index})`;
+        }
+      }
+      path.unshift(segment);
+      const selector = path.join(" > ");
+      if (selectorCount(selector) === 1) {
+        return selector;
+      }
+      current = parent;
+    }
+
+    return path.join(" > ");
+  }
+
+  function interactiveSortKey(element) {
+    const rect = element.getBoundingClientRect();
+    return [Math.round(rect.top), Math.round(rect.left)];
+  }
+
+  function buildInteractiveItem(element) {
+    const tagName = String(element.tagName || "").toLowerCase();
+    const hrefRaw = typeof element.href === "string" ? element.href : "";
+    const href = /^https?:/i.test(hrefRaw) ? hrefRaw : null;
+    const type =
+      element instanceof HTMLInputElement || element instanceof HTMLButtonElement
+        ? normalizeText(element.getAttribute?.("type")) || null
+        : null;
+
+    return {
+      selector: buildSelectorHint(element) || null,
+      tagName,
+      type,
+      role: getRole(element) || null,
+      textPreview: clipText(getElementText(element), TEXT_PREVIEW_LIMIT) || null,
+      label: clipText(getLabelText(element), FIELD_PREVIEW_LIMIT) || null,
+      name: clipText(element.getAttribute?.("name"), FIELD_PREVIEW_LIMIT) || null,
+      placeholder: clipText(element.getAttribute?.("placeholder"), FIELD_PREVIEW_LIMIT) || null,
+      valuePreview: getValuePreview(element) || null,
+      href,
+      enabled: isEnabled(element),
+      editable: isEditable(element)
+    };
+  }
+
+  function dedupeBySignature(items) {
+    const deduped = [];
+    const seen = new Set();
+    for (const item of items) {
+      const signature = JSON.stringify([
+        item.selector,
+        item.tagName,
+        item.role,
+        item.textPreview,
+        item.text,
+        item.label,
+        item.name,
+        item.placeholder
+      ]);
+      if (seen.has(signature)) {
+        continue;
+      }
+      seen.add(signature);
+      deduped.push(item);
+    }
+    return deduped;
+  }
+
+  function buildFormSummary(form, maxItems) {
+    const fields = Array.from(form.querySelectorAll("input, textarea, select"))
+      .filter((element) => isVisible(element))
+      .slice(0, Math.min(maxItems, 6))
+      .map((element) => ({
+        selector: buildSelectorHint(element) || null,
+        tagName: String(element.tagName || "").toLowerCase(),
+        type: element instanceof HTMLInputElement ? normalizeText(element.type) || null : null,
+        role: getRole(element) || null,
+        label: clipText(getLabelText(element), FIELD_PREVIEW_LIMIT) || null,
+        name: clipText(element.getAttribute?.("name"), FIELD_PREVIEW_LIMIT) || null,
+        placeholder: clipText(element.getAttribute?.("placeholder"), FIELD_PREVIEW_LIMIT) || null,
+        valuePreview: getValuePreview(element) || null,
+        required: typeof element.required === "boolean" ? element.required : false
+      }));
+
+    return {
+      selector: buildSelectorHint(form) || null,
+      name: clipText(form.getAttribute?.("name"), FIELD_PREVIEW_LIMIT) || null,
+      method: normalizeText(form.getAttribute?.("method") || "get").toLowerCase() || "get",
+      action: clipText(form.getAttribute?.("action"), FIELD_PREVIEW_LIMIT) || null,
+      fieldCount: Array.from(form.querySelectorAll("input, textarea, select")).length,
+      fields
+    };
+  }
+
+  const selector = typeof task?.selector === "string" && task.selector.trim().length > 0 ? task.selector.trim() : null;
+  const mode = task?.mode === "raw_html" ? "raw_html" : "navigation";
+  const rawMaxChars = toPositiveInt(task?.maxChars, RAW_MAX_CHARS_DEFAULT, 1, RAW_MAX_CHARS_LIMIT);
+  const navMaxChars = toPositiveInt(task?.maxChars, NAV_MAX_CHARS_DEFAULT, 250, NAV_MAX_CHARS_LIMIT);
+  const maxItems = toPositiveInt(task?.maxItems, NAV_MAX_ITEMS_DEFAULT, 1, NAV_MAX_ITEMS_LIMIT);
+  const node = selector ? document.querySelector(selector) : document.documentElement;
+  const title = clipText(document.title, 200);
+  const finalUrl = String(window.location.href || "");
+
+  if (!node) {
+    if (mode === "raw_html") {
+      return {
+        mode,
+        html: "",
+        fullLength: 0,
+        truncated: false,
+        finalUrl,
+        title,
+        selector,
+        selectorMatched: false
+      };
+    }
+    return {
+      mode,
+      title,
+      finalUrl,
+      selector,
+      selectorMatched: false,
+      textPreview: "",
+      headings: [],
+      interactive: [],
+      forms: [],
+      counts: {
+        headingCount: 0,
+        interactiveCount: 0,
+        formCount: 0
+      },
+      truncated: {
+        textPreview: false,
+        headings: false,
+        interactive: false,
+        forms: false
+      }
+    };
+  }
+
+  if (mode === "raw_html") {
+    const html = typeof node.outerHTML === "string" ? node.outerHTML : String(node.textContent ?? "");
+    return {
+      mode,
+      html: html.slice(0, rawMaxChars),
+      fullLength: html.length,
+      truncated: html.length > rawMaxChars,
+      finalUrl,
+      title,
+      selector,
+      selectorMatched: selector ? true : null
+    };
+  }
+
+  const root = node;
+  const rootText =
+    typeof root.innerText === "string"
+      ? root.innerText
+      : typeof root.textContent === "string"
+        ? root.textContent
+        : "";
+  const normalizedText = normalizeText(rootText);
+  const textPreview = clipText(normalizedText, navMaxChars);
+
+  const headingNodes = [];
+  if (root instanceof Element && /^h[1-6]$/i.test(root.tagName || "")) {
+    headingNodes.push(root);
+  }
+  headingNodes.push(...Array.from(root.querySelectorAll?.("h1, h2, h3, h4, h5, h6") || []));
+  const visibleHeadings = dedupeBySignature(
+    headingNodes
+      .filter((element) => element instanceof Element && isVisible(element))
+      .map((element) => ({
+        selector: buildSelectorHint(element) || null,
+        level: Number.parseInt(String(element.tagName || "").replace(/^h/i, ""), 10) || null,
+        text: clipText(getElementText(element), HEADING_PREVIEW_LIMIT) || null
+      }))
+      .filter((item) => item.text)
+  );
+  const headings = visibleHeadings.slice(0, Math.min(maxItems, 8));
+
+  const interactiveSelector = [
+    "a[href]",
+    "button",
+    "input",
+    "select",
+    "textarea",
+    "[role='button']",
+    "[role='link']",
+    "[role='textbox']",
+    "[role='combobox']",
+    "[contenteditable='true']",
+    "[contenteditable='']"
+  ].join(", ");
+  const interactiveNodes = [];
+  if (root instanceof Element && root.matches?.(interactiveSelector)) {
+    interactiveNodes.push(root);
+  }
+  interactiveNodes.push(...Array.from(root.querySelectorAll?.(interactiveSelector) || []));
+  interactiveNodes.sort((left, right) => {
+    const [leftTop, leftLeft] = interactiveSortKey(left);
+    const [rightTop, rightLeft] = interactiveSortKey(right);
+    if (leftTop !== rightTop) {
+      return leftTop - rightTop;
+    }
+    return leftLeft - rightLeft;
+  });
+  const interactiveItems = dedupeBySignature(
+    interactiveNodes
+      .filter((element) => element instanceof Element && isVisible(element))
+      .map((element) => buildInteractiveItem(element))
+      .filter((item) => item.selector || item.textPreview || item.label || item.name || item.placeholder)
+  );
+  const interactive = interactiveItems.slice(0, maxItems);
+
+  const formNodes = [];
+  if (root instanceof HTMLFormElement) {
+    formNodes.push(root);
+  }
+  formNodes.push(...Array.from(root.querySelectorAll?.("form") || []));
+  const visibleForms = formNodes.filter((form) => form instanceof HTMLFormElement && isVisible(form));
+  const forms = visibleForms.slice(0, Math.min(maxItems, 4)).map((form) => buildFormSummary(form, maxItems));
+
+  return {
+    mode,
+    title,
+    finalUrl,
+    selector,
+    selectorMatched: selector ? true : null,
+    textPreview,
+    headings,
+    interactive,
+    forms,
+    counts: {
+      headingCount: visibleHeadings.length,
+      interactiveCount: interactiveItems.length,
+      formCount: visibleForms.length
+    },
+    truncated: {
+      textPreview: normalizedText.length > textPreview.length,
+      headings: visibleHeadings.length > headings.length,
+      interactive: interactiveItems.length > interactive.length,
+      forms: visibleForms.length > forms.length
+    }
+  };
+}
+
 async function commandGetContent(args, allowedHosts) {
   const tabId = await resolveTabId(args.tabId);
   await getAllowedTab(tabId, allowedHosts);
-  const requestedMaxChars = Number.parseInt(String(args.maxChars ?? 6000), 10);
-  const maxChars = Number.isFinite(requestedMaxChars) && requestedMaxChars > 0
-    ? Math.min(requestedMaxChars, 50_000)
-    : 6_000;
-  const selector =
-    typeof args.selector === "string" && args.selector.trim().length > 0 ? args.selector.trim() : null;
+  const selector = typeof args.selector === "string" && args.selector.trim().length > 0 ? args.selector.trim() : null;
+  const mode = typeof args.mode === "string" ? args.mode.trim().toLowerCase() : "navigation";
+  const requestedMaxChars = Number.parseInt(String(args.maxChars ?? (mode === "raw_html" ? 6000 : 1200)), 10);
+  const requestedMaxItems = Number.parseInt(String(args.maxItems ?? 10), 10);
 
-  return await runInTab(
-    tabId,
-    (limit, sel) => {
-      const node = sel ? document.querySelector(sel) : document.documentElement;
-      if (!node) {
-        return {
-          html: "",
-          fullLength: 0,
-          truncated: false,
-          finalUrl: window.location.href,
-          selector: sel,
-          selectorMatched: false
-        };
-      }
-      const html = typeof node.outerHTML === "string" ? node.outerHTML : String(node.textContent ?? "");
+  return await runInTab(tabId, runGetContentTaskInPage, [
+    {
+      selector,
+      mode,
+      maxChars: requestedMaxChars,
+      maxItems: requestedMaxItems
+    }
+  ]);
+}
+
+async function commandFindOne(args, allowedHosts) {
+  const tabId = await resolveTabId(args.tabId);
+  await getAllowedTab(tabId, allowedHosts);
+  const locator = normalizeLocator(args.locator, { defaultVisible: true });
+  return await runInTab(tabId, runLocatorTaskInPage, [{ kind: "find_one", locator }]);
+}
+
+async function commandFindElements(args, allowedHosts) {
+  const tabId = await resolveTabId(args.tabId);
+  await getAllowedTab(tabId, allowedHosts);
+  const locator = normalizeLocator(args.locator, { defaultVisible: true });
+  const limit = normalizePositiveInt(args.limit, 10, { min: 1, max: 20 });
+  return await runInTab(tabId, runLocatorTaskInPage, [{ kind: "find_elements", locator, limit }]);
+}
+
+async function commandWaitFor(args, allowedHosts) {
+  const tabId = await resolveTabId(args.tabId);
+  await getAllowedTab(tabId, allowedHosts);
+  const locator = normalizeLocator(args.locator, { defaultVisible: null, allowVisibility: false });
+  const condition = normalizeWaitCondition(args.condition);
+  const timeoutMs = normalizePositiveInt(args.timeoutMs, 10_000, { min: 100, max: 60_000 });
+  const pollMs = normalizePositiveInt(args.pollMs, 250, { min: 50, max: 5_000 });
+  const startedAt = Date.now();
+  let lastProbe = null;
+
+  while (Date.now() - startedAt <= timeoutMs) {
+    lastProbe = await runInTab(tabId, runLocatorTaskInPage, [{ kind: "probe", locator }]);
+    const totalCount = Number(lastProbe?.totalCount ?? 0);
+    const visibleCount = Number(lastProbe?.visibleCount ?? 0);
+    const satisfied =
+      (condition === "present" && totalCount > 0) ||
+      (condition === "visible" && visibleCount > 0) ||
+      (condition === "hidden" && totalCount > 0 && visibleCount === 0) ||
+      (condition === "gone" && totalCount === 0);
+
+    if (satisfied) {
+      const element =
+        condition === "visible"
+          ? lastProbe?.firstVisible || lastProbe?.firstMatch || null
+          : condition === "gone"
+            ? null
+            : lastProbe?.firstMatch || lastProbe?.firstVisible || null;
       return {
-        html: html.slice(0, limit),
-        fullLength: html.length,
-        truncated: html.length > limit,
-        finalUrl: window.location.href,
-        selector: sel,
-        selectorMatched: sel ? true : null
+        condition,
+        satisfied: true,
+        elapsedMs: Date.now() - startedAt,
+        matchCount: totalCount,
+        visibleCount,
+        element
       };
-    },
-    [maxChars, selector]
-  );
+    }
+
+    await delay(pollMs);
+  }
+
+  throw new Error(`wait_for timed out: ${condition}`);
+}
+
+async function commandGetElementState(args, allowedHosts) {
+  const tabId = await resolveTabId(args.tabId);
+  await getAllowedTab(tabId, allowedHosts);
+  const locator = normalizeLocator(args.locator, { defaultVisible: true });
+  return await runInTab(tabId, runLocatorTaskInPage, [{ kind: "get_state", locator }]);
+}
+
+async function commandSelectOption(args, allowedHosts) {
+  const tabId = await resolveTabId(args.tabId);
+  await getAllowedTab(tabId, allowedHosts);
+  const locator = normalizeLocator(args.locator, { defaultVisible: true });
+  const selection = normalizeSelectOptionRequest(args);
+  const result = await runInTab(tabId, runLocatorTaskInPage, [
+    {
+      kind: "select_option",
+      locator,
+      ...selection
+    }
+  ]);
+
+  if (!result?.ok) {
+    throw new Error(`select_option failed: ${result?.error || "unknown_error"}`);
+  }
+
+  return {
+    matchCount: Number(result.matchCount ?? 1),
+    selectedValue: result.selectedValue ?? null,
+    selectedText: result.selectedText ?? null,
+    selectedIndex: Number.isInteger(result.selectedIndex) ? result.selectedIndex : null,
+    element: result.element ?? null
+  };
 }
 
 function normalizeGroupColor(value) {
