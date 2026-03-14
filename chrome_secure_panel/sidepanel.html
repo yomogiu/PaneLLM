@@ -248,6 +248,172 @@
         </section>
 
         <section class="models-card">
+          <div class="models-head">
+            <h3>Training Datasets</h3>
+            <button id="training-refresh-btn" class="ghost small" type="button">Refresh</button>
+          </div>
+          <p id="training-status" class="models-status">No training activity yet.</p>
+          <div class="models-grid">
+            <label class="models-field">
+              <span>Dataset Path</span>
+              <input id="training-dataset-path" type="text" placeholder="/path/to/train.jsonl or /path/to/dataset-dir" />
+            </label>
+            <label class="models-field">
+              <span>Dataset Name</span>
+              <input id="training-dataset-name" type="text" placeholder="optional label" />
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="training-dataset-import-btn" type="button">Import Dataset</button>
+          </div>
+          <div id="training-dataset-list" class="tools-list"></div>
+        </section>
+
+        <section class="models-card">
+          <h3>Start Training</h3>
+          <div class="models-grid">
+            <label class="models-field">
+              <span>Dataset</span>
+              <select id="training-dataset-select"></select>
+            </label>
+            <label class="models-field">
+              <span>Run Name</span>
+              <input id="training-run-name" type="text" placeholder="dataset-name LoRA" />
+            </label>
+            <label class="models-field">
+              <span>Base Model Path</span>
+              <input id="training-model-path" type="text" placeholder="/path/to/mlx-model" />
+            </label>
+            <label class="models-field">
+              <span>Preset</span>
+              <select id="training-preset">
+                <option value="balanced" selected>Balanced</option>
+              </select>
+            </label>
+          </div>
+          <details class="models-details">
+            <summary>Advanced Settings</summary>
+            <div class="models-grid">
+              <label class="models-field">
+                <span>Rank</span>
+                <input id="training-rank" type="number" min="1" step="1" />
+              </label>
+              <label class="models-field">
+                <span>Scale</span>
+                <input id="training-scale" type="number" min="0" step="0.5" />
+              </label>
+              <label class="models-field">
+                <span>Dropout</span>
+                <input id="training-dropout" type="number" min="0" max="1" step="0.05" />
+              </label>
+              <label class="models-field">
+                <span>Layers</span>
+                <input id="training-num-layers" type="number" min="1" step="1" />
+              </label>
+              <label class="models-field">
+                <span>Learning Rate</span>
+                <input id="training-learning-rate" type="number" min="0.00000001" step="0.000001" />
+              </label>
+              <label class="models-field">
+                <span>Iters</span>
+                <input id="training-iters" type="number" min="1" step="1" />
+              </label>
+              <label class="models-field">
+                <span>Batch Size</span>
+                <input id="training-batch-size" type="number" min="1" step="1" />
+              </label>
+              <label class="models-field">
+                <span>Grad Accumulation</span>
+                <input id="training-grad-accumulation" type="number" min="1" step="1" />
+              </label>
+              <label class="models-field">
+                <span>Report Every</span>
+                <input id="training-steps-report" type="number" min="1" step="1" />
+              </label>
+              <label class="models-field">
+                <span>Eval Every</span>
+                <input id="training-steps-eval" type="number" min="1" step="1" />
+              </label>
+              <label class="models-field">
+                <span>Save Every</span>
+                <input id="training-save-every" type="number" min="1" step="1" />
+              </label>
+              <label class="models-field">
+                <span>Val Batches</span>
+                <input id="training-val-batches" type="number" min="1" step="1" />
+              </label>
+              <label class="models-field">
+                <span>Max Seq Length</span>
+                <input id="training-max-seq-length" type="number" min="64" step="1" />
+              </label>
+              <label class="models-field">
+                <span>Seed</span>
+                <input id="training-seed" type="number" step="1" />
+              </label>
+              <label class="models-field models-field-full">
+                <span>Gradient Checkpointing</span>
+                <div class="checkbox-label">
+                  <input id="training-grad-checkpoint" type="checkbox" />
+                  <span>Reduce memory usage during LoRA training</span>
+                </div>
+              </label>
+            </div>
+          </details>
+          <div class="button-row">
+            <button id="training-start-btn" type="button">Start Training</button>
+            <button id="training-stop-start-btn" class="ghost hidden" type="button">Stop MLX and Train</button>
+          </div>
+        </section>
+
+        <section class="models-card">
+          <h3>Training Jobs</h3>
+          <div id="training-job-list" class="tools-list"></div>
+        </section>
+
+        <section class="models-card">
+          <h3>Training Runs</h3>
+          <div id="training-run-list" class="tools-list"></div>
+          <p id="training-run-output" class="models-contract">(view a training run to inspect details)</p>
+        </section>
+
+        <section class="models-card">
+          <div class="models-head">
+            <h3>MLX Experiments</h3>
+            <button id="experiments-refresh-btn" class="ghost small" type="button">Refresh</button>
+          </div>
+          <p id="experiments-status" class="models-status">No experiment jobs yet.</p>
+          <div class="models-grid">
+            <label class="models-field models-field-full">
+              <span>Prompt Set</span>
+              <textarea
+                id="experiment-prompts"
+                rows="5"
+                placeholder="One prompt per line"
+              ></textarea>
+            </label>
+            <label class="models-field models-field-full">
+              <span>References (optional)</span>
+              <textarea
+                id="experiment-references"
+                rows="4"
+                placeholder="One reference per line, aligned with prompts"
+              ></textarea>
+            </label>
+          </div>
+          <div class="button-row">
+            <button id="experiment-run-btn" type="button">Run Prompt Eval</button>
+            <button id="experiment-adapter-run-btn" class="ghost" type="button">Run Adapter Eval</button>
+          </div>
+          <div id="experiment-job-list" class="tools-list"></div>
+        </section>
+
+        <section class="models-card">
+          <h3>Experiment Library</h3>
+          <div id="experiment-list" class="tools-list"></div>
+          <p id="experiment-compare-output" class="models-contract">(no comparison yet)</p>
+        </section>
+
+        <section class="models-card">
           <h3>Runtime Trends</h3>
           <p id="mlx-latency-trend" class="models-trend">Latency: (no data)</p>
           <p id="mlx-tps-trend" class="models-trend">Tokens/sec: (no data)</p>
@@ -273,9 +439,37 @@
           </label>
           <div class="button-row tools-actions">
             <button id="tools-allow-btn" type="button">Allow Host</button>
-            <button id="tools-block-btn" class="ghost" type="button">Disallow Host</button>
             <button id="tools-allow-active-btn" class="ghost" type="button">Allow Current Tab</button>
           </div>
+        </section>
+
+        <section class="tools-card">
+          <h3>Paper Analysis</h3>
+          <p id="papers-status" class="tools-status">No paper activity yet.</p>
+          <label class="tools-field">
+            <span>URL or Local Path</span>
+            <input
+              id="paper-source-input"
+              type="text"
+              placeholder="https://arxiv.org/abs/... or /path/to/paper.pdf"
+            />
+          </label>
+          <div class="button-row tools-actions">
+            <button id="paper-use-active-btn" class="ghost" type="button">Use Current Tab</button>
+            <button id="paper-inspect-btn" type="button">Quick Inspect</button>
+            <button id="paper-analyze-btn" type="button">Analyze Paper</button>
+          </div>
+          <div id="paper-inspect-output" class="models-adapter-list"></div>
+        </section>
+
+        <section class="tools-card">
+          <h3>Paper Jobs</h3>
+          <div id="paper-job-list" class="tools-list"></div>
+        </section>
+
+        <section class="tools-card">
+          <h3>Paper Library</h3>
+          <div id="paper-list" class="tools-list"></div>
         </section>
 
         <section class="tools-card">
@@ -293,11 +487,6 @@
         <section class="tools-card">
           <h3>Allowlist</h3>
           <div id="tools-allowed-list" class="tools-list"></div>
-        </section>
-
-        <section class="tools-card">
-          <h3>Disallow List</h3>
-          <div id="tools-blocked-list" class="tools-list"></div>
         </section>
 
         <section class="tools-card">

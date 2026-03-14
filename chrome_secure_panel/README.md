@@ -13,7 +13,7 @@ Chrome side panel for the local broker.
 
 - No extension `localStorage`
 - UI state is runtime-only
-- Host allow/disallow policy persists in extension `chrome.storage.local`
+- Host allowlist policy persists in extension `chrome.storage.local`
 - Broker communication is localhost-only and header-gated
 - Page context toggle defaults to off
 - Page context capture requires an allowlisted host
@@ -68,16 +68,14 @@ Background worker RPC now supports:
 - `assistant.mlx.adapters.unload`
 - `assistant.tools.page_hosts.get`
 - `assistant.tools.page_hosts.allow`
-- `assistant.tools.page_hosts.block`
 - `assistant.tools.page_hosts.remove_allow`
-- `assistant.tools.page_hosts.unblock`
 - `assistant.tools.page_hosts.allow_active_tab`
 - `assistant.tools.page_hosts.active_tab`
 - `assistant.browser.tool.call`
 
 ## Expanding website allowlists
 
-Use the **Tools** tab in the side panel to manage runtime allow/disallow hosts.
+Use the **Tools** tab in the side panel to manage the runtime allowlist.
 
 If you need a permanent default host in source control, update:
 

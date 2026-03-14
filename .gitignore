@@ -9,6 +9,7 @@ __pycache__/
 !.env.example
 AGENTS.md
 CODEX_Add.md
+LoRA.md
 
 .mypy_cache/
 .pytest_cache/
