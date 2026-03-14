@@ -52,6 +52,7 @@ CODEX_EVENT_POLL_MIN_TIMEOUT_MS = 0
 CODEX_EVENT_POLL_MAX_TIMEOUT_MS = 30000
 MLX_MAX_CONTEXT_CHARS_CAP = 56000
 LLAMA_HEALTHCHECK_TIMEOUT_SEC = 0.35
+DEFAULT_LLAMA_MODEL = "glm-4.7-flash-llamacpp"
 BROWSER_AGENT_MAX_STEPS_DEFAULT = 20
 BROWSER_AGENT_MAX_STEPS_MIN = 1
 BROWSER_AGENT_MAX_STEPS_MAX = 40
@@ -710,7 +711,7 @@ def load_config() -> BrokerConfig:
     host = os.environ.get("BROKER_HOST", "127.0.0.1")
     port = int(os.environ.get("BROKER_PORT", "7777"))
     llama_url = os.environ.get("LLAMA_URL", "http://127.0.0.1:18000/v1/chat/completions")
-    llama_model = os.environ.get("LLAMA_MODEL", "glm-4.7-flash-llamacpp")
+    llama_model = os.environ.get("LLAMA_MODEL", DEFAULT_LLAMA_MODEL)
     llama_api_key = os.environ.get("LLAMA_API_KEY")
     openai_api_key = os.environ.get("OPENAI_API_KEY")
     openai_base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
@@ -976,7 +977,9 @@ def llama_backend_health(
     *,
     timeout_sec: float = LLAMA_HEALTHCHECK_TIMEOUT_SEC,
 ) -> dict[str, Any]:
+    configured_model = str(config.llama_model or "").strip()
     llama_url = str(config.llama_url or "").strip()
+    models_url = derive_llama_models_url(llama_url)
     payload: dict[str, Any] = {
         "configured": bool(llama_url),
         "available": False,
@@ -984,7 +987,11 @@ def llama_backend_health(
         "url": llama_url,
         "host": "",
         "port": None,
-        "model": str(config.llama_model or ""),
+        "model": configured_model or DEFAULT_LLAMA_MODEL,
+        "configured_model": configured_model,
+        "advertised_models": [],
+        "model_source": "configured" if configured_model else "fallback_default",
+        "models_url": models_url,
         "last_error": "",
     }
     if not llama_url:
@@ -1009,15 +1016,96 @@ def llama_backend_health(
         payload["status"] = "unreachable"
         payload["last_error"] = f"Cannot connect to llama.cpp at {llama_url} ({error})."
         return payload
+    resolved_model, advertised_models, model_source = resolve_llama_model(
+        config,
+        timeout_sec=max(0.05, float(timeout_sec)),
+    )
     payload["available"] = True
     payload["status"] = "ready"
+    payload["model"] = resolved_model
+    payload["advertised_models"] = advertised_models
+    payload["model_source"] = model_source
     return payload
 
 
-def ensure_llama_backend_available(config: BrokerConfig) -> None:
+def derive_llama_models_url(llama_url: str) -> str:
+    raw_url = str(llama_url or "").strip()
+    if not raw_url:
+        return ""
+    try:
+        parsed = urlsplit(raw_url)
+    except Exception:
+        return ""
+    segments = [segment for segment in (parsed.path or "").split("/") if segment]
+    if len(segments) >= 2 and segments[-2:] == ["chat", "completions"]:
+        segments = segments[:-2] + ["models"]
+    elif segments and segments[-1] == "completions":
+        segments[-1] = "models"
+    elif segments and segments[-1] != "models":
+        segments.append("models")
+    elif not segments:
+        segments = ["v1", "models"]
+    models_path = "/" + "/".join(segments)
+    return parsed._replace(path=models_path, query="", fragment="").geturl()
+
+
+def fetch_llama_advertised_models(
+    config: BrokerConfig,
+    *,
+    timeout_sec: float = 1.0,
+) -> tuple[list[str], str]:
+    models_url = derive_llama_models_url(config.llama_url)
+    if not models_url:
+        return [], ""
+    headers = {"Accept": "application/json"}
+    if config.llama_api_key:
+        headers["Authorization"] = f"Bearer {config.llama_api_key}"
+    request = Request(models_url, method="GET", headers=headers)
+    try:
+        with urlopen(request, timeout=max(0.05, float(timeout_sec))) as response:
+            parsed = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, socket.timeout, TimeoutError, OSError, json.JSONDecodeError, ValueError):
+        return [], models_url
+    data = parsed.get("data") if isinstance(parsed, dict) else None
+    if not isinstance(data, list):
+        return [], models_url
+    model_ids: list[str] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if model_id and model_id not in model_ids:
+            model_ids.append(model_id)
+    return model_ids, models_url
+
+
+def resolve_llama_model(
+    config: BrokerConfig,
+    *,
+    timeout_sec: float = 1.0,
+) -> tuple[str, list[str], str]:
+    configured_model = str(config.llama_model or "").strip()
+    advertised_models, _models_url = fetch_llama_advertised_models(
+        config,
+        timeout_sec=timeout_sec,
+    )
+    if configured_model and configured_model in advertised_models:
+        return configured_model, advertised_models, "configured"
+    if len(advertised_models) == 1:
+        return advertised_models[0], advertised_models, "auto_detected"
+    if advertised_models and configured_model in {"", DEFAULT_LLAMA_MODEL}:
+        return advertised_models[0], advertised_models, "auto_detected"
+    if configured_model:
+        return configured_model, advertised_models, "configured"
+    if advertised_models:
+        return advertised_models[0], advertised_models, "auto_detected"
+    return DEFAULT_LLAMA_MODEL, advertised_models, "fallback_default"
+
+
+def ensure_llama_backend_available(config: BrokerConfig) -> dict[str, Any]:
     health = llama_backend_health(config)
     if bool(health.get("available")):
-        return
+        return health
     raise RuntimeError(
         str(health.get("last_error") or f"Cannot connect to llama.cpp at {config.llama_url}.")
     )
@@ -4730,6 +4818,7 @@ class CodexRunManager:
             raise ValueError("backend must be llama, codex, or mlx.")
         session_id = str(data.get("session_id", "")).strip()
         prompt = str(data.get("prompt", "")).strip()
+        llama_options = normalize_llama_request_options(data)
         rewrite_message_index = ensure_rewrite_message_index(
             data.get("rewrite_message_index", data.get("rewriteMessageIndex"))
         )
@@ -4810,6 +4899,7 @@ class CodexRunManager:
                 "last_response_id": "",
                 "browser_tools_enabled": bool(browser_session),
                 "browser_action_forced": bool(force_browser_action),
+                "llama_request_options": llama_options if backend == "llama" else {},
             },
             "pending_approval": None,
             "events": [],
@@ -4823,6 +4913,7 @@ class CodexRunManager:
             "_browser_run": browser_run,
             "_allowed_hosts": allowed_hosts,
             "_force_browser_action": bool(force_browser_action),
+            "_llama_request_options": llama_options if backend == "llama" else {},
             "_approval_decision": None,
         }
 
@@ -4862,6 +4953,7 @@ class CodexRunManager:
                 "model": CONFIG.openai_codex_model if backend == "codex" and codex_mode == "responses" else "",
                 "browser_tools_enabled": bool(browser_session),
                 "browser_action_forced": bool(force_browser_action),
+                "llama_request_options": llama_options if backend == "llama" else {},
             },
         }
 
@@ -5013,7 +5105,7 @@ class CodexRunManager:
         reasoning_blocks = []
         if reasoning_text:
             reasoning_blocks = [part for part in reasoning_text.split("\n\n") if part.strip()]
-        if append_assistant_message and assistant_text:
+        if append_assistant_message and (assistant_text or reasoning_blocks):
             conversation = CONVERSATIONS.append_message(
                 conversation_id,
                 "assistant",
@@ -5264,8 +5356,12 @@ class CodexRunManager:
             return
         self._record_split_delta(run_id, cumulative)
 
-    def _record_split_delta(self, run_id: str, raw_text: str) -> None:
-        answer_text, reasoning_text = split_stream_text(raw_text)
+    def _record_answer_reasoning_state(
+        self,
+        run_id: str,
+        answer_text: str,
+        reasoning_text: str,
+    ) -> None:
         with self._condition:
             run = self._load_run_locked(run_id)
             if run.get("status") in CODEX_RUN_TERMINAL_STATUSES:
@@ -5296,6 +5392,10 @@ class CodexRunManager:
                     data={"delta": delta, "text": reasoning_text},
                 )
 
+    def _record_split_delta(self, run_id: str, raw_text: str) -> None:
+        answer_text, reasoning_text = split_stream_text(raw_text)
+        self._record_answer_reasoning_state(run_id, answer_text, reasoning_text)
+
     def _run_llama_loop(self, run_id: str) -> tuple[str, str]:
         with self._condition:
             run = self._load_run_locked(run_id)
@@ -5304,6 +5404,9 @@ class CodexRunManager:
             page_context = run.get("_page_context")
             force_browser_action = bool(run.get("_force_browser_action"))
             allowed_hosts = list(run.get("_allowed_hosts", []))
+            llama_options = run.get("_llama_request_options") if isinstance(run.get("_llama_request_options"), dict) else {}
+            chat_template_kwargs = llama_options.get("chat_template_kwargs")
+            reasoning_budget = llama_options.get("reasoning_budget")
         conversation = CONVERSATIONS.get(run["conversation_id"])
         model_prompt = prompt
         page_context_text = format_page_context(page_context)
@@ -5317,18 +5420,28 @@ class CodexRunManager:
                 raise RuntimeError("Browser action mode requires a connected extension relay client.")
             if not allowed_hosts:
                 raise RuntimeError("Browser action mode requires at least one allowlisted host.")
+            agent_max_steps = BROWSER_CONFIG.agent_max_steps()
             return run_llama_browser_agent(
                 run["conversation_id"],
                 messages,
                 allowed_hosts,
+                agent_max_steps,
+                chat_template_kwargs=chat_template_kwargs,
+                reasoning_budget=reasoning_budget,
                 cancel_check=lambda: self._run_cancel_requested(run_id),
             )
-        raw_text = call_llama_stream(
+        answer_text, reasoning_text = call_llama_stream(
             messages,
+            chat_template_kwargs=chat_template_kwargs,
+            reasoning_budget=reasoning_budget,
             cancel_check=lambda: self._run_cancel_requested(run_id),
-            on_text_delta=lambda _delta, cumulative: self._record_split_delta(run_id, cumulative),
+            on_state_delta=lambda answer, reasoning: self._record_answer_reasoning_state(
+                run_id,
+                answer,
+                reasoning,
+            ),
         )
-        return split_stream_text(raw_text)
+        return answer_text, reasoning_text
 
     def _run_mlx_loop(self, run_id: str) -> tuple[str, str]:
         with self._condition:
@@ -5351,11 +5464,13 @@ class CodexRunManager:
                 raise RuntimeError("Browser action mode requires a connected extension relay client.")
             if not allowed_hosts:
                 raise RuntimeError("Browser action mode requires at least one allowlisted host.")
+            agent_max_steps = BROWSER_CONFIG.agent_max_steps()
             return (
                 run_mlx_browser_agent(
                     run["conversation_id"],
                     messages,
                     allowed_hosts,
+                    agent_max_steps,
                     cancel_check=lambda: self._run_cancel_requested(run_id),
                     on_text_delta=lambda _delta, cumulative: self._record_split_delta(
                         run_id,
@@ -5696,25 +5811,134 @@ def ensure_boolean_flag(value: Any, field_name: str) -> bool:
     raise ValueError(f"{field_name} must be a boolean when provided.")
 
 
+def normalize_llama_chat_template_kwargs(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                "chat_template_kwargs must be a JSON object string when provided as text."
+            ) from error
+    if not isinstance(value, dict):
+        raise ValueError("chat_template_kwargs must be an object when provided.")
+
+    # Preserve caller keys instead of projecting onto a narrow broker-owned
+    # schema. The upstream OpenAI-compatible server expects an object here.
+    return json.loads(json.dumps(value))
+
+
+def normalize_llama_reasoning_budget(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError("reasoning_budget must be an integer when provided.")
+    try:
+        budget = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("reasoning_budget must be an integer when provided.") from error
+    if budget < -1:
+        raise ValueError("reasoning_budget must be >= -1 when provided.")
+    return budget
+
+
+def normalize_llama_request_options(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {"chat_template_kwargs": {}, "reasoning_budget": None}
+    return {
+        "chat_template_kwargs": normalize_llama_chat_template_kwargs(
+            data.get("chat_template_kwargs", data.get("chatTemplateKwargs"))
+        ),
+        "reasoning_budget": normalize_llama_reasoning_budget(
+            data.get("reasoning_budget", data.get("reasoningBudget"))
+        ),
+    }
+
+
+def _flatten_llama_text_field(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return "".join(_flatten_llama_text_field(item) for item in value)
+    if isinstance(value, dict):
+        text_value = value.get("text")
+        if isinstance(text_value, str):
+            return text_value
+        for key in ("content", "value", "reasoning", "reasoning_content"):
+            nested = value.get(key)
+            if nested is None:
+                continue
+            flattened = _flatten_llama_text_field(nested)
+            if flattened:
+                return flattened
+        return ""
+    return str(value)
+
+
+def _extract_llama_reasoning_text(payload: Any, *, strip: bool = True) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    reasoning = _flatten_llama_text_field(payload.get("reasoning"))
+    reasoning_content = _flatten_llama_text_field(payload.get("reasoning_content"))
+    if reasoning and reasoning_content and reasoning != reasoning_content:
+        merged = f"{reasoning}\n\n{reasoning_content}"
+    else:
+        merged = reasoning or reasoning_content
+    return merged.strip() if strip else merged
+
+
+def extract_llama_message_parts(message: Any) -> tuple[str, str]:
+    if isinstance(message, dict):
+        content = _flatten_llama_text_field(message.get("content"))
+        server_reasoning = _extract_llama_reasoning_text(message)
+    else:
+        content = str(message or "")
+        server_reasoning = ""
+    visible, inline_reasoning = split_stream_text(content)
+    reasoning = server_reasoning or inline_reasoning
+    return visible, reasoning
+
+
+def extract_llama_delta_parts(choice: Any) -> tuple[str, str]:
+    if not isinstance(choice, dict):
+        return "", ""
+    delta_obj = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+    content_delta = _flatten_llama_text_field(delta_obj.get("content"))
+    reasoning_delta = _extract_llama_reasoning_text(delta_obj, strip=False)
+    return content_delta, reasoning_delta
+
+
 def call_llama_completion(
     messages: list[dict[str, Any]],
     *,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | None = None,
+    resolved_model: str | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    reasoning_budget: int | None = None,
     stop: list[str] | None = None,
     temperature: float = 0.1,
-    max_tokens: int = 768,
+    max_tokens: int | None = None,
 ) -> dict[str, Any]:
     target_url = str(CONFIG.llama_url or "").strip() or "(unset LLAMA_URL)"
+    target_model = str(resolved_model or "").strip() or resolve_llama_model(CONFIG, timeout_sec=1.0)[0]
     payload = {
-        "model": CONFIG.llama_model,
+        "model": target_model,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": max_tokens,
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice or "auto"
+    if chat_template_kwargs:
+        payload["chat_template_kwargs"] = chat_template_kwargs
+    if reasoning_budget is not None:
+        payload["reasoning_budget"] = reasoning_budget
     if stop:
         payload["stop"] = stop
     headers = {"Content-Type": "application/json"}
@@ -5752,23 +5976,32 @@ def call_llama_completion_stream(
     *,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: str | None = None,
+    resolved_model: str | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    reasoning_budget: int | None = None,
     stop: list[str] | None = None,
     temperature: float = 0.1,
-    max_tokens: int = 768,
-    on_text_delta: Any = None,
+    max_tokens: int | None = None,
+    on_state_delta: Any = None,
     cancel_check: Any = None,
-) -> str:
+) -> tuple[str, str]:
     target_url = str(CONFIG.llama_url or "").strip() or "(unset LLAMA_URL)"
+    target_model = str(resolved_model or "").strip() or resolve_llama_model(CONFIG, timeout_sec=1.0)[0]
     payload = {
-        "model": CONFIG.llama_model,
+        "model": target_model,
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": max_tokens,
         "stream": True,
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice or "auto"
+    if chat_template_kwargs:
+        payload["chat_template_kwargs"] = chat_template_kwargs
+    if reasoning_budget is not None:
+        payload["reasoning_budget"] = reasoning_budget
     if stop:
         payload["stop"] = stop
     headers = {"Content-Type": "application/json"}
@@ -5781,7 +6014,8 @@ def call_llama_completion_stream(
         data=json.dumps(payload).encode("utf-8"),
     )
 
-    accumulated = ""
+    accumulated_content = ""
+    accumulated_reasoning = ""
     try:
         with urlopen(request, timeout=120) as response:
             content_type = str(response.headers.get("Content-Type", "")).lower()
@@ -5790,8 +6024,8 @@ def call_llama_completion_stream(
                 choices = parsed.get("choices") if isinstance(parsed.get("choices"), list) else []
                 if choices and isinstance(choices[0], dict):
                     message = choices[0].get("message") if isinstance(choices[0].get("message"), dict) else {}
-                    accumulated = str(message.get("content", "") or "")
-                return accumulated
+                    return extract_llama_message_parts(message)
+                return "", ""
             for event in iter_sse_events(response):
                 if cancel_check and cancel_check():
                     try:
@@ -5809,12 +6043,15 @@ def call_llama_completion_stream(
                 if not choices:
                     continue
                 choice = choices[0] if isinstance(choices[0], dict) else {}
-                delta_obj = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
-                delta = str(delta_obj.get("content", "") or "")
-                if delta:
-                    accumulated += delta
-                    if on_text_delta:
-                        on_text_delta(delta, accumulated)
+                content_delta, reasoning_delta = extract_llama_delta_parts(choice)
+                if content_delta:
+                    accumulated_content += content_delta
+                if reasoning_delta:
+                    accumulated_reasoning += reasoning_delta
+                if content_delta or reasoning_delta:
+                    visible, inline_reasoning = split_stream_text(accumulated_content)
+                    if on_state_delta:
+                        on_state_delta(visible, accumulated_reasoning or inline_reasoning)
     except HTTPError as error:
         body = error.read().decode("utf-8", errors="replace")
         try:
@@ -5831,45 +6068,69 @@ def call_llama_completion_stream(
         raise RuntimeError(f"llama request to {target_url} failed: {error.reason}") from error
     except socket.timeout as error:
         raise RuntimeError(f"llama request to {target_url} timed out.") from error
-    return accumulated
+    visible, inline_reasoning = split_stream_text(accumulated_content)
+    return visible, accumulated_reasoning or inline_reasoning
 
 
-def call_llama(messages: list[dict[str, str]], *, cancel_check: Any = None) -> str:
+def call_llama(
+    messages: list[dict[str, str]],
+    *,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    reasoning_budget: int | None = None,
+    cancel_check: Any = None,
+) -> tuple[str, str]:
     if cancel_check and cancel_check():
         raise RouteRequestCancelledError("Request cancelled by user.")
-    ensure_llama_backend_available(CONFIG)
+    llama_health = ensure_llama_backend_available(CONFIG)
+    resolved_model = str(llama_health.get("model") or "").strip() or DEFAULT_LLAMA_MODEL
     guarded_messages = [
         {"role": "system", "content": LLAMA_CHAT_SYSTEM_PROMPT},
         *messages,
     ]
-    parsed = call_llama_completion(guarded_messages, stop=LLAMA_STOP_SEQUENCES)
+    parsed = call_llama_completion(
+        guarded_messages,
+        resolved_model=resolved_model,
+        chat_template_kwargs=chat_template_kwargs,
+        reasoning_budget=reasoning_budget,
+        stop=LLAMA_STOP_SEQUENCES,
+    )
     if cancel_check and cancel_check():
         raise RouteRequestCancelledError("Request cancelled by user.")
-    return str(parsed["choices"][0]["message"].get("content", ""))
+    choices = parsed.get("choices") if isinstance(parsed.get("choices"), list) else []
+    if not choices or not isinstance(choices[0], dict):
+        return "", ""
+    message = choices[0].get("message") if isinstance(choices[0].get("message"), dict) else {}
+    return extract_llama_message_parts(message)
 
 
 def call_llama_stream(
     messages: list[dict[str, str]],
     *,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    reasoning_budget: int | None = None,
     cancel_check: Any = None,
-    on_text_delta: Any = None,
-) -> str:
+    on_state_delta: Any = None,
+) -> tuple[str, str]:
     if cancel_check and cancel_check():
         raise RouteRequestCancelledError("Request cancelled by user.")
-    ensure_llama_backend_available(CONFIG)
+    llama_health = ensure_llama_backend_available(CONFIG)
+    resolved_model = str(llama_health.get("model") or "").strip() or DEFAULT_LLAMA_MODEL
     guarded_messages = [
         {"role": "system", "content": LLAMA_CHAT_SYSTEM_PROMPT},
         *messages,
     ]
-    text = call_llama_completion_stream(
+    answer_text, reasoning_text = call_llama_completion_stream(
         guarded_messages,
+        resolved_model=resolved_model,
+        chat_template_kwargs=chat_template_kwargs,
+        reasoning_budget=reasoning_budget,
         stop=LLAMA_STOP_SEQUENCES,
         cancel_check=cancel_check,
-        on_text_delta=on_text_delta,
+        on_state_delta=on_state_delta,
     )
     if cancel_check and cancel_check():
         raise RouteRequestCancelledError("Request cancelled by user.")
-    return text
+    return answer_text, reasoning_text
 
 
 def run_subprocess_with_cancel(
@@ -6132,7 +6393,8 @@ def generate_paper_digest(paper: dict[str, Any], *, backend: str, cancel_check: 
         },
     ]
     if normalized_backend == "llama":
-        return call_llama(messages, cancel_check=cancel_check).strip()
+        answer, _reasoning = call_llama(messages, cancel_check=cancel_check)
+        return answer.strip()
     if MLX_RUNTIME.status().get("status") == "running":
         return MLX_RUNTIME.generate(messages, cancel_check=cancel_check).strip()
     return run_ephemeral_mlx_completion(messages, cancel_check=cancel_check).strip()
@@ -6803,11 +7065,15 @@ def run_llama_browser_agent(
     messages: list[dict[str, Any]],
     allowed_hosts: list[str],
     max_steps: int,
+    *,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    reasoning_budget: int | None = None,
     cancel_check: Any = None,
 ) -> str:
     if cancel_check and cancel_check():
         raise RouteRequestCancelledError("Request cancelled by user.")
-    ensure_llama_backend_available(CONFIG)
+    llama_health = ensure_llama_backend_available(CONFIG)
+    resolved_model = str(llama_health.get("model") or "").strip() or DEFAULT_LLAMA_MODEL
     session = BROWSER_AUTOMATION.session_create(
         {
             "policy": {
@@ -6835,13 +7101,15 @@ def run_llama_browser_agent(
                 agent_messages,
                 tools=LLAMA_BROWSER_TOOLS,
                 tool_choice="auto",
+                resolved_model=resolved_model,
+                chat_template_kwargs=chat_template_kwargs,
+                reasoning_budget=reasoning_budget,
                 temperature=0.1,
-                max_tokens=768,
             )
             if cancel_check and cancel_check():
                 raise RouteRequestCancelledError("Request cancelled by user.")
             message = response["choices"][0].get("message", {})
-            content = str(message.get("content", "") or "")
+            content, _reasoning = extract_llama_message_parts(message)
             tool_calls = message.get("tool_calls") or []
 
             if not tool_calls:
@@ -6925,7 +7193,12 @@ def summarize_messages(existing: str, extra_messages: list[dict[str, str]]) -> s
     return merged
 
 
-def strip_internal_thinking(value: Any) -> tuple[str, int, list[str]]:
+def strip_internal_thinking(
+    value: Any,
+    *,
+    allow_plaintext_headers: bool = False,
+    allow_unmarked_reasoning: bool = False,
+) -> tuple[str, int, list[str]]:
     raw = str(value or "")
     if not raw:
         return "", 0, []
@@ -6934,10 +7207,18 @@ def strip_internal_thinking(value: Any) -> tuple[str, int, list[str]]:
     reasoning_blocks: list[str] = []
     hidden_chars = 0
 
-    thinking_header_match = THINKING_PLAIN_HEADER_PATTERN.search(raw)
-    final_answer_match = FINAL_ANSWER_MARKER_PATTERN.search(raw)
+    thinking_header_match = (
+        THINKING_PLAIN_HEADER_PATTERN.search(raw) if allow_plaintext_headers else None
+    )
+    final_answer_match = (
+        FINAL_ANSWER_MARKER_PATTERN.search(raw) if allow_plaintext_headers else None
+    )
 
-    if not thinking_header_match and not THINK_OPEN_TAG_PATTERN.search(raw):
+    if (
+        allow_unmarked_reasoning
+        and not thinking_header_match
+        and not THINK_OPEN_TAG_PATTERN.search(raw)
+    ):
         paragraphs = [part.strip() for part in re.split(r"\n\s*\n", raw) if part.strip()]
         if len(paragraphs) >= 2 and UNMARKED_REASONING_PREFIX_PATTERN.search(paragraphs[0]):
             split_index = None
@@ -7009,8 +7290,17 @@ def strip_internal_thinking(value: Any) -> tuple[str, int, list[str]]:
     return visible, hidden_chars, reasoning_blocks
 
 
-def split_stream_text(raw_text: str) -> tuple[str, str]:
-    visible, _hidden_chars, reasoning_blocks = strip_internal_thinking(raw_text)
+def split_stream_text(
+    raw_text: str,
+    *,
+    allow_plaintext_headers: bool = False,
+    allow_unmarked_reasoning: bool = False,
+) -> tuple[str, str]:
+    visible, _hidden_chars, reasoning_blocks = strip_internal_thinking(
+        raw_text,
+        allow_plaintext_headers=allow_plaintext_headers,
+        allow_unmarked_reasoning=allow_unmarked_reasoning,
+    )
     visible = strip_transcript_spillover(visible)
     reasoning = "\n\n".join(
         str(block or "").strip()
@@ -7162,6 +7452,7 @@ def route_request(data: dict[str, Any]) -> dict[str, Any]:
     session_id = str(data.get("session_id", "")).strip()
     backend = str(data.get("backend", "")).strip()
     prompt = str(data.get("prompt", "")).strip()
+    llama_options = normalize_llama_request_options(data)
     request_id = ensure_route_request_id(data.get("request_id", data.get("requestId")))
     rewrite_message_index = ensure_rewrite_message_index(
         data.get("rewrite_message_index", data.get("rewriteMessageIndex"))
@@ -7244,6 +7535,8 @@ def route_request(data: dict[str, Any]) -> dict[str, Any]:
             raise RouteRequestCancelledError("Request cancelled by user.")
 
         extension_clients = int(EXTENSION_RELAY.health().get("connected_clients", 0))
+        answer = ""
+        llama_reasoning_text = ""
         if force_browser_action and extension_clients <= 0:
             raise RuntimeError("Browser action mode requires a connected extension relay client.")
         if force_browser_action and not allowed_hosts:
@@ -7262,6 +7555,8 @@ def route_request(data: dict[str, Any]) -> dict[str, Any]:
                     messages,
                     allowed_hosts,
                     agent_max_steps,
+                    chat_template_kwargs=llama_options.get("chat_template_kwargs"),
+                    reasoning_budget=llama_options.get("reasoning_budget"),
                     cancel_check=cancel_check,
                 )
             else:
@@ -7273,7 +7568,12 @@ def route_request(data: dict[str, Any]) -> dict[str, Any]:
                     cancel_check=cancel_check,
                 )
         elif backend == "llama":
-            answer = call_llama(messages, cancel_check=cancel_check)
+            answer, llama_reasoning_text = call_llama(
+                messages,
+                chat_template_kwargs=llama_options.get("chat_template_kwargs"),
+                reasoning_budget=llama_options.get("reasoning_budget"),
+                cancel_check=cancel_check,
+            )
         elif backend == "mlx":
             if force_browser_action:
                 answer = run_mlx_browser_agent(
@@ -7344,8 +7644,15 @@ def route_request(data: dict[str, Any]) -> dict[str, Any]:
         if cancel_check():
             raise RouteRequestCancelledError("Request cancelled by user.")
 
-        visible_answer, hidden_thinking_chars, reasoning_blocks = strip_internal_thinking(answer)
-        visible_answer = strip_transcript_spillover(visible_answer)
+        if backend == "llama":
+            visible_answer = strip_transcript_spillover(answer)
+            reasoning_blocks = [
+                part for part in str(llama_reasoning_text or "").split("\n\n") if part.strip()
+            ]
+            hidden_thinking_chars = len(str(llama_reasoning_text or ""))
+        else:
+            visible_answer, hidden_thinking_chars, reasoning_blocks = strip_internal_thinking(answer)
+            visible_answer = strip_transcript_spillover(visible_answer)
         if hidden_thinking_chars > 0 and not visible_answer:
             visible_answer = (
                 "I generated internal reasoning but no final answer. "

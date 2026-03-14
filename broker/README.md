@@ -18,7 +18,7 @@ Optional environment variables:
 - `BROKER_PORT` (default `7777`)
 - `BROKER_DATA_DIR` (default `broker/.data`)
 - `LLAMA_URL` (default `http://127.0.0.1:18000/v1/chat/completions`)
-- `LLAMA_MODEL` (default `glm-4.7-flash-llamacpp`)
+- `LLAMA_MODEL` (optional override; broker auto-detects from `LLAMA_URL` `/v1/models` when available and falls back to `glm-4.7-flash-llamacpp`)
 - `LLAMA_API_KEY` (optional)
 - `OPENAI_API_KEY` (enables Codex Responses mode)
 - `OPENAI_BASE_URL` (default `https://api.openai.com/v1`)
@@ -110,6 +110,8 @@ Unified run API (all backends, same underlying manager):
   "session_id": "string",
   "prompt": "string",
   "rewrite_message_index": 2,
+  "chat_template_kwargs": "{\"enable_thinking\":true,\"clear_thinking\":false}",
+  "reasoning_budget": 0,
   "page_context": {
     "title": "string",
     "url": "string",
@@ -210,6 +212,8 @@ The command may return:
   "backend": "llama | codex | mlx",
   "prompt": "string",
   "rewrite_message_index": 2,
+  "chat_template_kwargs": "{\"enable_thinking\":true,\"clear_thinking\":false}",
+  "reasoning_budget": -1,
   "page_context": {
     "title": "string",
     "url": "string",
@@ -222,6 +226,11 @@ The command may return:
   "risk_signals": ["high_risk_prompt"]
 }
 ```
+
+For `backend: "llama"`, `chat_template_kwargs` and `reasoning_budget`
+are passed through to the upstream llama.cpp chat-completions request when provided.
+`chat_template_kwargs` may be sent to the broker as either an object or a JSON string;
+the broker normalizes it to an object on the outgoing llama.cpp request.
 
 `POST /route` response includes:
 

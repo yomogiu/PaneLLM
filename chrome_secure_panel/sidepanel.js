@@ -79,6 +79,10 @@ const promptEl = $("prompt");
 const backendEl = $("backend");
 const includePageContextEl = $("include-page-context");
 const forceBrowserActionEl = $("force-browser-action");
+const llamaThinkingControlsEl = $("llama-thinking-controls");
+const llamaThinkingToggleEl = $("llama-thinking-toggle");
+const llamaEnableThinkingEl = $("llama-enable-thinking");
+const llamaThinkingStateEl = $("llama-thinking-state");
 const stopBtn = $("stop-btn");
 const sendBtn = $("send-btn");
 const newSessionBtn = $("new-session-btn");
@@ -414,6 +418,49 @@ function setContextUsagePending() {
   contextUsageEl.classList.remove("hidden", "warning", "critical");
 }
 
+function isLlamaChatBackend(backend = backendEl?.value) {
+  return String(backend || "").trim().toLowerCase() === "llama";
+}
+
+function buildLlamaThinkingRequestFields(backend = backendEl?.value) {
+  if (!isLlamaChatBackend(backend)) {
+    return {};
+  }
+  const enabled = Boolean(llamaEnableThinkingEl?.checked);
+  return {
+    chatTemplateKwargs: {
+      enable_thinking: enabled,
+      clear_thinking: false
+    },
+    reasoningBudget: enabled ? -1 : 0
+  };
+}
+
+function applyLlamaThinkingRequestFields(message, backend = message?.backend) {
+  if (!message || !isLlamaChatBackend(backend)) {
+    return message;
+  }
+  const llamaFields = buildLlamaThinkingRequestFields(backend);
+  return {
+    ...message,
+    ...llamaFields
+  };
+}
+
+function updateLlamaThinkingComposer() {
+  const isLlama = isLlamaChatBackend();
+  const enabled = isLlama && Boolean(llamaEnableThinkingEl?.checked);
+  if (llamaThinkingControlsEl) {
+    llamaThinkingControlsEl.classList.toggle("hidden", !isLlama);
+  }
+  if (llamaThinkingToggleEl) {
+    llamaThinkingToggleEl.classList.toggle("active", enabled);
+  }
+  if (llamaThinkingStateEl) {
+    llamaThinkingStateEl.textContent = enabled ? "On · budget -1" : "Off · budget 0";
+  }
+}
+
 sendBtn.addEventListener("click", async () => {
   await submitPrompt(false);
 });
@@ -515,6 +562,10 @@ backendEl?.addEventListener("change", () => {
     modelsBackendEl.value = selected;
   }
   updateComposerState();
+});
+
+llamaEnableThinkingEl?.addEventListener("change", () => {
+  updateLlamaThinkingComposer();
 });
 
 mlxStartBtn?.addEventListener("click", async () => {
@@ -3043,6 +3094,8 @@ async function restoreCodexRun(conversation) {
   runUi.approvalCards = new Map();
   runUi.assistantNode = null;
   runUi.thinkingNode = null;
+  runUi.streamedAssistantText = "";
+  runUi.streamedReasoningText = "";
 
   try {
     const result = await sendRuntimeMessage({
@@ -3143,6 +3196,7 @@ async function submitPrompt(confirmed) {
         confirmed: false
       };
     }
+    request = applyLlamaThinkingRequestFields(request, backend);
   }
 
   if (request.type === "assistant.codex.run.start") {
@@ -3424,6 +3478,8 @@ function ensureCodexRunUi(runId, conversationId, allowAssistantBubble, backend =
       waitingNode: null,
       assistantNode: null,
       thinkingNode: null,
+      streamedAssistantText: "",
+      streamedReasoningText: "",
       approvalCards: new Map(),
       allowAssistantBubble,
       backend: typeof backend === "string" ? backend : "codex"
@@ -3497,17 +3553,28 @@ function renderCodexEvents(runId, events) {
 
     if (event.type === "partial_text" || event.type === "partial_answer_text") {
       clearRunWaitingIndicator(runUi);
+      runUi.streamedAssistantText = String(event?.data?.text || "");
       if (runUi.allowAssistantBubble) {
-        upsertCodexAssistantBubble(runUi, String(event?.data?.text || ""));
+        upsertCodexAssistantBubble(
+          runUi,
+          runUi.streamedAssistantText,
+          true,
+          buildPendingReasoningPayload(runUi.streamedReasoningText)
+        );
       }
       continue;
     }
 
     if (event.type === "partial_reasoning_text") {
       clearRunWaitingIndicator(runUi);
-      const reasoningText = String(event?.data?.text || "");
-      if (reasoningText || runUi.thinkingNode) {
-        upsertCodexThinkingPanel(runUi, reasoningText, true);
+      runUi.streamedReasoningText = String(event?.data?.text || "");
+      if (runUi.allowAssistantBubble && (runUi.streamedReasoningText || runUi.assistantNode)) {
+        upsertCodexAssistantBubble(
+          runUi,
+          runUi.streamedAssistantText,
+          true,
+          buildPendingReasoningPayload(runUi.streamedReasoningText)
+        );
       }
       continue;
     }
@@ -3528,8 +3595,10 @@ function renderCodexEvents(runId, events) {
       clearRunWaitingIndicator(runUi);
       const assistantText = String(event?.data?.assistant_text || "");
       const reasoningText = String(event?.data?.reasoning_text || "");
-      const finalAssistantText = assistantText || getMessageText(runUi.assistantNode);
-      const finalReasoningText = reasoningText || getMessageText(runUi.thinkingNode);
+      const finalAssistantText = assistantText || runUi.streamedAssistantText || getMessageText(runUi.assistantNode);
+      const finalReasoningText = reasoningText || runUi.streamedReasoningText;
+      runUi.streamedAssistantText = finalAssistantText;
+      runUi.streamedReasoningText = finalReasoningText;
       const finalReasoningBlocks = splitReasoningText(finalReasoningText);
       if (runUi.allowAssistantBubble && (finalAssistantText || runUi.assistantNode || finalReasoningBlocks.length)) {
         upsertCodexAssistantBubble(
@@ -3540,10 +3609,6 @@ function renderCodexEvents(runId, events) {
         );
         runUi.allowAssistantBubble = false;
       }
-      if (runUi.thinkingNode) {
-        runUi.thinkingNode.remove();
-        runUi.thinkingNode = null;
-      }
       disableApprovalCards(runUi);
       if (runUi.backend === "codex" && event.type === "completed" && !assistantText && !reasoningText) {
         continue;
@@ -3553,8 +3618,13 @@ function renderCodexEvents(runId, events) {
     }
 
     if (event.type === "thinking") {
-      if (runUi.thinkingNode) {
-        upsertCodexThinkingPanel(runUi, getMessageText(runUi.thinkingNode), true);
+      if (runUi.allowAssistantBubble && (runUi.streamedAssistantText || runUi.streamedReasoningText || runUi.assistantNode)) {
+        upsertCodexAssistantBubble(
+          runUi,
+          runUi.streamedAssistantText,
+          true,
+          buildPendingReasoningPayload(runUi.streamedReasoningText)
+        );
       }
       continue;
     }
@@ -3781,7 +3851,8 @@ function setApprovalCardBusy(card, disabled, statusText) {
 }
 
 function upsertCodexAssistantBubble(runUi, text, pending = true, reasoningBlocks = null) {
-  if (!text && !(Array.isArray(reasoningBlocks) && reasoningBlocks.length)) {
+  const reasoningState = normalizeReasoningPayload(reasoningBlocks);
+  if (!text && !reasoningState.text.trim() && !reasoningState.blocks.length) {
     return;
   }
   if (!runUi.assistantNode) {
@@ -3791,11 +3862,11 @@ function upsertCodexAssistantBubble(runUi, text, pending = true, reasoningBlocks
       pending,
       "codex-assistant",
       null,
-      reasoningBlocks
+      reasoningState
     );
     return;
   }
-  updateMessage(runUi.assistantNode, "assistant", text, pending, "codex-assistant", reasoningBlocks);
+  updateMessage(runUi.assistantNode, "assistant", text, pending, "codex-assistant", reasoningState);
 }
 
 function showRunWaitingIndicator(runUi) {
@@ -3836,49 +3907,49 @@ function clearRunWaitingIndicator(runUi) {
   runUi.waitingNode = null;
 }
 
-function upsertCodexThinkingPanel(runUi, text, pending = true) {
-  const trace = String(text || "");
-  if (!trace.trim() && !pending && !runUi.thinkingNode) {
-    return;
-  }
-  if (!runUi.thinkingNode) {
-    runUi.thinkingNode = appendMessage("assistant", "", pending, "codex-thinking");
-  }
-  runUi.thinkingNode.className = `message assistant codex-thinking${pending ? " pending" : ""}`;
-  runUi.thinkingNode.dataset.rawText = trace;
-  const body = runUi.thinkingNode.querySelector(".message-body") || document.createElement("div");
-  if (!body.parentNode) {
-    body.className = "message-body";
-    runUi.thinkingNode.appendChild(body);
-  }
-
-  const existing = body.querySelector("details.thinking-disclosure");
-  const wasOpen = Boolean(existing?.open);
-  body.textContent = "";
-
-  const details = document.createElement("details");
-  details.className = "thinking-disclosure";
-  details.open = wasOpen;
-
-  const summary = document.createElement("summary");
-  summary.textContent = pending ? "Thinking..." : "Thought";
-  details.appendChild(summary);
-
-  const content = document.createElement("div");
-  content.className = "reasoning-content";
-  if (trace.trim()) {
-    content.appendChild(renderMarkdownFragment(trace));
-  }
-  details.appendChild(content);
-  body.appendChild(details);
-  messagesEl.scrollTop = messagesEl.scrollHeight;
-}
-
 function splitReasoningText(text) {
   return String(text || "")
     .split(/\n{2,}/)
     .map((part) => part.trim())
     .filter(Boolean);
+}
+
+function normalizeReasoningPayload(reasoning) {
+  if (Array.isArray(reasoning)) {
+    const blocks = reasoning.map((block) => String(block || "").trim()).filter(Boolean);
+    return {
+      blocks,
+      text: blocks.join("\n\n"),
+      pending: false
+    };
+  }
+  if (reasoning && typeof reasoning === "object") {
+    const pending = Boolean(reasoning.pending);
+    const blocks = Array.isArray(reasoning.blocks)
+      ? reasoning.blocks.map((block) => String(block || "").trim()).filter(Boolean)
+      : [];
+    const text = String(reasoning.text || "");
+    if (pending) {
+      return {
+        blocks,
+        text,
+        pending: true
+      };
+    }
+    const finalBlocks = blocks.length ? blocks : splitReasoningText(text);
+    return {
+      blocks: finalBlocks,
+      text: finalBlocks.join("\n\n") || text,
+      pending: false
+    };
+  }
+  const text = String(reasoning || "");
+  const blocks = text.trim() ? splitReasoningText(text) : [];
+  return {
+    blocks,
+    text: blocks.join("\n\n") || text,
+    pending: false
+  };
 }
 
 function appendCodexStatusCard(eventSummary) {
@@ -3935,6 +4006,17 @@ function getLastRenderedSeq(runUi) {
   return maxSeq;
 }
 
+function buildPendingReasoningPayload(text) {
+  const reasoningText = String(text || "");
+  if (!reasoningText.trim()) {
+    return null;
+  }
+  return {
+    text: reasoningText,
+    pending: true
+  };
+}
+
 function usesCodexRunProtocol() {
   return true;
 }
@@ -3954,6 +4036,7 @@ function updateComposerState() {
   const hasActiveLegacy = Boolean(state.activeLegacyRequestId);
   const showStop = hasActiveCodex || hasActiveLegacy;
   const browserActionSupported = ["codex", "llama", "mlx"].includes(String(backendEl.value || ""));
+  const llamaSelected = isLlamaChatBackend();
   sendBtn.disabled = locked;
   promptEl.disabled = locked;
   confirmBtn.disabled = state.busy;
@@ -3963,6 +4046,10 @@ function updateComposerState() {
     }
     forceBrowserActionEl.disabled = locked || !browserActionSupported;
   }
+  if (llamaEnableThinkingEl) {
+    llamaEnableThinkingEl.disabled = locked || !llamaSelected;
+  }
+  updateLlamaThinkingComposer();
   stopBtn.classList.toggle("hidden", !showStop);
   stopBtn.disabled = !showStop || state.stopping;
   stopBtn.textContent = state.stopping ? "Stopping..." : hasActiveCodex ? "Stop Run" : "Stop";
@@ -4221,27 +4308,34 @@ function collapseThinkBlocks(text) {
   return { visible, hiddenChars, reasoningBlocks };
 }
 
-function createReasoningDisclosure(reasoningBlocks) {
-  const blocks = Array.isArray(reasoningBlocks)
-    ? reasoningBlocks.map((block) => String(block || "").trim()).filter(Boolean)
-    : [];
-  if (!blocks.length) {
+function createReasoningDisclosure(reasoning, existing = null) {
+  const normalized = normalizeReasoningPayload(reasoning);
+  const blocks = normalized.blocks;
+  const text = normalized.pending ? normalized.text : normalized.text || blocks.join("\n\n");
+  if (!text.trim() && !blocks.length) {
     return null;
   }
 
   const details = document.createElement("details");
-  details.className = "reasoning-disclosure";
+  details.className = `reasoning-disclosure${normalized.pending ? " pending" : ""}`;
+  details.open = existing ? Boolean(existing.open) : normalized.pending;
 
   const summary = document.createElement("summary");
-  const totalChars = blocks.reduce((sum, block) => sum + block.length, 0);
-  summary.textContent = `Reasoning (${blocks.length} block${blocks.length === 1 ? "" : "s"}, ${totalChars} chars)`;
+  if (normalized.pending) {
+    summary.textContent = "Thinking...";
+  } else {
+    const totalChars = blocks.reduce((sum, block) => sum + block.length, 0);
+    summary.textContent = `Reasoning (${blocks.length} block${blocks.length === 1 ? "" : "s"}, ${totalChars} chars)`;
+  }
   details.appendChild(summary);
 
   const content = document.createElement("div");
   content.className = "reasoning-content";
-  const combined = blocks
-    .map((block, index) => (blocks.length > 1 ? `Block ${index + 1}\n\n${block}` : block))
-    .join("\n\n");
+  const combined = normalized.pending
+    ? text
+    : blocks
+      .map((block, index) => (blocks.length > 1 ? `Block ${index + 1}\n\n${block}` : block))
+      .join("\n\n");
   content.appendChild(renderMarkdownFragment(combined));
   details.appendChild(content);
   return details;
@@ -4276,17 +4370,17 @@ function updateMessage(node, role, text, pending = false, extraClass = "", reaso
   }
   let displayText = rawText;
   let reasoningDisclosure = null;
+  let reasoningState = null;
   if (role === "assistant") {
-    const explicitReasoning = Array.isArray(reasoningBlocks)
-      ? reasoningBlocks.map((block) => String(block || "").trim()).filter(Boolean)
-      : [];
-    if (explicitReasoning.length) {
+    const existingReasoningDisclosure = body.querySelector("details.reasoning-disclosure");
+    reasoningState = normalizeReasoningPayload(reasoningBlocks);
+    if (reasoningState.text.trim() || reasoningState.blocks.length) {
       displayText = rawText;
-      reasoningDisclosure = createReasoningDisclosure(explicitReasoning);
+      reasoningDisclosure = createReasoningDisclosure(reasoningState, existingReasoningDisclosure);
     } else {
       const collapsed = collapseThinkBlocks(rawText);
       displayText = collapsed.visible;
-      reasoningDisclosure = createReasoningDisclosure(collapsed.reasoningBlocks);
+      reasoningDisclosure = createReasoningDisclosure(collapsed.reasoningBlocks, existingReasoningDisclosure);
     }
   }
   body.textContent = "";
@@ -4295,7 +4389,9 @@ function updateMessage(node, role, text, pending = false, extraClass = "", reaso
   } else if (role === "assistant" && reasoningDisclosure) {
     const note = document.createElement("p");
     note.className = "reasoning-note";
-    note.textContent = "No final answer text. Expand reasoning below.";
+    note.textContent = reasoningState?.pending
+      ? "No final answer yet. Thinking below."
+      : "No final answer text. Expand reasoning below.";
     body.appendChild(note);
   }
   if (role === "assistant" && reasoningDisclosure) {
