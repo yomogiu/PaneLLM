@@ -208,8 +208,8 @@ def add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=256,
-        help="Max completion tokens per request (default: 256).",
+        default=None,
+        help="Max completion tokens per request (default: upstream server behavior).",
     )
     parser.add_argument(
         "--verbose",
@@ -436,8 +436,9 @@ def run_private_ask(args: argparse.Namespace) -> int:
             {"role": "user", "content": question},
         ],
         "temperature": args.temperature,
-        "max_tokens": args.max_tokens,
     }
+    if args.max_tokens is not None:
+        payload["max_tokens"] = args.max_tokens
     response = chat_completion(args.glm_url, api_key, payload)
     print_summary("model response:", response, args.verbose)
 
@@ -528,8 +529,9 @@ def run_agent_loop(args: argparse.Namespace) -> int:
             "tools": TOOLS,
             "tool_choice": "auto",
             "temperature": args.temperature,
-            "max_tokens": args.max_tokens,
         }
+        if args.max_tokens is not None:
+            payload["max_tokens"] = args.max_tokens
         response = chat_completion(args.glm_url, api_key, payload)
         print_summary(f"\nllama.cpp response {step}:", response, args.verbose)
 

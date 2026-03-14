@@ -276,8 +276,18 @@ async function buildAssistantBrokerPayload(message) {
 
   const pageContext = message.includePageContext && tab ? await capturePageContext(tab) : null;
   const riskSignals = detectRiskSignals(message.prompt);
+  const chatTemplateKwargs =
+    message.chatTemplateKwargs && typeof message.chatTemplateKwargs === "object"
+      ? message.chatTemplateKwargs
+      : message.chat_template_kwargs && typeof message.chat_template_kwargs === "object"
+        ? message.chat_template_kwargs
+        : null;
+  const reasoningBudget =
+    message.reasoningBudget !== undefined
+      ? message.reasoningBudget
+      : message.reasoning_budget;
 
-  return {
+  const payload = {
     session_id: message.sessionId,
     prompt: message.prompt,
     page_context: pageContext,
@@ -287,6 +297,13 @@ async function buildAssistantBrokerPayload(message) {
     confirmed: message.confirmed === true,
     risk_signals: riskSignals
   };
+  if (chatTemplateKwargs) {
+    payload.chat_template_kwargs = chatTemplateKwargs;
+  }
+  if (reasoningBudget !== undefined) {
+    payload.reasoning_budget = reasoningBudget;
+  }
+  return payload;
 }
 
 async function routeAssistantQuery(message) {

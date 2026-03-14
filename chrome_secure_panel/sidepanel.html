@@ -146,8 +146,17 @@
             placeholder="Message the assistant..."
           ></textarea>
           <div class="composer-row">
-            <button id="stop-btn" class="ghost hidden" type="button">Stop</button>
-            <button id="send-btn">Send</button>
+            <div id="llama-thinking-controls" class="composer-tools hidden" aria-live="polite">
+              <label id="llama-thinking-toggle" class="toggle compact composer-toggle" for="llama-enable-thinking">
+                <input id="llama-enable-thinking" type="checkbox" />
+                <span>Thinking</span>
+              </label>
+              <span id="llama-thinking-state" class="composer-inline-note">Off · budget 0</span>
+            </div>
+            <div class="composer-actions">
+              <button id="stop-btn" class="ghost hidden" type="button">Stop</button>
+              <button id="send-btn">Send</button>
+            </div>
           </div>
         </footer>
       </section>
