@@ -4,8 +4,7 @@ const RELAY_POLL_TIMEOUT_MS = 25_000;
 const RELAY_INITIAL_BACKOFF_MS = 1_000;
 const RELAY_MAX_BACKOFF_MS = 15_000;
 const RELAY_COMMAND_LOOP_VERSION = "0.2.0";
-const PAGE_CONTEXT_SELECTION_CHARS = 1_200;
-const PAGE_CONTEXT_TEXT_CHARS = 3_000;
+const PAGE_CONTEXT_TEXT_CHARS = 5_000;
 const FORCED_BROWSER_ACTION_ROUTE_TIMEOUT_MS = 300_000;
 const HOST_POLICY_STORAGE_KEY = "assistant.pageHostPolicy.v1";
 const MAX_POLICY_HOSTS = 256;
@@ -27,8 +26,7 @@ let relayBackoffMs = RELAY_INITIAL_BACKOFF_MS;
 const relayClientId = `ext_${crypto.randomUUID()}`;
 const inflightRouteQueries = new Map();
 const hostPolicy = {
-  allowedHosts: [],
-  blockedHosts: []
+  allowedHosts: []
 };
 const hostPolicyReady = initializeHostPolicy();
 
@@ -133,6 +131,72 @@ async function handleMessage(message) {
   if (message.type === "assistant.mlx.adapters.unload") {
     return await unloadMlxAdapter();
   }
+  if (message.type === "assistant.mlx.training.datasets.import") {
+    return await importTrainingDataset(message);
+  }
+  if (message.type === "assistant.mlx.training.datasets.list") {
+    return await listTrainingDatasets();
+  }
+  if (message.type === "assistant.mlx.training.datasets.get") {
+    return await getTrainingDataset(message);
+  }
+  if (message.type === "assistant.mlx.training.datasets.delete") {
+    return await deleteTrainingDataset(message);
+  }
+  if (message.type === "assistant.mlx.training.job.start") {
+    return await startTrainingJob(message);
+  }
+  if (message.type === "assistant.mlx.training.job.get") {
+    return await getTrainingJob(message);
+  }
+  if (message.type === "assistant.mlx.training.runs.list") {
+    return await listTrainingRuns();
+  }
+  if (message.type === "assistant.mlx.training.runs.get") {
+    return await getTrainingRun(message);
+  }
+  if (message.type === "assistant.mlx.training.checkpoint.promote") {
+    return await promoteTrainingCheckpoint(message);
+  }
+  if (message.type === "assistant.jobs.list") {
+    return await listJobs(message);
+  }
+  if (message.type === "assistant.jobs.cancel") {
+    return await cancelJob(message);
+  }
+  if (message.type === "assistant.papers.inspect") {
+    return await inspectPaper(message);
+  }
+  if (message.type === "assistant.papers.job.start") {
+    return await startPaperJob(message);
+  }
+  if (message.type === "assistant.papers.job.get") {
+    return await getPaperJob(message);
+  }
+  if (message.type === "assistant.papers.list") {
+    return await listPapers();
+  }
+  if (message.type === "assistant.papers.get") {
+    return await getPaper(message);
+  }
+  if (message.type === "assistant.papers.section.get") {
+    return await getPaperSection(message);
+  }
+  if (message.type === "assistant.experiments.job.start") {
+    return await startExperimentJob(message);
+  }
+  if (message.type === "assistant.experiments.job.get") {
+    return await getExperimentJob(message);
+  }
+  if (message.type === "assistant.experiments.list") {
+    return await listExperiments();
+  }
+  if (message.type === "assistant.experiments.get") {
+    return await getExperiment(message);
+  }
+  if (message.type === "assistant.experiments.compare") {
+    return await compareExperiments(message);
+  }
   if (message.type === "assistant.tools.browser_config.get") {
     return await getBrowserConfig();
   }
@@ -145,14 +209,8 @@ async function handleMessage(message) {
   if (message.type === "assistant.tools.page_hosts.allow") {
     return { policy: await allowHost(message.host) };
   }
-  if (message.type === "assistant.tools.page_hosts.block") {
-    return { policy: await blockHost(message.host) };
-  }
   if (message.type === "assistant.tools.page_hosts.remove_allow") {
     return { policy: await removeAllowedHost(message.host) };
-  }
-  if (message.type === "assistant.tools.page_hosts.unblock") {
-    return { policy: await unblockHost(message.host) };
   }
   if (message.type === "assistant.tools.page_hosts.allow_active_tab") {
     const activeTab = await getActiveTab();
@@ -179,8 +237,7 @@ async function handleMessage(message) {
       active_tab: {
         host,
         url: String(activeTab.url),
-        allowed: isHostAllowed(activeTab.url, snapshot.effective_allowed_hosts),
-        blocked: hostMatchesAllowedList(host, snapshot.blocked_hosts)
+        allowed: isHostAllowed(activeTab.url, snapshot.effective_allowed_hosts)
       }
     };
   }
@@ -443,6 +500,245 @@ async function unloadMlxAdapter() {
   return await brokerRequest("POST", "/mlx/adapters/unload", {});
 }
 
+async function importTrainingDataset(message) {
+  const body = {};
+  if (typeof message?.path === "string" && message.path.trim()) {
+    body.path = message.path.trim();
+  }
+  if (typeof message?.name === "string" && message.name.trim()) {
+    body.name = message.name.trim();
+  }
+  return await brokerRequest("POST", "/mlx/training/datasets/import", body);
+}
+
+async function listTrainingDatasets() {
+  return await brokerRequest("GET", "/mlx/training/datasets");
+}
+
+async function getTrainingDataset(message) {
+  if (!message?.datasetId || typeof message.datasetId !== "string") {
+    throw new Error("datasetId is required.");
+  }
+  return await brokerRequest("GET", `/mlx/training/datasets/${encodeURIComponent(message.datasetId)}`);
+}
+
+async function deleteTrainingDataset(message) {
+  if (!message?.datasetId || typeof message.datasetId !== "string") {
+    throw new Error("datasetId is required.");
+  }
+  return await brokerRequest("DELETE", `/mlx/training/datasets/${encodeURIComponent(message.datasetId)}`);
+}
+
+async function startTrainingJob(message) {
+  const body = {};
+  if (typeof message?.datasetId === "string" && message.datasetId.trim()) {
+    body.dataset_id = message.datasetId.trim();
+  }
+  if (typeof message?.name === "string" && message.name.trim()) {
+    body.name = message.name.trim();
+  }
+  if (typeof message?.modelPath === "string" && message.modelPath.trim()) {
+    body.model_path = message.modelPath.trim();
+  }
+  if (message?.trainingConfig && typeof message.trainingConfig === "object") {
+    body.training_config = message.trainingConfig;
+  }
+  if (typeof message?.resumeRunId === "string" && message.resumeRunId.trim()) {
+    body.resume_run_id = message.resumeRunId.trim();
+  }
+  if (typeof message?.resumeCheckpointKind === "string" && message.resumeCheckpointKind.trim()) {
+    body.resume_checkpoint_kind = message.resumeCheckpointKind.trim();
+  }
+  if (typeof message?.resumeCheckpointPath === "string" && message.resumeCheckpointPath.trim()) {
+    body.resume_checkpoint_path = message.resumeCheckpointPath.trim();
+  }
+  if (Number.isInteger(Number(message?.additionalIters))) {
+    body.additional_iters = Number(message.additionalIters);
+  }
+  if (typeof message?.stopRuntimeFirst === "boolean") {
+    body.stop_runtime_first = message.stopRuntimeFirst;
+  }
+  return await brokerRequest("POST", "/mlx/training/jobs", body);
+}
+
+async function getTrainingJob(message) {
+  if (!message?.jobId || typeof message.jobId !== "string") {
+    throw new Error("jobId is required.");
+  }
+  return await brokerRequest("GET", `/mlx/training/jobs/${encodeURIComponent(message.jobId)}`);
+}
+
+async function listTrainingRuns() {
+  return await brokerRequest("GET", "/mlx/training/runs");
+}
+
+async function getTrainingRun(message) {
+  if (!message?.runId || typeof message.runId !== "string") {
+    throw new Error("runId is required.");
+  }
+  return await brokerRequest("GET", `/mlx/training/runs/${encodeURIComponent(message.runId)}`);
+}
+
+async function promoteTrainingCheckpoint(message) {
+  const body = {};
+  if (typeof message?.runId === "string" && message.runId.trim()) {
+    body.run_id = message.runId.trim();
+  }
+  if (typeof message?.checkpointKind === "string" && message.checkpointKind.trim()) {
+    body.checkpoint_kind = message.checkpointKind.trim();
+  }
+  if (typeof message?.checkpointPath === "string" && message.checkpointPath.trim()) {
+    body.checkpoint_path = message.checkpointPath.trim();
+  }
+  if (typeof message?.name === "string" && message.name.trim()) {
+    body.name = message.name.trim();
+  }
+  return await brokerRequest("POST", "/mlx/training/checkpoints/promote", body);
+}
+
+async function listJobs(message) {
+  const params = new URLSearchParams();
+  if (typeof message?.kind === "string" && message.kind.trim()) {
+    params.set("kind", message.kind.trim());
+  }
+  if (typeof message?.status === "string" && message.status.trim()) {
+    params.set("status", message.status.trim());
+  }
+  const query = params.toString();
+  return await brokerRequest("GET", query ? `/jobs?${query}` : "/jobs");
+}
+
+async function cancelJob(message) {
+  if (!message?.jobId || typeof message.jobId !== "string") {
+    throw new Error("jobId is required.");
+  }
+  const path = `/jobs/${encodeURIComponent(message.jobId)}/cancel`;
+  return await brokerRequest("POST", path, {});
+}
+
+async function inspectPaper(message) {
+  const body = buildPaperSourceBody(message);
+  return await brokerRequest("POST", "/papers/inspect", body);
+}
+
+async function startPaperJob(message) {
+  const body = buildPaperSourceBody(message);
+  if (typeof message?.analysisMode === "string" && message.analysisMode.trim()) {
+    body.analysis_mode = message.analysisMode.trim();
+  }
+  if (typeof message?.backend === "string" && message.backend.trim()) {
+    body.backend = message.backend.trim();
+  }
+  return await brokerRequest("POST", "/papers/jobs", body);
+}
+
+async function getPaperJob(message) {
+  if (!message?.jobId || typeof message.jobId !== "string") {
+    throw new Error("jobId is required.");
+  }
+  const path = `/papers/jobs/${encodeURIComponent(message.jobId)}`;
+  return await brokerRequest("GET", path);
+}
+
+async function listPapers() {
+  return await brokerRequest("GET", "/papers");
+}
+
+async function getPaper(message) {
+  if (!message?.paperId || typeof message.paperId !== "string") {
+    throw new Error("paperId is required.");
+  }
+  const path = `/papers/${encodeURIComponent(message.paperId)}`;
+  return await brokerRequest("GET", path);
+}
+
+async function getPaperSection(message) {
+  if (!message?.paperId || typeof message.paperId !== "string") {
+    throw new Error("paperId is required.");
+  }
+  if (!message?.sectionId || typeof message.sectionId !== "string") {
+    throw new Error("sectionId is required.");
+  }
+  const path =
+    `/papers/${encodeURIComponent(message.paperId)}/sections/${encodeURIComponent(message.sectionId)}`;
+  return await brokerRequest("GET", path);
+}
+
+async function startExperimentJob(message) {
+  const body = {};
+  if (typeof message?.kind === "string" && message.kind.trim()) {
+    body.kind = message.kind.trim();
+  }
+  if (typeof message?.modelPath === "string" && message.modelPath.trim()) {
+    body.model_path = message.modelPath.trim();
+  }
+  if (typeof message?.adapterPath === "string" && message.adapterPath.trim()) {
+    body.adapter_path = message.adapterPath.trim();
+  }
+  if (typeof message?.adapterId === "string" && message.adapterId.trim()) {
+    body.adapter_id = message.adapterId.trim();
+  }
+  if (Array.isArray(message?.promptSet)) {
+    body.prompt_set = message.promptSet;
+  }
+  if (message?.generation && typeof message.generation === "object") {
+    body.generation = message.generation;
+  }
+  if (typeof message?.systemPrompt === "string") {
+    body.system_prompt = message.systemPrompt;
+  }
+  return await brokerRequest("POST", "/experiments/jobs", body);
+}
+
+async function getExperimentJob(message) {
+  if (!message?.jobId || typeof message.jobId !== "string") {
+    throw new Error("jobId is required.");
+  }
+  const path = `/experiments/jobs/${encodeURIComponent(message.jobId)}`;
+  return await brokerRequest("GET", path);
+}
+
+async function listExperiments() {
+  return await brokerRequest("GET", "/experiments");
+}
+
+async function getExperiment(message) {
+  if (!message?.experimentId || typeof message.experimentId !== "string") {
+    throw new Error("experimentId is required.");
+  }
+  const path = `/experiments/${encodeURIComponent(message.experimentId)}`;
+  return await brokerRequest("GET", path);
+}
+
+async function compareExperiments(message) {
+  if (!message?.experimentId || typeof message.experimentId !== "string") {
+    throw new Error("experimentId is required.");
+  }
+  if (!message?.otherExperimentId || typeof message.otherExperimentId !== "string") {
+    throw new Error("otherExperimentId is required.");
+  }
+  const path =
+    `/experiments/${encodeURIComponent(message.experimentId)}/compare/${encodeURIComponent(message.otherExperimentId)}`;
+  return await brokerRequest("GET", path);
+}
+
+function buildPaperSourceBody(message) {
+  const body = {};
+  if (typeof message?.url === "string" && message.url.trim()) {
+    body.url = message.url.trim();
+  }
+  if (typeof message?.pdfPath === "string" && message.pdfPath.trim()) {
+    body.pdf_path = message.pdfPath.trim();
+  }
+  if (typeof message?.htmlPath === "string" && message.htmlPath.trim()) {
+    body.html_path = message.htmlPath.trim();
+  }
+  if (typeof message?.textPath === "string" && message.textPath.trim()) {
+    body.text_path = message.textPath.trim();
+  }
+  return body;
+}
+
 async function getBrowserConfig() {
   return await brokerRequest("GET", "/browser/config");
 }
@@ -465,12 +761,31 @@ async function brokerRequest(method, path, body = null, options = {}) {
     headers["Content-Type"] = "application/json";
   }
 
-  const response = await fetch(`${BROKER_URL}${path}`, {
-    method,
-    headers,
-    body: body === null ? undefined : JSON.stringify(body),
-    signal: options.signal
-  });
+  let response;
+  try {
+    response = await fetch(`${BROKER_URL}${path}`, {
+      method,
+      headers,
+      body: body === null ? undefined : JSON.stringify(body),
+      signal: options.signal
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw error;
+    }
+    const detail = String(error?.message || error || "unknown fetch failure");
+    console.error("[secure-panel] broker request failed to reach local broker:", {
+      method,
+      path,
+      detail
+    });
+    const message =
+      `Could not reach the local broker at ${BROKER_URL}${path}. `
+      + "Make sure broker/local_broker.py is running and the extension can access localhost.";
+    const wrapped = new Error(message);
+    wrapped.code = "broker_unreachable";
+    throw wrapped;
+  }
   let parsed = null;
   try {
     parsed = await response.json();
@@ -600,19 +915,12 @@ function normalizeHostList(values, maxEntries = MAX_POLICY_HOSTS) {
   return deduped;
 }
 
-function normalizeBlockedHosts(blockedHosts = null) {
-  const source = blockedHosts === null ? hostPolicy.blockedHosts : blockedHosts;
-  return normalizeHostList(source);
-}
-
 function normalizeAllowedHosts(allowedHosts = null) {
   const source =
     allowedHosts === null
       ? [...DEFAULT_ALLOWED_PAGE_HOSTS, ...hostPolicy.allowedHosts]
       : allowedHosts;
-  const normalized = normalizeHostList(source);
-  const blockedSet = new Set(normalizeBlockedHosts());
-  return normalized.filter((host) => !blockedSet.has(host));
+  return normalizeHostList(source);
 }
 
 function hostPermissionOrigins(host) {
@@ -710,9 +1018,6 @@ function isHostAllowed(rawUrl, allowedHosts = null) {
   if (!host) {
     return false;
   }
-  if (hostMatchesAllowedList(host, normalizeBlockedHosts())) {
-    return false;
-  }
   return hostMatchesAllowedList(host, normalizeAllowedHosts(allowedHosts));
 }
 
@@ -722,22 +1027,28 @@ function createHostNotAllowlistedError(rawUrl, message, allowedHosts = null) {
   error.data = {
     host: extractUrlHost(rawUrl),
     url: typeof rawUrl === "string" ? rawUrl : "",
-    effective_allowed_hosts: normalizeAllowedHosts(allowedHosts),
-    blocked_hosts: normalizeBlockedHosts()
+    effective_allowed_hosts: normalizeAllowedHosts(allowedHosts)
   };
   return error;
 }
 
 async function initializeHostPolicy() {
+  let needsMigration = false;
   try {
     const stored = await chrome.storage.local.get(HOST_POLICY_STORAGE_KEY);
     const raw = stored?.[HOST_POLICY_STORAGE_KEY];
     if (raw && typeof raw === "object") {
       hostPolicy.allowedHosts = normalizeHostList(raw.allowed_hosts ?? raw.allowedHosts ?? []);
-      hostPolicy.blockedHosts = normalizeHostList(raw.blocked_hosts ?? raw.blockedHosts ?? []);
+      needsMigration =
+        Object.prototype.hasOwnProperty.call(raw, "blocked_hosts")
+        || Object.prototype.hasOwnProperty.call(raw, "blockedHosts");
     }
   } catch (error) {
     console.warn("[secure-panel] failed to load host policy:", String(error?.message || error));
+    return;
+  }
+  if (needsMigration) {
+    await persistHostPolicy();
   }
 }
 
@@ -745,8 +1056,7 @@ async function persistHostPolicy() {
   try {
     await chrome.storage.local.set({
       [HOST_POLICY_STORAGE_KEY]: {
-        allowed_hosts: [...hostPolicy.allowedHosts],
-        blocked_hosts: [...hostPolicy.blockedHosts]
+        allowed_hosts: [...hostPolicy.allowedHosts]
       }
     });
   } catch (error) {
@@ -757,12 +1067,10 @@ async function persistHostPolicy() {
 function getHostPolicySnapshot() {
   const defaultHosts = normalizeHostList([...DEFAULT_ALLOWED_PAGE_HOSTS]);
   const customAllowedHosts = normalizeHostList(hostPolicy.allowedHosts);
-  const blockedHosts = normalizeHostList(hostPolicy.blockedHosts);
   const effectiveAllowedHosts = normalizeAllowedHosts([...defaultHosts, ...customAllowedHosts]);
   return {
     default_hosts: defaultHosts,
     custom_allowed_hosts: customAllowedHosts,
-    blocked_hosts: blockedHosts,
     effective_allowed_hosts: effectiveAllowedHosts
   };
 }
@@ -777,12 +1085,8 @@ function parseHostForPolicy(rawHost) {
   throw error;
 }
 
-async function updateHostPolicyState(nextAllowedHosts, nextBlockedHosts) {
-  const blocked = normalizeHostList(nextBlockedHosts);
-  const blockedSet = new Set(blocked);
-  const allowed = normalizeHostList(nextAllowedHosts).filter((host) => !blockedSet.has(host));
-  hostPolicy.allowedHosts = allowed;
-  hostPolicy.blockedHosts = blocked;
+async function updateHostPolicyState(nextAllowedHosts) {
+  hostPolicy.allowedHosts = normalizeHostList(nextAllowedHosts);
   await persistHostPolicy();
   return getHostPolicySnapshot();
 }
@@ -795,30 +1099,14 @@ async function allowHost(rawHost) {
   if (!defaultHosts.has(host)) {
     nextAllowed.push(host);
   }
-  const nextBlocked = hostPolicy.blockedHosts.filter((value) => value !== host);
-  return await updateHostPolicyState(nextAllowed, nextBlocked);
-}
-
-async function blockHost(rawHost) {
-  await hostPolicyReady;
-  const host = parseHostForPolicy(rawHost);
-  const nextAllowed = hostPolicy.allowedHosts.filter((value) => value !== host);
-  const nextBlocked = [...hostPolicy.blockedHosts.filter((value) => value !== host), host];
-  return await updateHostPolicyState(nextAllowed, nextBlocked);
+  return await updateHostPolicyState(nextAllowed);
 }
 
 async function removeAllowedHost(rawHost) {
   await hostPolicyReady;
   const host = parseHostForPolicy(rawHost);
   const nextAllowed = hostPolicy.allowedHosts.filter((value) => value !== host);
-  return await updateHostPolicyState(nextAllowed, hostPolicy.blockedHosts);
-}
-
-async function unblockHost(rawHost) {
-  await hostPolicyReady;
-  const host = parseHostForPolicy(rawHost);
-  const nextBlocked = hostPolicy.blockedHosts.filter((value) => value !== host);
-  return await updateHostPolicyState(hostPolicy.allowedHosts, nextBlocked);
+  return await updateHostPolicyState(nextAllowed);
 }
 
 function ensureUrl(rawUrl, allowedHosts = null) {
@@ -991,9 +1279,7 @@ async function waitForTabLoad(tabId, timeoutMs) {
 
 async function capturePageContext(tab) {
   const fallback = {
-    title: typeof tab?.title === "string" ? tab.title.slice(0, 200) : "",
     url: typeof tab?.url === "string" ? tab.url : "",
-    selection: "",
     text_excerpt: ""
   };
 
@@ -1002,31 +1288,225 @@ async function capturePageContext(tab) {
     const tabId = parseTabId(tab?.id);
     const [injected] = await chrome.scripting.executeScript({
       target: { tabId },
-      func: (selectionLimit, textLimit) => {
-        const normalize = (value, limit) =>
-          String(value || "").replace(/\s+/g, " ").trim().slice(0, limit);
-        const selection = normalize(
-          typeof window.getSelection === "function" ? window.getSelection()?.toString() : "",
-          selectionLimit
-        );
-        const bodyText =
-          typeof document.body?.innerText === "string"
-            ? document.body.innerText
-            : typeof document.documentElement?.innerText === "string"
-              ? document.documentElement.innerText
-              : typeof document.body?.textContent === "string"
-                ? document.body.textContent
-                : typeof document.documentElement?.textContent === "string"
-                  ? document.documentElement.textContent
-                  : "";
+      func: (textLimit) => {
+        const BLOCK_TAGS = new Set([
+          "address",
+          "article",
+          "blockquote",
+          "dd",
+          "div",
+          "dl",
+          "dt",
+          "figcaption",
+          "figure",
+          "h1",
+          "h2",
+          "h3",
+          "h4",
+          "h5",
+          "h6",
+          "li",
+          "main",
+          "ol",
+          "p",
+          "pre",
+          "section",
+          "table",
+          "tbody",
+          "td",
+          "th",
+          "thead",
+          "tr",
+          "ul"
+        ]);
+        const SKIP_TAGS = new Set([
+          "aside",
+          "button",
+          "canvas",
+          "dialog",
+          "footer",
+          "form",
+          "header",
+          "iframe",
+          "input",
+          "nav",
+          "noscript",
+          "script",
+          "select",
+          "style",
+          "svg",
+          "textarea"
+        ]);
+        const BOILERPLATE_PATTERN =
+          /\b(ad|ads|advert|advertisement|sponsor|sponsored|promo|promoted|cookie|consent|newsletter|subscribe|signup|sign-up|related|recommend(?:ed|ation)?s?|social|share|sidebar|rail|banner|popup|modal|dialog|toolbar|breadcrumb|outbrain|taboola)\b/i;
+
+        const normalizeInline = (value) => String(value || "").replace(/\s+/g, " ").trim();
+        const clipText = (value, limit) => String(value || "").slice(0, limit);
+
+        const isVisible = (element) => {
+          if (!(element instanceof Element)) {
+            return false;
+          }
+          const style = window.getComputedStyle(element);
+          if (!style || style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+            return false;
+          }
+          if (element.hasAttribute("hidden") || element.getAttribute("aria-hidden") === "true") {
+            return false;
+          }
+          const rect = element.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        };
+
+        const markerText = (element) =>
+          normalizeInline([
+            element.id,
+            typeof element.className === "string" ? element.className : "",
+            element.getAttribute("role"),
+            element.getAttribute("aria-label"),
+            element.getAttribute("data-testid"),
+            element.getAttribute("data-test"),
+            element.getAttribute("name")
+          ].join(" "));
+
+        const shouldSkipElement = (element) => {
+          if (!(element instanceof Element)) {
+            return false;
+          }
+          const tagName = String(element.tagName || "").toLowerCase();
+          if (tagName === "body" || tagName === "html") {
+            return false;
+          }
+          if (SKIP_TAGS.has(tagName)) {
+            return true;
+          }
+          if (!isVisible(element)) {
+            return true;
+          }
+          const role = normalizeInline(element.getAttribute("role")).toLowerCase();
+          if (role === "navigation" || role === "banner" || role === "contentinfo" || role === "complementary") {
+            return true;
+          }
+          const marker = markerText(element);
+          return Boolean(marker && BOILERPLATE_PATTERN.test(marker));
+        };
+
+        const appendBoundary = (parts) => {
+          if (!parts.length) {
+            return;
+          }
+          const last = parts[parts.length - 1];
+          if (last !== "\n\n") {
+            parts.push("\n\n");
+          }
+        };
+
+        const appendText = (parts, value) => {
+          const text = normalizeInline(value);
+          if (!text) {
+            return;
+          }
+          const last = parts[parts.length - 1] || "";
+          if (last && last !== "\n" && last !== "\n\n" && !last.endsWith(" ")) {
+            parts.push(" ");
+          }
+          parts.push(text);
+        };
+
+        const extractText = (root) => {
+          const parts = [];
+
+          const walk = (node) => {
+            if (!node) {
+              return;
+            }
+            if (node.nodeType === Node.TEXT_NODE) {
+              appendText(parts, node.textContent || "");
+              return;
+            }
+            if (!(node instanceof Element)) {
+              return;
+            }
+            const tagName = String(node.tagName || "").toLowerCase();
+            if (tagName === "br") {
+              if (parts.length && parts[parts.length - 1] !== "\n") {
+                parts.push("\n");
+              }
+              return;
+            }
+            if (shouldSkipElement(node)) {
+              return;
+            }
+            const isBlock = BLOCK_TAGS.has(tagName);
+            if (isBlock) {
+              appendBoundary(parts);
+            }
+            for (const child of Array.from(node.childNodes)) {
+              walk(child);
+            }
+            if (isBlock) {
+              appendBoundary(parts);
+            }
+          };
+
+          walk(root);
+
+          return parts
+            .join("")
+            .replace(/[ \t]+\n/g, "\n")
+            .replace(/\n[ \t]+/g, "\n")
+            .replace(/[ \t]{2,}/g, " ")
+            .replace(/\n{3,}/g, "\n\n")
+            .trim();
+        };
+
+        const rootCandidates = [
+          ...Array.from(document.querySelectorAll("article")),
+          ...Array.from(document.querySelectorAll("main")),
+          ...Array.from(document.querySelectorAll("[role='main']"))
+        ].filter((element, index, items) => items.indexOf(element) === index);
+
+        let bestRoot = null;
+        let bestLength = 0;
+        for (const candidate of rootCandidates) {
+          if (!(candidate instanceof Element) || shouldSkipElement(candidate)) {
+            continue;
+          }
+          const candidateText = extractText(candidate);
+          if (candidateText.length > bestLength) {
+            bestRoot = candidate;
+            bestLength = candidateText.length;
+          }
+        }
+
+        const fallbackRoot =
+          document.body instanceof Element
+            ? document.body
+            : document.documentElement instanceof Element
+              ? document.documentElement
+              : null;
+        const chosenRoot = bestRoot || fallbackRoot;
+        let textExcerpt = chosenRoot ? extractText(chosenRoot) : "";
+        if (!textExcerpt) {
+          const bodyText =
+            typeof document.body?.innerText === "string"
+              ? document.body.innerText
+              : typeof document.documentElement?.innerText === "string"
+                ? document.documentElement.innerText
+                : typeof document.body?.textContent === "string"
+                  ? document.body.textContent
+                  : typeof document.documentElement?.textContent === "string"
+                    ? document.documentElement.textContent
+                    : "";
+          textExcerpt = normalizeInline(bodyText);
+        }
+
         return {
-          title: normalize(document.title, 200),
-          url: String(location?.href || "").slice(0, 2000),
-          selection,
-          text_excerpt: normalize(bodyText, textLimit)
+          url: clipText(location?.href || "", 2000),
+          text_excerpt: clipText(textExcerpt, textLimit)
         };
       },
-      args: [PAGE_CONTEXT_SELECTION_CHARS, PAGE_CONTEXT_TEXT_CHARS]
+      args: [PAGE_CONTEXT_TEXT_CHARS]
     });
 
     const result = injected?.result;
@@ -1035,9 +1515,7 @@ async function capturePageContext(tab) {
     }
 
     return {
-      title: typeof result.title === "string" && result.title ? result.title : fallback.title,
       url: typeof result.url === "string" && result.url ? result.url : fallback.url,
-      selection: typeof result.selection === "string" ? result.selection : "",
       text_excerpt: typeof result.text_excerpt === "string" ? result.text_excerpt : ""
     };
   } catch (error) {

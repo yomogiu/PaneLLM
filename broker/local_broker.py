@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import select
 import shlex
@@ -17,6 +18,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import sha1
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -40,17 +42,16 @@ REQUIRED_CLIENT_VALUE = "chrome-sidepanel-v1"
 CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 PAGE_CONTEXT_FIELD_LIMITS = {
-    "title": 200,
     "url": 2000,
-    "selection": 1200,
-    "text_excerpt": 3000,
+    "text_excerpt": 5000,
 }
-PAGE_CONTEXT_PROMPT_CHAR_BUDGET = 4500
+PAGE_CONTEXT_PROMPT_CHAR_BUDGET = 7200
 CODEX_TOOL_OUTPUT_CHAR_BUDGET = 12000
 CODEX_APPROVAL_TEXT_PREVIEW_CHARS = 120
 CODEX_EVENT_POLL_MIN_TIMEOUT_MS = 0
 CODEX_EVENT_POLL_MAX_TIMEOUT_MS = 30000
 MLX_MAX_CONTEXT_CHARS_CAP = 56000
+LLAMA_HEALTHCHECK_TIMEOUT_SEC = 0.35
 BROWSER_AGENT_MAX_STEPS_DEFAULT = 20
 BROWSER_AGENT_MAX_STEPS_MIN = 1
 BROWSER_AGENT_MAX_STEPS_MAX = 40
@@ -694,6 +695,15 @@ class BrokerConfig:
     mlx_default_seed: int | None
     mlx_default_enable_thinking: bool
     mlx_default_system_prompt: str
+    paper_worker_python: str
+    paper_worker_path: Path
+    paper_job_timeout_sec: int
+    experiment_worker_python: str
+    experiment_worker_path: Path
+    experiment_job_timeout_sec: int
+    training_worker_python: str
+    training_worker_path: Path
+    training_job_timeout_sec: int
 
 
 def load_config() -> BrokerConfig:
@@ -775,6 +785,8 @@ def load_config() -> BrokerConfig:
     )
     browser_default_domain_allowlist = normalize_domain_allowlist(default_allowlist_raw)
     default_mlx_worker_path = repo_root / "broker" / "mlx_worker.py"
+    default_paper_worker_path = repo_root / "broker" / "paper_worker.py"
+    default_experiment_worker_path = repo_root / "broker" / "experiment_worker.py"
     mlx_model_path = os.environ.get("BROKER_MLX_MODEL_PATH", "").strip()
     mlx_worker_python = (
         os.environ.get("BROKER_MLX_WORKER_PYTHON", "python3").strip()
@@ -808,6 +820,31 @@ def load_config() -> BrokerConfig:
         except ValueError:
             mlx_default_seed = None
     mlx_default_system_prompt = os.environ.get("BROKER_MLX_DEFAULT_SYSTEM_PROMPT", "").strip()
+    paper_worker_python = (
+        os.environ.get("BROKER_PAPER_WORKER_PYTHON", "python3").strip()
+        or "python3"
+    )
+    paper_worker_path = Path(
+        os.environ.get("BROKER_PAPER_WORKER_PATH", str(default_paper_worker_path))
+    ).expanduser()
+    paper_job_timeout_sec = int(os.environ.get("BROKER_PAPER_JOB_TIMEOUT_SEC", "180"))
+    experiment_worker_python = (
+        os.environ.get("BROKER_EXPERIMENT_WORKER_PYTHON", "python3").strip()
+        or "python3"
+    )
+    experiment_worker_path = Path(
+        os.environ.get("BROKER_EXPERIMENT_WORKER_PATH", str(default_experiment_worker_path))
+    ).expanduser()
+    experiment_job_timeout_sec = int(os.environ.get("BROKER_EXPERIMENT_JOB_TIMEOUT_SEC", "900"))
+    training_worker_python = (
+        os.environ.get("BROKER_TRAINING_WORKER_PYTHON", "python3").strip()
+        or "python3"
+    )
+    default_training_worker_path = repo_root / "broker" / "training_worker.py"
+    training_worker_path = Path(
+        os.environ.get("BROKER_TRAINING_WORKER_PATH", str(default_training_worker_path))
+    ).expanduser()
+    training_job_timeout_sec = int(os.environ.get("BROKER_TRAINING_JOB_TIMEOUT_SEC", "7200"))
     return BrokerConfig(
         host=host,
         port=port,
@@ -856,6 +893,15 @@ def load_config() -> BrokerConfig:
         mlx_default_seed=mlx_default_seed,
         mlx_default_enable_thinking=mlx_default_enable_thinking,
         mlx_default_system_prompt=mlx_default_system_prompt,
+        paper_worker_python=paper_worker_python,
+        paper_worker_path=paper_worker_path,
+        paper_job_timeout_sec=paper_job_timeout_sec,
+        experiment_worker_python=experiment_worker_python,
+        experiment_worker_path=experiment_worker_path,
+        experiment_job_timeout_sec=experiment_job_timeout_sec,
+        training_worker_python=training_worker_python,
+        training_worker_path=training_worker_path,
+        training_job_timeout_sec=training_job_timeout_sec,
     )
 
 
@@ -923,6 +969,58 @@ def resolve_route_allowlist(
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def llama_backend_health(
+    config: BrokerConfig,
+    *,
+    timeout_sec: float = LLAMA_HEALTHCHECK_TIMEOUT_SEC,
+) -> dict[str, Any]:
+    llama_url = str(config.llama_url or "").strip()
+    payload: dict[str, Any] = {
+        "configured": bool(llama_url),
+        "available": False,
+        "status": "disabled",
+        "url": llama_url,
+        "host": "",
+        "port": None,
+        "model": str(config.llama_model or ""),
+        "last_error": "",
+    }
+    if not llama_url:
+        payload["last_error"] = "LLAMA_URL is not set."
+        return payload
+    try:
+        parsed = urlparse(llama_url)
+    except Exception:
+        parsed = None
+    if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        payload["status"] = "invalid_url"
+        payload["last_error"] = f"LLAMA_URL is invalid: {llama_url}"
+        return payload
+    host = str(parsed.hostname or "").strip()
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    payload["host"] = host
+    payload["port"] = port
+    try:
+        with socket.create_connection((host, port), timeout=max(0.05, float(timeout_sec))):
+            pass
+    except OSError as error:
+        payload["status"] = "unreachable"
+        payload["last_error"] = f"Cannot connect to llama.cpp at {llama_url} ({error})."
+        return payload
+    payload["available"] = True
+    payload["status"] = "ready"
+    return payload
+
+
+def ensure_llama_backend_available(config: BrokerConfig) -> None:
+    health = llama_backend_health(config)
+    if bool(health.get("available")):
+        return
+    raise RuntimeError(
+        str(health.get("last_error") or f"Cannot connect to llama.cpp at {config.llama_url}.")
+    )
 
 
 def read_codex_session_index(limit: int = 200) -> list[dict[str, Any]]:
@@ -1389,6 +1487,25 @@ MLX_CHAT_CONTRACT_BASE = {
     "tokenizer_template_mode": "apply_chat_template_default_v1",
     "max_context_behavior": "tail_truncate_chars_v1",
 }
+TRAINING_DATASET_MESSAGE_ROLES = {"system", "user", "assistant"}
+TRAINING_BALANCED_PROFILE = {
+    "rank": 8,
+    "scale": 20.0,
+    "dropout": 0.0,
+    "num_layers": 8,
+    "learning_rate": 1e-5,
+    "iters": 600,
+    "batch_size": 1,
+    "grad_accumulation_steps": 4,
+    "steps_per_report": 10,
+    "steps_per_eval": 100,
+    "save_every": 100,
+    "val_batches": 25,
+    "max_seq_length": 2048,
+    "grad_checkpoint": True,
+    "seed": 0,
+}
+TRAINING_PERIODIC_CHECKPOINT_LIMIT = 5
 
 
 class BrowserConfigManager:
@@ -1588,6 +1705,13 @@ class MlxRuntimeManager:
             "name": name,
             "path": str(Path(adapter_path).expanduser()),
             "created_at": created_at,
+            "source_type": str(value.get("source_type", "")).strip(),
+            "run_id": str(value.get("run_id", "")).strip(),
+            "checkpoint_kind": str(value.get("checkpoint_kind", "")).strip(),
+            "step": int(value.get("step", 0) or 0),
+            "validation_loss": _coerce_optional_float(value.get("validation_loss")),
+            "dataset_id": str(value.get("dataset_id", "")).strip(),
+            "promoted": bool(value.get("promoted", False)),
         }
 
     def _load_adapters(self) -> None:
@@ -1687,12 +1811,14 @@ class MlxRuntimeManager:
 
     def models_payload(self) -> dict[str, Any]:
         with self._lock:
+            llama = llama_backend_health(self._config)
             return {
                 "backends": [
                     {"id": "codex", "label": "Codex", "available": codex_backend_mode() != "disabled"},
-                    {"id": "llama", "label": "llama.cpp", "available": True},
+                    {"id": "llama", "label": "llama.cpp", "available": bool(llama["available"])},
                     {"id": "mlx", "label": "MLX Local", "available": self.is_available()},
                 ],
+                "llama": llama,
                 "mlx": self._status_payload_locked(),
             }
 
@@ -1704,7 +1830,20 @@ class MlxRuntimeManager:
         elif status in {"stopped", "failed", "disabled"}:
             self._started_at = ""
 
-    def _readline_with_timeout(self, stream: Any, timeout_sec: float) -> str:
+    def _stderr_excerpt_locked(self, process: subprocess.Popen[str]) -> str:
+        try:
+            if not process.stderr:
+                return ""
+            return summarize_mlx_worker_failure(process.stderr.read() or "")
+        except Exception:
+            return ""
+
+    def _readline_with_timeout(
+        self,
+        process: subprocess.Popen[str],
+        stream: Any,
+        timeout_sec: float,
+    ) -> str:
         if timeout_sec <= 0:
             timeout_sec = 0.1
         fd = stream.fileno()
@@ -1715,9 +1854,17 @@ class MlxRuntimeManager:
                 raise TimeoutError("Timed out waiting for MLX worker response.")
             ready, _, _ = select.select([fd], [], [], remaining)
             if not ready:
+                if process.poll() is not None:
+                    detail = self._stderr_excerpt_locked(process)
+                    if detail:
+                        raise RuntimeError(f"MLX worker exited before responding: {detail}")
+                    raise RuntimeError("MLX worker exited before responding.")
                 continue
             line = stream.readline()
             if line == "":
+                detail = self._stderr_excerpt_locked(process)
+                if detail:
+                    raise RuntimeError(f"MLX worker closed its stdout stream: {detail}")
                 raise RuntimeError("MLX worker closed its stdout stream.")
             return line.strip()
 
@@ -1729,7 +1876,7 @@ class MlxRuntimeManager:
     ) -> dict[str, Any]:
         end_at = time.monotonic() + max(0.1, timeout_sec)
         while True:
-            line = self._readline_with_timeout(process.stdout, max(0.1, end_at - time.monotonic()))
+            line = self._readline_with_timeout(process, process.stdout, max(0.1, end_at - time.monotonic()))
             if not line:
                 continue
             try:
@@ -1755,7 +1902,7 @@ class MlxRuntimeManager:
         while True:
             if cancel_check and cancel_check():
                 raise RouteRequestCancelledError("Request cancelled by user.")
-            line = self._readline_with_timeout(process.stdout, max(0.1, end_at - time.monotonic()))
+            line = self._readline_with_timeout(process, process.stdout, max(0.1, end_at - time.monotonic()))
             if not line:
                 continue
             try:
@@ -1822,7 +1969,7 @@ class MlxRuntimeManager:
                     command,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     text=True,
                     bufsize=1,
                 )
@@ -1971,6 +2118,68 @@ class MlxRuntimeManager:
                 "active_adapter": self._active_adapter_locked(),
             }
 
+    def register_adapter(
+        self,
+        *,
+        path: str,
+        name: str = "",
+        adapter_id: str = "",
+        metadata: dict[str, Any] | None = None,
+        activate: bool = False,
+    ) -> dict[str, Any]:
+        with self._lock:
+            adapter_path = str(Path(path).expanduser()) if path else ""
+            if not adapter_path:
+                raise ValueError("path is required.")
+            if not Path(adapter_path).exists():
+                raise ValueError(f"Adapter path does not exist: {adapter_path}")
+            selected: dict[str, Any] | None = None
+            if adapter_id:
+                for item in self._adapters:
+                    if item["id"] == adapter_id:
+                        selected = item
+                        break
+            if not selected:
+                for item in self._adapters:
+                    if item["path"] == adapter_path:
+                        selected = item
+                        break
+            if not selected:
+                selected = {
+                    "id": adapter_id.strip() or f"adp_{uuid.uuid4().hex[:10]}",
+                    "name": name.strip() or Path(adapter_path).name,
+                    "path": adapter_path,
+                    "created_at": now_iso(),
+                }
+                self._adapters.append(selected)
+            else:
+                selected["path"] = adapter_path
+                if name.strip():
+                    selected["name"] = name.strip()
+            for key, value in (metadata or {}).items():
+                selected[key] = value
+            normalized = self._normalize_adapter(selected)
+            if not normalized:
+                raise ValueError("Adapter metadata is invalid.")
+            for index, item in enumerate(self._adapters):
+                if item["id"] == normalized["id"]:
+                    self._adapters[index] = normalized
+                    break
+            if activate:
+                self._active_adapter_id = str(normalized["id"])
+                if self._status == "running" and self._process and self._process.poll() is None:
+                    self._rpc_locked(
+                        "adapter_load",
+                        {"adapter_path": str(normalized["path"])},
+                        timeout_sec=float(self._config.mlx_generation_timeout_sec),
+                    )
+            self._save_adapters()
+            return {
+                "adapters": [dict(item) for item in self._adapters],
+                "active_adapter": self._active_adapter_locked(),
+                "adapter": dict(normalized),
+            }
+
     def load_adapter(self, *, adapter_id: str = "", path: str = "", name: str = "") -> dict[str, Any]:
         with self._lock:
             selected: dict[str, Any] | None = None
@@ -1991,26 +2200,24 @@ class MlxRuntimeManager:
                     if item["path"] == adapter_path:
                         selected = item
                         break
-                if not selected:
-                    selected = {
-                        "id": f"adp_{uuid.uuid4().hex[:10]}",
-                        "name": name.strip() or Path(adapter_path).name,
-                        "path": adapter_path,
-                        "created_at": now_iso(),
-                    }
-                    self._adapters.append(selected)
-            self._active_adapter_id = str(selected["id"])
-            if self._status == "running" and self._process and self._process.poll() is None:
-                self._rpc_locked(
-                    "adapter_load",
-                    {"adapter_path": str(selected["path"])},
-                    timeout_sec=float(self._config.mlx_generation_timeout_sec),
-                )
-            self._save_adapters()
-            return {
-                "adapters": [dict(item) for item in self._adapters],
-                "active_adapter": dict(selected),
-            }
+            if selected:
+                self._active_adapter_id = str(selected["id"])
+                if self._status == "running" and self._process and self._process.poll() is None:
+                    self._rpc_locked(
+                        "adapter_load",
+                        {"adapter_path": str(selected["path"])},
+                        timeout_sec=float(self._config.mlx_generation_timeout_sec),
+                    )
+                self._save_adapters()
+                return {
+                    "adapters": [dict(item) for item in self._adapters],
+                    "active_adapter": dict(selected),
+                }
+        payload = self.register_adapter(path=path, name=name, activate=True)
+        return {
+            "adapters": payload.get("adapters", []),
+            "active_adapter": payload.get("active_adapter"),
+        }
 
     def unload_adapter(self) -> dict[str, Any]:
         with self._lock:
@@ -2154,6 +2361,1591 @@ class MlxRuntimeManager:
                 "worker_pid": status["worker_pid"],
                 "last_error": status["last_error"],
             }
+
+
+class AsyncJobStore:
+    def __init__(self, data_dir: Path, kind: str) -> None:
+        self._lock = threading.RLock()
+        self._kind = kind
+        self._root = data_dir / "jobs" / kind
+        self._root.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, job_id: str) -> Path:
+        if not CONVERSATION_ID_RE.match(job_id):
+            raise ValueError("Invalid job id.")
+        return self._root / f"{job_id}.json"
+
+    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _read_json(self, path: Path) -> dict[str, Any]:
+        if not path.exists():
+            raise FileNotFoundError("Job not found.")
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError("Persisted job payload is invalid.")
+        return parsed
+
+    def create(self, job_type: str, input_summary: dict[str, Any]) -> dict[str, Any]:
+        job_id = f"{self._kind}_job_{uuid.uuid4().hex[:12]}"
+        stamp = now_iso()
+        payload = {
+            "job_id": job_id,
+            "kind": self._kind,
+            "job_type": str(job_type or ""),
+            "status": "queued",
+            "created_at": stamp,
+            "updated_at": stamp,
+            "completed_at": "",
+            "cancel_requested": False,
+            "input_summary": sanitize_value_for_model(input_summary, max_string_chars=6000),
+            "result": None,
+            "error": None,
+        }
+        with self._lock:
+            self._write_json(self._path(job_id), payload)
+        return payload
+
+    def get(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            return self._read_json(self._path(job_id))
+
+    def update(self, job_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            payload = self._read_json(self._path(job_id))
+            payload.update(updates)
+            payload["updated_at"] = now_iso()
+            if payload.get("status") in {"completed", "failed", "cancelled"} and not payload.get("completed_at"):
+                payload["completed_at"] = now_iso()
+            self._write_json(self._path(job_id), payload)
+            return payload
+
+    def cancel(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            payload = self._read_json(self._path(job_id))
+            if payload.get("status") in {"completed", "failed", "cancelled"}:
+                return payload
+            payload["cancel_requested"] = True
+            payload["updated_at"] = now_iso()
+            self._write_json(self._path(job_id), payload)
+            return payload
+
+    def is_cancel_requested(self, job_id: str) -> bool:
+        with self._lock:
+            payload = self._read_json(self._path(job_id))
+            return bool(payload.get("cancel_requested"))
+
+    def list_metadata(self, *, status_filter: str = "", limit: int = 20) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        with self._lock:
+            for path in self._root.glob("*.json"):
+                try:
+                    payload = self._read_json(path)
+                except Exception:
+                    continue
+                if status_filter and str(payload.get("status", "")) != status_filter:
+                    continue
+                items.append(payload)
+        items.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
+        return items[:limit]
+
+    def health(self) -> dict[str, Any]:
+        metadata = self.list_metadata(limit=500)
+        active = sum(1 for item in metadata if str(item.get("status", "")) in {"queued", "running"})
+        return {
+            "total_jobs": len(metadata),
+            "active_jobs": active,
+        }
+
+
+class PaperStore:
+    def __init__(self, data_dir: Path) -> None:
+        self._lock = threading.RLock()
+        self._root = data_dir / "papers"
+        self._records = self._root / "records"
+        self._records.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, paper_id: str) -> Path:
+        if not CONVERSATION_ID_RE.match(paper_id):
+            raise ValueError("Invalid paper id.")
+        return self._records / f"{paper_id}.json"
+
+    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _read_json(self, path: Path) -> dict[str, Any]:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError("Persisted paper payload is invalid.")
+        return parsed
+
+    def _summary(self, payload: dict[str, Any]) -> dict[str, Any]:
+        latest_digest = payload.get("latest_digest") if isinstance(payload.get("latest_digest"), dict) else None
+        return {
+            "paper_id": str(payload.get("paper_id", "")),
+            "title": str(payload.get("title", "")),
+            "authors": payload.get("authors") if isinstance(payload.get("authors"), list) else [],
+            "abstract": str(payload.get("abstract", "")),
+            "source_type": str(payload.get("source_type", "")),
+            "source_format": str(payload.get("source_format", "")),
+            "url": str(payload.get("url", "")),
+            "local_path": str(payload.get("local_path", "")),
+            "section_count": int(payload.get("section_count", 0) or 0),
+            "char_count": int(payload.get("char_count", 0) or 0),
+            "updated_at": str(payload.get("updated_at", "")),
+            "latest_digest_excerpt": truncate_text((latest_digest or {}).get("text", ""), 320),
+        }
+
+    def find_by_source_key(self, source_key: str) -> dict[str, Any] | None:
+        normalized = str(source_key or "").strip()
+        if not normalized:
+            return None
+        with self._lock:
+            for path in self._records.glob("*.json"):
+                try:
+                    payload = self._read_json(path)
+                except Exception:
+                    continue
+                if str(payload.get("source_key", "")) == normalized:
+                    return payload
+        return None
+
+    def upsert_extracted(self, payload: dict[str, Any]) -> dict[str, Any]:
+        paper_id = str(payload.get("paper_id", "") or "")
+        if not paper_id:
+            raise ValueError("paper_id is required.")
+        path = self._path(paper_id)
+        with self._lock:
+            existing = self._read_json(path) if path.exists() else {}
+            stamp = now_iso()
+            merged = {
+                **payload,
+                "created_at": str(existing.get("created_at", "")) or stamp,
+                "updated_at": stamp,
+                "digests": existing.get("digests") if isinstance(existing.get("digests"), list) else [],
+                "latest_digest": existing.get("latest_digest") if isinstance(existing.get("latest_digest"), dict) else None,
+            }
+            self._write_json(path, merged)
+            return merged
+
+    def append_digest(self, paper_id: str, digest: dict[str, Any]) -> dict[str, Any]:
+        path = self._path(paper_id)
+        with self._lock:
+            payload = self._read_json(path)
+            digests = payload.get("digests") if isinstance(payload.get("digests"), list) else []
+            digests.append(digest)
+            payload["digests"] = digests[-8:]
+            payload["latest_digest"] = digest
+            payload["updated_at"] = now_iso()
+            self._write_json(path, payload)
+            return payload
+
+    def list_metadata(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        with self._lock:
+            for path in self._records.glob("*.json"):
+                try:
+                    items.append(self._summary(self._read_json(path)))
+                except Exception:
+                    continue
+        items.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
+        return items[:limit]
+
+    def get(self, paper_id: str) -> dict[str, Any]:
+        with self._lock:
+            return self._read_json(self._path(paper_id))
+
+    def get_section(self, paper_id: str, section_id: str) -> dict[str, Any]:
+        payload = self.get(paper_id)
+        for section in payload.get("sections", []):
+            if str(section.get("section_id", "")) == section_id:
+                return section
+        raise FileNotFoundError("Section not found.")
+
+
+class ExperimentStore:
+    def __init__(self, data_dir: Path) -> None:
+        self._lock = threading.RLock()
+        self._root = data_dir / "experiments"
+        self._records = self._root / "records"
+        self._records.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, experiment_id: str) -> Path:
+        if not CONVERSATION_ID_RE.match(experiment_id):
+            raise ValueError("Invalid experiment id.")
+        return self._records / f"{experiment_id}.json"
+
+    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _read_json(self, path: Path) -> dict[str, Any]:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError("Persisted experiment payload is invalid.")
+        return parsed
+
+    def save(self, payload: dict[str, Any]) -> dict[str, Any]:
+        experiment_id = str(payload.get("experiment_id", "") or "")
+        if not experiment_id:
+            raise ValueError("experiment_id is required.")
+        with self._lock:
+            self._write_json(self._path(experiment_id), payload)
+        return payload
+
+    def list_metadata(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        with self._lock:
+            for path in self._records.glob("*.json"):
+                try:
+                    payload = self._read_json(path)
+                except Exception:
+                    continue
+                items.append(
+                    {
+                        "experiment_id": str(payload.get("experiment_id", "")),
+                        "job_id": str(payload.get("job_id", "")),
+                        "kind": str(payload.get("kind", "")),
+                        "prompt_count": int(payload.get("prompt_count", 0) or 0),
+                        "model_path": str(payload.get("model_path", "")),
+                        "adapter_path": str(payload.get("adapter_path", "")),
+                        "created_at": str(payload.get("created_at", "")),
+                        "completed_at": str(payload.get("completed_at", "")),
+                        "summary": sanitize_value_for_model(payload.get("summary")),
+                    }
+                )
+        items.sort(key=lambda item: str(item.get("completed_at") or item.get("created_at")), reverse=True)
+        return items[:limit]
+
+    def get(self, experiment_id: str) -> dict[str, Any]:
+        with self._lock:
+            return self._read_json(self._path(experiment_id))
+
+
+class PaperManager:
+    def __init__(self, config: BrokerConfig) -> None:
+        self._config = config
+        self._store = PaperStore(config.data_dir)
+        self._jobs = AsyncJobStore(config.data_dir, "paper")
+
+    def _worker_payload(self, payload: dict[str, Any], *, mode: str) -> dict[str, Any]:
+        data = {"mode": mode}
+        for key in ("url", "pdf_path", "pdfPath", "html_path", "htmlPath", "text_path", "textPath"):
+            if key in payload and payload.get(key):
+                normalized = key.replace("Path", "_path")
+                data[normalized] = payload.get(key)
+        if "allow_html_fallback" in payload or "allowHtmlFallback" in payload:
+            data["allow_html_fallback"] = payload.get("allow_html_fallback", payload.get("allowHtmlFallback", False))
+        return data
+
+    def _run_worker(self, payload: dict[str, Any], *, mode: str, timeout_sec: int, cancel_check: Any = None) -> dict[str, Any]:
+        if not self._config.paper_worker_path.exists():
+            raise RuntimeError(f"Paper worker script not found: {self._config.paper_worker_path}")
+        command = [
+            self._config.paper_worker_python,
+            str(self._config.paper_worker_path),
+        ]
+        completed = run_subprocess_with_cancel(
+            command,
+            input_text=json.dumps(self._worker_payload(payload, mode=mode), ensure_ascii=True),
+            timeout_sec=float(timeout_sec),
+            cancel_check=cancel_check,
+        )
+        stdout = str(completed.stdout or "").strip()
+        stderr = str(completed.stderr or "").strip()
+        if completed.returncode != 0 and not stdout:
+            raise RuntimeError(stderr or "Paper worker exited unsuccessfully.")
+        parsed = json.loads(stdout or "{}")
+        if not isinstance(parsed, dict) or not bool(parsed.get("ok")):
+            error = parsed.get("error") if isinstance(parsed.get("error"), dict) else {}
+            raise RuntimeError(str(error.get("message", stderr or "Paper worker failed.")))
+        data = parsed.get("data")
+        if not isinstance(data, dict):
+            raise RuntimeError("Paper worker returned an invalid payload.")
+        return data
+
+    def inspect(self, payload: dict[str, Any]) -> dict[str, Any]:
+        inspect_payload = self._run_worker(
+            payload,
+            mode="inspect",
+            timeout_sec=min(45, self._config.paper_job_timeout_sec),
+        )
+        cached = self._store.find_by_source_key(str(inspect_payload.get("source_key", "")))
+        return {
+            "ok": True,
+            "inspect": inspect_payload,
+            "cached_paper": self._store._summary(cached) if cached else None,
+        }
+
+    def start_job(self, payload: dict[str, Any]) -> dict[str, Any]:
+        analysis_mode = str(payload.get("analysis_mode", payload.get("analysisMode", "digest")) or "digest").strip().lower()
+        if analysis_mode not in {"extract", "digest"}:
+            raise ValueError("analysis_mode must be extract or digest.")
+        backend = str(payload.get("backend", "") or "").strip().lower()
+        if analysis_mode == "digest" and backend not in {"", "llama", "mlx"}:
+            raise ValueError("paper analysis backend must be llama or mlx.")
+        if analysis_mode == "digest" and not backend:
+            backend = "mlx" if self._config.mlx_model_path else "llama"
+        summary = {
+            "url": str(payload.get("url", "") or ""),
+            "pdf_path": str(payload.get("pdf_path", payload.get("pdfPath", "")) or ""),
+            "html_path": str(payload.get("html_path", payload.get("htmlPath", "")) or ""),
+            "text_path": str(payload.get("text_path", payload.get("textPath", "")) or ""),
+            "analysis_mode": analysis_mode,
+            "backend": backend,
+        }
+        job = self._jobs.create(
+            "paper.digest" if analysis_mode == "digest" else "paper.extract",
+            summary,
+        )
+        request_payload = {**payload, "analysis_mode": analysis_mode, "backend": backend}
+        thread = threading.Thread(target=self._run_job, args=(job["job_id"], request_payload), daemon=True)
+        thread.start()
+        return {"ok": True, "job": job}
+
+    def _run_job(self, job_id: str, payload: dict[str, Any]) -> None:
+        try:
+            self._jobs.update(job_id, {"status": "running"})
+            if self._jobs.is_cancel_requested(job_id):
+                self._jobs.update(job_id, {"status": "cancelled", "error": {"code": "cancelled", "message": "Job cancelled."}})
+                return
+            paper = self._run_worker(
+                payload,
+                mode="extract",
+                timeout_sec=self._config.paper_job_timeout_sec,
+                cancel_check=lambda: self._jobs.is_cancel_requested(job_id),
+            )
+            stored = self._store.upsert_extracted(paper)
+            digest_text = ""
+            backend = str(payload.get("backend", "") or "").strip().lower()
+            if str(payload.get("analysis_mode", "")) == "digest":
+                if self._jobs.is_cancel_requested(job_id):
+                    self._jobs.update(job_id, {"status": "cancelled", "error": {"code": "cancelled", "message": "Job cancelled."}})
+                    return
+                digest_text = generate_paper_digest(
+                    stored,
+                    backend=backend,
+                    cancel_check=lambda: self._jobs.is_cancel_requested(job_id),
+                )
+                digest_entry = {
+                    "digest_id": f"digest_{sha1(f'{job_id}:{backend}:{time.time()}'.encode('utf-8')).hexdigest()[:10]}",
+                    "backend": backend,
+                    "mode": "research_digest",
+                    "created_at": now_iso(),
+                    "text": digest_text,
+                }
+                stored = self._store.append_digest(str(stored.get("paper_id", "")), digest_entry)
+            self._jobs.update(
+                job_id,
+                {
+                    "status": "completed",
+                    "result": {
+                        "paper_id": str(stored.get("paper_id", "")),
+                        "title": str(stored.get("title", "")),
+                        "section_count": int(stored.get("section_count", 0) or 0),
+                        "char_count": int(stored.get("char_count", 0) or 0),
+                        "latest_digest_excerpt": truncate_text(digest_text, 320),
+                    },
+                    "error": None,
+                },
+            )
+        except Exception as error:
+            status = "cancelled" if self._jobs.is_cancel_requested(job_id) else "failed"
+            code = "cancelled" if status == "cancelled" else "job_failed"
+            self._jobs.update(job_id, {"status": status, "error": {"code": code, "message": str(error)}})
+
+    def list_jobs(self, *, status_filter: str = "") -> list[dict[str, Any]]:
+        return self._jobs.list_metadata(status_filter=status_filter)
+
+    def get_job(self, job_id: str) -> dict[str, Any]:
+        return self._jobs.get(job_id)
+
+    def cancel_job(self, job_id: str) -> dict[str, Any]:
+        payload = self._jobs.cancel(job_id)
+        return {"ok": True, "job": payload}
+
+    def list_papers(self) -> dict[str, Any]:
+        return {"papers": self._store.list_metadata()}
+
+    def get_paper(self, paper_id: str) -> dict[str, Any]:
+        return {"paper": self._store.get(paper_id)}
+
+    def get_section(self, paper_id: str, section_id: str) -> dict[str, Any]:
+        return {"paper_id": paper_id, "section": self._store.get_section(paper_id, section_id)}
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "jobs": self._jobs.health(),
+            "papers": len(self._store.list_metadata(limit=500)),
+        }
+
+
+class ExperimentManager:
+    def __init__(self, config: BrokerConfig) -> None:
+        self._config = config
+        self._jobs = AsyncJobStore(config.data_dir, "experiment")
+        self._store = ExperimentStore(config.data_dir)
+
+    def _normalize_prompt_set(self, raw_value: Any) -> list[dict[str, str]]:
+        prompts: list[dict[str, str]] = []
+        if isinstance(raw_value, list):
+            for index, item in enumerate(raw_value[:16]):
+                if isinstance(item, str):
+                    prompt = item.strip()
+                    reference = ""
+                    item_id = f"prompt_{index + 1:02d}"
+                elif isinstance(item, dict):
+                    prompt = str(item.get("prompt", "")).strip()
+                    reference = str(item.get("reference", "")).strip()
+                    item_id = str(item.get("id", "")).strip() or f"prompt_{index + 1:02d}"
+                else:
+                    continue
+                if prompt:
+                    prompts.append({"id": item_id, "prompt": prompt[:4000], "reference": reference[:1200]})
+        elif isinstance(raw_value, str):
+            for index, prompt in enumerate([line.strip() for line in raw_value.splitlines() if line.strip()][:16]):
+                prompts.append({"id": f"prompt_{index + 1:02d}", "prompt": prompt[:4000], "reference": ""})
+        if not prompts:
+            raise ValueError("prompt_set must contain at least one prompt.")
+        return prompts
+
+    def _resolve_adapter_path(self, payload: dict[str, Any]) -> str:
+        path = str(payload.get("adapter_path", payload.get("adapterPath", "")) or "").strip()
+        if path:
+            resolved = str(Path(path).expanduser())
+            if not Path(resolved).exists():
+                raise ValueError(f"Adapter path does not exist: {resolved}")
+            return resolved
+        adapter_id = str(payload.get("adapter_id", payload.get("adapterId", "")) or "").strip()
+        if not adapter_id:
+            return ""
+        adapters = MLX_RUNTIME.list_adapters()
+        for item in adapters.get("adapters", []):
+            if str(item.get("id", "")) == adapter_id:
+                return str(item.get("path", ""))
+        raise ValueError("adapter_id was not found.")
+
+    def start_job(self, payload: dict[str, Any]) -> dict[str, Any]:
+        kind = str(payload.get("kind", "") or "").strip().lower()
+        if not kind:
+            has_adapter_hint = bool(
+                str(payload.get("adapter_path", payload.get("adapterPath", "")) or "").strip()
+                or str(payload.get("adapter_id", payload.get("adapterId", "")) or "").strip()
+            )
+            kind = "adapter_eval" if has_adapter_hint else "prompt_eval"
+        if kind not in {"prompt_eval", "adapter_eval"}:
+            raise ValueError("kind must be prompt_eval or adapter_eval.")
+        adapter_path = self._resolve_adapter_path(payload) if kind == "adapter_eval" else ""
+        if kind == "adapter_eval" and not adapter_path:
+            raise ValueError("adapter_path or adapter_id is required for adapter_eval.")
+        model_path = str(payload.get("model_path", payload.get("modelPath", self._config.mlx_model_path)) or "").strip()
+        if not model_path:
+            raise ValueError("MLX model_path is required to run experiments.")
+        if not Path(model_path).expanduser().exists():
+            raise ValueError(f"MLX model_path does not exist: {model_path}")
+        prompt_set = self._normalize_prompt_set(payload.get("prompt_set", payload.get("promptSet")))
+        generation = payload.get("generation") if isinstance(payload.get("generation"), dict) else {}
+        summary = {
+            "kind": kind,
+            "backend": "mlx",
+            "model_path": model_path,
+            "adapter_path": adapter_path,
+            "prompt_count": len(prompt_set),
+        }
+        job = self._jobs.create(f"experiment.{kind}", summary)
+        request_payload = {
+            "kind": kind,
+            "backend": "mlx",
+            "model_path": model_path,
+            "adapter_path": adapter_path,
+            "generation": generation,
+            "system_prompt": str(payload.get("system_prompt", payload.get("systemPrompt", "")) or ""),
+            "prompt_set": prompt_set,
+        }
+        thread = threading.Thread(target=self._run_job, args=(job["job_id"], request_payload), daemon=True)
+        thread.start()
+        return {"ok": True, "job": job}
+
+    def _run_job(self, job_id: str, payload: dict[str, Any]) -> None:
+        try:
+            self._jobs.update(job_id, {"status": "running"})
+            if self._jobs.is_cancel_requested(job_id):
+                self._jobs.update(job_id, {"status": "cancelled", "error": {"code": "cancelled", "message": "Job cancelled."}})
+                return
+            if not self._config.experiment_worker_path.exists():
+                raise RuntimeError(f"Experiment worker script not found: {self._config.experiment_worker_path}")
+            worker_payload = {
+                "op": str(payload.get("kind", "")),
+                "model_path": str(Path(str(payload.get("model_path", ""))).expanduser()),
+                "mlx_worker_python": self._config.mlx_worker_python,
+                "mlx_worker_path": str(self._config.mlx_worker_path),
+                "max_context_chars": MLX_RUNTIME.effective_max_context_chars() if self._config.mlx_model_path else 56000,
+                "generation": payload.get("generation") if isinstance(payload.get("generation"), dict) else {},
+                "system_prompt": str(payload.get("system_prompt", "") or ""),
+                "prompt_set": payload.get("prompt_set", []),
+                "adapter_path": str(payload.get("adapter_path", "") or ""),
+            }
+            completed = run_subprocess_with_cancel(
+                [self._config.experiment_worker_python, str(self._config.experiment_worker_path)],
+                input_text=json.dumps(worker_payload, ensure_ascii=True),
+                timeout_sec=float(self._config.experiment_job_timeout_sec),
+                cancel_check=lambda: self._jobs.is_cancel_requested(job_id),
+            )
+            stdout = str(completed.stdout or "").strip()
+            stderr = str(completed.stderr or "").strip()
+            if completed.returncode != 0 and not stdout:
+                raise RuntimeError(stderr or "Experiment worker exited unsuccessfully.")
+            parsed = json.loads(stdout or "{}")
+            if not isinstance(parsed, dict) or not bool(parsed.get("ok")):
+                error = parsed.get("error") if isinstance(parsed.get("error"), dict) else {}
+                raise RuntimeError(str(error.get("message", stderr or "Experiment worker failed.")))
+            result = parsed.get("data")
+            if not isinstance(result, dict):
+                raise RuntimeError("Experiment worker returned an invalid payload.")
+            experiment_id = f"exp_{uuid.uuid4().hex[:12]}"
+            artifact = {
+                "experiment_id": experiment_id,
+                "job_id": job_id,
+                "kind": str(result.get("kind", payload.get("kind", ""))),
+                "backend": "mlx",
+                "model_path": worker_payload["model_path"],
+                "adapter_path": worker_payload["adapter_path"],
+                "prompt_count": int(result.get("prompt_count", 0) or 0),
+                "generation": worker_payload["generation"],
+                "system_prompt": worker_payload["system_prompt"],
+                "items": result.get("items") if isinstance(result.get("items"), list) else [],
+                "summary": result.get("summary") if isinstance(result.get("summary"), dict) else {},
+                "created_at": now_iso(),
+                "completed_at": now_iso(),
+            }
+            self._store.save(artifact)
+            self._jobs.update(
+                job_id,
+                {
+                    "status": "completed",
+                    "result": {
+                        "experiment_id": experiment_id,
+                        "kind": artifact["kind"],
+                        "prompt_count": artifact["prompt_count"],
+                        "summary": sanitize_value_for_model(artifact["summary"]),
+                    },
+                    "error": None,
+                },
+            )
+        except Exception as error:
+            status = "cancelled" if self._jobs.is_cancel_requested(job_id) else "failed"
+            code = "cancelled" if status == "cancelled" else "job_failed"
+            self._jobs.update(job_id, {"status": status, "error": {"code": code, "message": str(error)}})
+
+    def list_jobs(self, *, status_filter: str = "") -> list[dict[str, Any]]:
+        return self._jobs.list_metadata(status_filter=status_filter)
+
+    def get_job(self, job_id: str) -> dict[str, Any]:
+        return self._jobs.get(job_id)
+
+    def cancel_job(self, job_id: str) -> dict[str, Any]:
+        payload = self._jobs.cancel(job_id)
+        return {"ok": True, "job": payload}
+
+    def list_experiments(self) -> dict[str, Any]:
+        return {"experiments": self._store.list_metadata()}
+
+    def get_experiment(self, experiment_id: str) -> dict[str, Any]:
+        return {"experiment": self._store.get(experiment_id)}
+
+    def compare(self, experiment_id: str, other_id: str) -> dict[str, Any]:
+        left = self._store.get(experiment_id)
+        right = self._store.get(other_id)
+        left_summary = left.get("summary") if isinstance(left.get("summary"), dict) else {}
+        right_summary = right.get("summary") if isinstance(right.get("summary"), dict) else {}
+        left_latency = float(left_summary.get("average_latency_ms", left_summary.get("adapter_average_latency_ms", 0)) or 0)
+        right_latency = float(right_summary.get("average_latency_ms", right_summary.get("adapter_average_latency_ms", 0)) or 0)
+        left_match_rate = left_summary.get("exact_match_rate", left_summary.get("adapter_exact_match_rate"))
+        right_match_rate = right_summary.get("exact_match_rate", right_summary.get("adapter_exact_match_rate"))
+        left_contains_rate = left_summary.get(
+            "contains_reference_rate",
+            left_summary.get("adapter_contains_reference_rate"),
+        )
+        right_contains_rate = right_summary.get(
+            "contains_reference_rate",
+            right_summary.get("adapter_contains_reference_rate"),
+        )
+        exact_match_rate_delta = None
+        contains_reference_rate_delta = None
+        if isinstance(left_match_rate, (int, float)) and isinstance(right_match_rate, (int, float)):
+            exact_match_rate_delta = round(float(right_match_rate) - float(left_match_rate), 4)
+        if isinstance(left_contains_rate, (int, float)) and isinstance(right_contains_rate, (int, float)):
+            contains_reference_rate_delta = round(float(right_contains_rate) - float(left_contains_rate), 4)
+        return {
+            "left": {
+                "experiment_id": experiment_id,
+                "kind": left.get("kind"),
+                "summary": sanitize_value_for_model(left_summary),
+            },
+            "right": {
+                "experiment_id": other_id,
+                "kind": right.get("kind"),
+                "summary": sanitize_value_for_model(right_summary),
+            },
+            "comparison": {
+                "left_prompt_count": int(left.get("prompt_count", 0) or 0),
+                "right_prompt_count": int(right.get("prompt_count", 0) or 0),
+                "left_average_latency_ms": round(left_latency, 2),
+                "right_average_latency_ms": round(right_latency, 2),
+                "average_latency_delta_ms": round(right_latency - left_latency, 2),
+                "left_exact_match_rate": left_match_rate,
+                "right_exact_match_rate": right_match_rate,
+                "exact_match_rate_delta": exact_match_rate_delta,
+                "left_contains_reference_rate": left_contains_rate,
+                "right_contains_reference_rate": right_contains_rate,
+                "contains_reference_rate_delta": contains_reference_rate_delta,
+            },
+        }
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "jobs": self._jobs.health(),
+            "experiments": len(self._store.list_metadata(limit=500)),
+        }
+
+
+def _write_jsonl_lines(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = "\n".join(json.dumps(row, ensure_ascii=True) for row in rows)
+    if text:
+        text += "\n"
+    path.write_text(text, encoding="utf-8")
+
+
+def _append_jsonl_line(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=True) + "\n")
+
+
+def _read_recent_jsonl(path: Path, limit: int = 40) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in lines[-limit:]:
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            rows.append(parsed)
+    return rows
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    if value in {"", None}:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_training_messages(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        raise ValueError("messages must be an array.")
+    messages: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).strip().lower()
+        content = str(item.get("content", "")).strip()
+        if role not in TRAINING_DATASET_MESSAGE_ROLES or not content:
+            continue
+        messages.append({"role": role, "content": content})
+    if len(messages) < 2:
+        raise ValueError("messages records must contain at least two valid messages.")
+    return messages
+
+
+def _normalize_training_record(record: Any) -> tuple[dict[str, Any], str]:
+    if not isinstance(record, dict):
+        raise ValueError("Each JSONL line must be a JSON object.")
+    if isinstance(record.get("messages"), list):
+        return {"messages": _normalize_training_messages(record.get("messages"))}, "messages"
+    prompt = str(record.get("prompt", "")).strip()
+    completion = str(
+        record.get("completion", record.get("response", record.get("output", "")))
+    ).strip()
+    if prompt and completion:
+        return {"prompt": prompt, "completion": completion}, "prompt_completion"
+    instruction = str(record.get("instruction", "")).strip()
+    output = str(record.get("output", "")).strip()
+    if instruction and output:
+        return {"prompt": instruction, "completion": output}, "instruction_output"
+    text = str(record.get("text", "")).strip()
+    if text:
+        return {"text": text}, "text"
+    raise ValueError("Unsupported training record schema.")
+
+
+def _load_training_jsonl(path: Path) -> tuple[list[dict[str, Any]], str]:
+    rows: list[dict[str, Any]] = []
+    formats: list[str] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception as error:
+        raise ValueError(f"Unable to read dataset file: {path}") from error
+    for index, line in enumerate(lines, start=1):
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{path.name}:{index} is not valid JSON.") from error
+        normalized, record_format = _normalize_training_record(parsed)
+        rows.append(normalized)
+        formats.append(record_format)
+    if not rows:
+        raise ValueError(f"{path.name} does not contain any valid training rows.")
+    unique_formats = sorted(set(formats))
+    return rows, unique_formats[0] if len(unique_formats) == 1 else "mixed"
+
+
+def _split_training_records(records: list[dict[str, Any]], seed: int = 0) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not records:
+        raise ValueError("records are required to split validation data.")
+    if len(records) == 1:
+        return list(records), [records[0]]
+    rng = random.Random(int(seed))
+    indices = list(range(len(records)))
+    rng.shuffle(indices)
+    validation_count = max(1, int(round(len(records) * 0.1)))
+    validation_count = min(validation_count, len(records) - 1)
+    validation_indices = set(indices[:validation_count])
+    train_rows = [row for index, row in enumerate(records) if index not in validation_indices]
+    valid_rows = [row for index, row in enumerate(records) if index in validation_indices]
+    return train_rows, valid_rows
+
+
+def stream_training_worker_events(
+    command: list[str],
+    *,
+    input_payload: dict[str, Any],
+    timeout_sec: float,
+    cancel_check: Any = None,
+    on_event: Any = None,
+) -> dict[str, Any]:
+    if cancel_check and cancel_check():
+        raise RouteRequestCancelledError("Job cancelled.")
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        if process.stdin:
+            process.stdin.write(json.dumps(input_payload, ensure_ascii=True))
+            process.stdin.flush()
+            process.stdin.close()
+    except Exception:
+        terminate_subprocess(process)
+        raise
+    stdout_fd = process.stdout.fileno() if process.stdout else -1
+    stderr_fd = process.stderr.fileno() if process.stderr else -1
+    final_result: dict[str, Any] | None = None
+    worker_error = ""
+    stderr_lines: deque[str] = deque(maxlen=60)
+    deadline = time.monotonic() + max(1.0, float(timeout_sec))
+    while True:
+        if cancel_check and cancel_check():
+            terminate_subprocess(process)
+            raise RouteRequestCancelledError("Job cancelled.")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            terminate_subprocess(process)
+            raise subprocess.TimeoutExpired(command, timeout_sec)
+        read_fds = [fd for fd in (stdout_fd, stderr_fd) if fd >= 0]
+        ready, _, _ = select.select(read_fds, [], [], min(0.5, remaining))
+        if stdout_fd in ready and process.stdout:
+            line = process.stdout.readline()
+            if line:
+                raw = line.strip()
+                if raw:
+                    try:
+                        parsed = json.loads(raw)
+                    except json.JSONDecodeError:
+                        parsed = {"event": "log", "stream": "stdout", "message": raw}
+                    if isinstance(parsed, dict):
+                        if on_event:
+                            on_event(parsed)
+                        if str(parsed.get("event", "")).strip().lower() == "error":
+                            worker_error = str(parsed.get("message", "")).strip()
+                        if str(parsed.get("event", "")).strip().lower() == "completed":
+                            result = parsed.get("result")
+                            final_result = result if isinstance(result, dict) else {}
+        if stderr_fd in ready and process.stderr:
+            line = process.stderr.readline()
+            if line:
+                stderr_lines.append(line.strip())
+        if process.poll() is not None:
+            while process.stdout:
+                trailing = process.stdout.readline()
+                if not trailing:
+                    break
+                raw = trailing.strip()
+                if not raw:
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    parsed = {"event": "log", "stream": "stdout", "message": raw}
+                if isinstance(parsed, dict):
+                    if on_event:
+                        on_event(parsed)
+                    if str(parsed.get("event", "")).strip().lower() == "error":
+                        worker_error = str(parsed.get("message", "")).strip()
+                    if str(parsed.get("event", "")).strip().lower() == "completed":
+                        result = parsed.get("result")
+                        final_result = result if isinstance(result, dict) else {}
+            while process.stderr:
+                trailing_err = process.stderr.readline()
+                if not trailing_err:
+                    break
+                stderr_lines.append(trailing_err.strip())
+            break
+    if process.returncode != 0 and final_result is None:
+        raise RuntimeError(worker_error or " ".join([line for line in stderr_lines if line]).strip() or "Training worker failed.")
+    return final_result or {}
+
+
+class TrainingDatasetStore:
+    def __init__(self, data_dir: Path) -> None:
+        self._lock = threading.RLock()
+        self._root = data_dir / "mlx_training" / "datasets"
+        self._root.mkdir(parents=True, exist_ok=True)
+
+    def _dataset_dir(self, dataset_id: str) -> Path:
+        if not CONVERSATION_ID_RE.match(dataset_id):
+            raise ValueError("Invalid dataset id.")
+        return self._root / dataset_id
+
+    def _manifest_path(self, dataset_id: str) -> Path:
+        return self._dataset_dir(dataset_id) / "manifest.json"
+
+    def save(self, manifest: dict[str, Any], splits: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+        dataset_id = str(manifest.get("dataset_id", "") or "")
+        if not dataset_id:
+            raise ValueError("dataset_id is required.")
+        dataset_dir = self._dataset_dir(dataset_id)
+        with self._lock:
+            dataset_dir.mkdir(parents=True, exist_ok=True)
+            for split_name, rows in splits.items():
+                _write_jsonl_lines(dataset_dir / f"{split_name}.jsonl", rows)
+            (dataset_dir / "manifest.json").write_text(
+                json.dumps(manifest, ensure_ascii=True, indent=2),
+                encoding="utf-8",
+            )
+        return manifest
+
+    def list_metadata(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        with self._lock:
+            for manifest_path in self._root.glob("*/manifest.json"):
+                try:
+                    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                items.append(
+                    {
+                        "dataset_id": str(payload.get("dataset_id", "")),
+                        "name": str(payload.get("name", "")),
+                        "created_at": str(payload.get("created_at", "")),
+                        "updated_at": str(payload.get("updated_at", "")),
+                        "split_mode": str(payload.get("split_mode", "")),
+                        "source_path": str(payload.get("source_path", "")),
+                        "record_counts": sanitize_value_for_model(payload.get("record_counts", {})),
+                        "format": str(payload.get("format", "")),
+                    }
+                )
+        items.sort(key=lambda item: str(item.get("updated_at", item.get("created_at", ""))), reverse=True)
+        return items[:limit]
+
+    def get(self, dataset_id: str) -> dict[str, Any]:
+        manifest_path = self._manifest_path(dataset_id)
+        with self._lock:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Persisted dataset payload is invalid.")
+        return payload
+
+    def delete(self, dataset_id: str) -> bool:
+        dataset_dir = self._dataset_dir(dataset_id)
+        with self._lock:
+            if not dataset_dir.exists():
+                return False
+            shutil.rmtree(dataset_dir)
+        return True
+
+    def split_path(self, dataset_id: str, split_name: str) -> Path:
+        return self._dataset_dir(dataset_id) / f"{split_name}.jsonl"
+
+    def dataset_dir(self, dataset_id: str) -> Path:
+        return self._dataset_dir(dataset_id)
+
+
+class TrainingRunStore:
+    def __init__(self, data_dir: Path) -> None:
+        self._lock = threading.RLock()
+        self._root = data_dir / "mlx_training" / "runs"
+        self._root.mkdir(parents=True, exist_ok=True)
+
+    def _run_dir(self, run_id: str) -> Path:
+        if not CONVERSATION_ID_RE.match(run_id):
+            raise ValueError("Invalid run id.")
+        return self._root / run_id
+
+    def _run_json_path(self, run_id: str) -> Path:
+        return self._run_dir(run_id) / "run.json"
+
+    def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        run_id = str(payload.get("run_id", "") or "")
+        if not run_id:
+            raise ValueError("run_id is required.")
+        run_dir = self._run_dir(run_id)
+        with self._lock:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            self._run_json_path(run_id).write_text(
+                json.dumps(payload, ensure_ascii=True, indent=2),
+                encoding="utf-8",
+            )
+            (run_dir / "events.jsonl").touch()
+            (run_dir / "metrics.jsonl").touch()
+        return payload
+
+    def update(self, run_id: str, updates: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            path = self._run_json_path(run_id)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("Persisted run payload is invalid.")
+            payload.update(updates)
+            payload["updated_at"] = now_iso()
+            if payload.get("status") in {"completed", "failed", "cancelled"} and not payload.get("completed_at"):
+                payload["completed_at"] = now_iso()
+            path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+            return payload
+
+    def get(self, run_id: str) -> dict[str, Any]:
+        run_dir = self._run_dir(run_id)
+        with self._lock:
+            payload = json.loads(self._run_json_path(run_id).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Persisted run payload is invalid.")
+        payload["recent_events"] = _read_recent_jsonl(run_dir / "events.jsonl", limit=40)
+        payload["metric_history"] = _read_recent_jsonl(run_dir / "metrics.jsonl", limit=200)
+        return payload
+
+    def list_metadata(self, *, limit: int = 40) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        with self._lock:
+            for run_json_path in self._root.glob("*/run.json"):
+                try:
+                    payload = json.loads(run_json_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                progress = payload.get("progress") if isinstance(payload.get("progress"), dict) else {}
+                items.append(
+                    {
+                        "run_id": str(payload.get("run_id", "")),
+                        "job_id": str(payload.get("job_id", "")),
+                        "name": str(payload.get("name", "")),
+                        "status": str(payload.get("status", "")),
+                        "phase": str(payload.get("phase", "")),
+                        "dataset_id": str(payload.get("dataset_id", "")),
+                        "model_path": str(payload.get("model_path", "")),
+                        "created_at": str(payload.get("created_at", "")),
+                        "completed_at": str(payload.get("completed_at", "")),
+                        "best_checkpoint": sanitize_value_for_model(payload.get("best_checkpoint")),
+                        "latest_checkpoint": sanitize_value_for_model(payload.get("latest_checkpoint")),
+                        "progress": sanitize_value_for_model(progress),
+                    }
+                )
+        items.sort(key=lambda item: str(item.get("completed_at") or item.get("created_at")), reverse=True)
+        return items[:limit]
+
+    def append_event(self, run_id: str, event: dict[str, Any]) -> None:
+        with self._lock:
+            _append_jsonl_line(self._run_dir(run_id) / "events.jsonl", event)
+
+    def append_metric(self, run_id: str, metric: dict[str, Any]) -> None:
+        with self._lock:
+            _append_jsonl_line(self._run_dir(run_id) / "metrics.jsonl", metric)
+
+    def run_dir(self, run_id: str) -> Path:
+        return self._run_dir(run_id)
+
+    def health(self) -> dict[str, Any]:
+        metadata = self.list_metadata(limit=500)
+        active = sum(1 for item in metadata if str(item.get("status", "")) in {"queued", "running"})
+        return {"runs": len(metadata), "active_runs": active}
+
+
+class TrainingManager:
+    def __init__(self, config: BrokerConfig) -> None:
+        self._config = config
+        self._jobs = AsyncJobStore(config.data_dir, "training")
+        self._datasets = TrainingDatasetStore(config.data_dir)
+        self._runs = TrainingRunStore(config.data_dir)
+
+    def _normalize_training_config(self, raw_value: Any, *, base: dict[str, Any] | None = None) -> dict[str, Any]:
+        raw = raw_value if isinstance(raw_value, dict) else {}
+        current = dict(base or TRAINING_BALANCED_PROFILE)
+
+        def _int(name: str, *aliases: str) -> None:
+            for alias in (name, *aliases):
+                if alias in raw:
+                    current[name] = int(raw[alias])
+                    return
+
+        def _float(name: str, *aliases: str) -> None:
+            for alias in (name, *aliases):
+                if alias in raw:
+                    current[name] = float(raw[alias])
+                    return
+
+        _int("rank")
+        _float("scale")
+        _float("dropout")
+        _int("num_layers", "lora_layers")
+        _float("learning_rate")
+        _int("iters")
+        _int("batch_size")
+        _int("grad_accumulation_steps", "gradAccumulationSteps")
+        _int("steps_per_report", "stepsPerReport")
+        _int("steps_per_eval", "stepsPerEval")
+        _int("save_every", "saveEvery")
+        _int("val_batches", "valBatches")
+        _int("max_seq_length", "maxSeqLength")
+        if "grad_checkpoint" in raw:
+            current["grad_checkpoint"] = ensure_boolean_flag(raw["grad_checkpoint"], "grad_checkpoint")
+        elif "gradCheckpoint" in raw:
+            current["grad_checkpoint"] = ensure_boolean_flag(raw["gradCheckpoint"], "gradCheckpoint")
+        if "seed" in raw and raw["seed"] not in {"", None}:
+            current["seed"] = int(raw["seed"])
+        elif "seed" in raw:
+            current["seed"] = 0
+        current["rank"] = max(1, int(current["rank"]))
+        current["scale"] = max(0.0, float(current["scale"]))
+        current["dropout"] = max(0.0, min(1.0, float(current["dropout"])))
+        current["num_layers"] = max(1, int(current["num_layers"]))
+        current["learning_rate"] = max(1e-8, float(current["learning_rate"]))
+        current["iters"] = max(1, int(current["iters"]))
+        current["batch_size"] = max(1, int(current["batch_size"]))
+        current["grad_accumulation_steps"] = max(1, int(current["grad_accumulation_steps"]))
+        current["steps_per_report"] = max(1, int(current["steps_per_report"]))
+        current["steps_per_eval"] = max(1, int(current["steps_per_eval"]))
+        current["save_every"] = max(1, int(current["save_every"]))
+        current["val_batches"] = max(1, int(current["val_batches"]))
+        current["max_seq_length"] = max(64, int(current["max_seq_length"]))
+        current["grad_checkpoint"] = bool(current["grad_checkpoint"])
+        current["seed"] = int(current["seed"])
+        return current
+
+    def _dataset_summary(self, manifest: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "dataset_id": str(manifest.get("dataset_id", "")),
+            "name": str(manifest.get("name", "")),
+            "record_counts": sanitize_value_for_model(manifest.get("record_counts", {})),
+            "split_mode": str(manifest.get("split_mode", "")),
+            "format": str(manifest.get("format", "")),
+        }
+
+    def import_dataset(self, payload: dict[str, Any]) -> dict[str, Any]:
+        source_path = str(
+            payload.get("path", payload.get("dataset_path", payload.get("datasetPath", payload.get("source_path", ""))))
+            or ""
+        ).strip()
+        if not source_path:
+            raise ValueError("dataset path is required.")
+        resolved = Path(source_path).expanduser()
+        if not resolved.exists():
+            raise ValueError(f"Dataset path does not exist: {resolved}")
+        splits: dict[str, list[dict[str, Any]]] = {}
+        split_formats: list[str] = []
+        split_mode = "imported"
+        if resolved.is_dir():
+            train_path = resolved / "train.jsonl"
+            valid_path = resolved / "valid.jsonl"
+            test_path = resolved / "test.jsonl"
+            if not train_path.exists():
+                raise ValueError("Dataset directory must include train.jsonl.")
+            splits["train"], train_format = _load_training_jsonl(train_path)
+            split_formats.append(train_format)
+            if valid_path.exists():
+                splits["valid"], valid_format = _load_training_jsonl(valid_path)
+                split_formats.append(valid_format)
+            else:
+                splits["train"], splits["valid"] = _split_training_records(splits["train"], seed=0)
+                split_mode = "generated_validation"
+            if test_path.exists():
+                splits["test"], test_format = _load_training_jsonl(test_path)
+                split_formats.append(test_format)
+        else:
+            rows, record_format = _load_training_jsonl(resolved)
+            splits["train"], splits["valid"] = _split_training_records(rows, seed=0)
+            split_formats.append(record_format)
+            split_mode = "generated_validation"
+        dataset_id = f"ds_{uuid.uuid4().hex[:12]}"
+        stamp = now_iso()
+        format_label = split_formats[0] if len(set(split_formats)) == 1 else "mixed"
+        manifest = {
+            "dataset_id": dataset_id,
+            "name": str(payload.get("name", "") or resolved.name),
+            "source_path": str(resolved),
+            "created_at": stamp,
+            "updated_at": stamp,
+            "split_mode": split_mode,
+            "format": format_label,
+            "record_counts": {key: len(value) for key, value in splits.items()},
+        }
+        self._datasets.save(manifest, splits)
+        return {"ok": True, "dataset": self._datasets.get(dataset_id)}
+
+    def list_datasets(self) -> dict[str, Any]:
+        return {"datasets": self._datasets.list_metadata()}
+
+    def get_dataset(self, dataset_id: str) -> dict[str, Any]:
+        return {"dataset": self._datasets.get(dataset_id)}
+
+    def delete_dataset(self, dataset_id: str) -> dict[str, Any]:
+        for job in self._jobs.list_metadata(limit=500):
+            if str(job.get("status", "")) not in {"queued", "running"}:
+                continue
+            summary = job.get("input_summary") if isinstance(job.get("input_summary"), dict) else {}
+            if str(summary.get("dataset_id", "")) == dataset_id:
+                raise ValueError("Dataset is in use by an active training job.")
+        return {"deleted": self._datasets.delete(dataset_id)}
+
+    def _resolve_run_checkpoint(self, run: dict[str, Any], *, kind: str = "", path: str = "") -> dict[str, Any]:
+        checkpoints = run.get("checkpoints") if isinstance(run.get("checkpoints"), list) else []
+        if path:
+            resolved = str(Path(path).expanduser())
+            for checkpoint in checkpoints:
+                if str(checkpoint.get("path", "")) == resolved:
+                    return checkpoint
+            raise ValueError("Checkpoint path was not found in the run.")
+        if kind:
+            normalized_kind = str(kind or "").strip().lower()
+            if normalized_kind == "best" and isinstance(run.get("best_checkpoint"), dict):
+                return run["best_checkpoint"]
+            if normalized_kind == "latest" and isinstance(run.get("latest_checkpoint"), dict):
+                return run["latest_checkpoint"]
+            for checkpoint in checkpoints:
+                if str(checkpoint.get("kind", "")).strip().lower() == normalized_kind:
+                    return checkpoint
+            raise ValueError("Checkpoint kind was not found in the run.")
+        if isinstance(run.get("latest_checkpoint"), dict):
+            return run["latest_checkpoint"]
+        raise ValueError("Run does not have a latest checkpoint.")
+
+    def _initial_progress(self, *, phase: str, total_steps: int, message: str) -> dict[str, Any]:
+        return {
+            "phase": phase,
+            "percent": 0.0,
+            "current_step": 0,
+            "total_steps": total_steps,
+            "latest_train_loss": None,
+            "latest_validation_loss": None,
+            "elapsed_sec": 0,
+            "eta_sec": None,
+            "last_checkpoint_step": 0,
+            "last_checkpoint_kind": "",
+            "status_message": message,
+        }
+
+    def _resolved_run_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        stop_runtime_first = bool(payload.get("stop_runtime_first", payload.get("stopRuntimeFirst", False)))
+        if MLX_RUNTIME.status().get("status") == "running":
+            if stop_runtime_first:
+                MLX_RUNTIME.stop()
+            else:
+                raise RuntimeError("MLX runtime is running. Stop MLX and Train to continue.")
+        resume_run_id = str(payload.get("resume_run_id", payload.get("resumeRunId", "")) or "").strip()
+        resume_checkpoint_kind = str(
+            payload.get("resume_checkpoint_kind", payload.get("resumeCheckpointKind", "latest")) or "latest"
+        ).strip()
+        resume_checkpoint_path = str(
+            payload.get("resume_checkpoint_path", payload.get("resumeCheckpointPath", "")) or ""
+        ).strip()
+        if resume_run_id:
+            base_run = self._runs.get(resume_run_id)
+            base_config = self._normalize_training_config(base_run.get("training_config"), base=TRAINING_BALANCED_PROFILE)
+            additional_iters = int(payload.get("additional_iters", payload.get("additionalIters", base_config["iters"])) or 0)
+            if additional_iters <= 0:
+                additional_iters = base_config["iters"]
+            training_config = dict(base_config)
+            training_config["iters"] = additional_iters
+            checkpoint = self._resolve_run_checkpoint(
+                base_run,
+                kind=resume_checkpoint_kind,
+                path=resume_checkpoint_path,
+            )
+            dataset = self._datasets.get(str(base_run.get("dataset_id", "")))
+            model_path = str(base_run.get("model_path", "")).strip()
+            return {
+                "dataset": dataset,
+                "model_path": model_path,
+                "name": str(payload.get("name", "") or f"{base_run.get('name', resume_run_id)} resume"),
+                "training_config": training_config,
+                "resume": {
+                    "run_id": resume_run_id,
+                    "checkpoint": checkpoint,
+                },
+            }
+        dataset_id = str(payload.get("dataset_id", payload.get("datasetId", "")) or "").strip()
+        if not dataset_id:
+            raise ValueError("dataset_id is required.")
+        dataset = self._datasets.get(dataset_id)
+        model_path = str(payload.get("model_path", payload.get("modelPath", self._config.mlx_model_path)) or "").strip()
+        if not model_path:
+            raise ValueError("MLX model_path is required to train adapters.")
+        resolved_model_path = str(Path(model_path).expanduser())
+        if not Path(resolved_model_path).exists():
+            raise ValueError(f"MLX model_path does not exist: {resolved_model_path}")
+        training_config = self._normalize_training_config(payload.get("training_config", payload.get("trainingConfig", payload)))
+        return {
+            "dataset": dataset,
+            "model_path": resolved_model_path,
+            "name": str(payload.get("name", "") or f"{dataset.get('name', dataset_id)} LoRA"),
+            "training_config": training_config,
+            "resume": None,
+        }
+
+    def start_job(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request = self._resolved_run_request(payload)
+        dataset = request["dataset"]
+        training_config = request["training_config"]
+        run_id = f"trn_{uuid.uuid4().hex[:12]}"
+        job = self._jobs.create(
+            "mlx.training",
+            {
+                "run_id": run_id,
+                "dataset_id": str(dataset.get("dataset_id", "")),
+                "dataset_name": str(dataset.get("name", "")),
+                "model_path": request["model_path"],
+                "resume_run_id": str((request.get("resume") or {}).get("run_id", "")),
+            },
+        )
+        run_payload = {
+            "run_id": run_id,
+            "job_id": str(job.get("job_id", "")),
+            "name": request["name"],
+            "status": "queued",
+            "phase": "queued",
+            "dataset_id": str(dataset.get("dataset_id", "")),
+            "dataset": self._dataset_summary(dataset),
+            "model_path": request["model_path"],
+            "training_config": training_config,
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+            "completed_at": "",
+            "progress": self._initial_progress(
+                phase="queued",
+                total_steps=int(training_config["iters"]),
+                message="Queued for training.",
+            ),
+            "checkpoints": [],
+            "best_checkpoint": None,
+            "latest_checkpoint": None,
+            "summary": {},
+            "error": None,
+            "resume": sanitize_value_for_model(request.get("resume")),
+        }
+        self._runs.create(run_payload)
+        self._jobs.update(job["job_id"], {"progress": run_payload["progress"]})
+        worker_payload = {
+            "job_id": job["job_id"],
+            "run_id": run_id,
+            "dataset": dataset,
+            "model_path": request["model_path"],
+            "training_config": training_config,
+            "resume": request.get("resume"),
+        }
+        thread = threading.Thread(target=self._run_job, args=(job["job_id"], worker_payload), daemon=True)
+        thread.start()
+        return {"ok": True, "job": self._jobs.get(job["job_id"])}
+
+    def _upsert_checkpoint(self, run_id: str, checkpoint: dict[str, Any]) -> dict[str, Any]:
+        run = self._runs.get(run_id)
+        checkpoints = run.get("checkpoints") if isinstance(run.get("checkpoints"), list) else []
+        normalized = {
+            "id": str(checkpoint.get("id", "") or f"ckpt_{uuid.uuid4().hex[:10]}"),
+            "kind": str(checkpoint.get("kind", "")).strip(),
+            "label": str(checkpoint.get("label", "")).strip() or str(checkpoint.get("kind", "checkpoint")).strip() or "checkpoint",
+            "step": int(checkpoint.get("step", 0) or 0),
+            "path": str(checkpoint.get("path", "")).strip(),
+            "validation_loss": _coerce_optional_float(checkpoint.get("validation_loss")),
+            "created_at": str(checkpoint.get("created_at", "")).strip() or now_iso(),
+            "promoted": bool(checkpoint.get("promoted", False)),
+        }
+        if not normalized["path"]:
+            return run
+        replaced = False
+        for index, current in enumerate(checkpoints):
+            if str(current.get("path", "")) == normalized["path"] or str(current.get("id", "")) == normalized["id"]:
+                checkpoints[index] = {**current, **normalized}
+                replaced = True
+                break
+        if not replaced:
+            checkpoints.append(normalized)
+        checkpoints.sort(key=lambda item: (int(item.get("step", 0) or 0), str(item.get("kind", ""))))
+        updates: dict[str, Any] = {"checkpoints": checkpoints}
+        if normalized["kind"] == "best":
+            updates["best_checkpoint"] = normalized
+        if normalized["kind"] == "latest":
+            updates["latest_checkpoint"] = normalized
+        return self._runs.update(run_id, updates)
+
+    def _handle_worker_event(self, job_id: str, run_id: str, envelope: dict[str, Any]) -> None:
+        event_type = str(envelope.get("event", "")).strip().lower()
+        if not event_type:
+            return
+        self._runs.append_event(
+            run_id,
+            {
+                "event": event_type,
+                "created_at": now_iso(),
+                "data": sanitize_value_for_model(envelope, max_string_chars=1200),
+            },
+        )
+        if event_type == "checkpoint":
+            checkpoint = envelope.get("checkpoint") if isinstance(envelope.get("checkpoint"), dict) else {}
+            self._upsert_checkpoint(run_id, checkpoint)
+            run = self._runs.get(run_id)
+            progress = run.get("progress") if isinstance(run.get("progress"), dict) else {}
+            progress["last_checkpoint_step"] = int(checkpoint.get("step", progress.get("last_checkpoint_step", 0)) or 0)
+            progress["last_checkpoint_kind"] = str(checkpoint.get("kind", progress.get("last_checkpoint_kind", "")) or "")
+            progress["status_message"] = str(envelope.get("message", progress.get("status_message", "")) or "")
+            self._runs.update(run_id, {"progress": progress})
+            self._jobs.update(job_id, {"progress": progress})
+            return
+        if event_type == "metric":
+            metric = envelope.get("metric") if isinstance(envelope.get("metric"), dict) else {}
+            self._runs.append_metric(run_id, metric)
+            return
+        if event_type in {"status", "progress"}:
+            progress = envelope.get("progress") if isinstance(envelope.get("progress"), dict) else {}
+            run = self._runs.get(run_id)
+            current = run.get("progress") if isinstance(run.get("progress"), dict) else {}
+            merged = {**current, **progress}
+            if event_type == "status" and str(envelope.get("message", "")).strip():
+                merged["status_message"] = str(envelope.get("message", "")).strip()
+            if merged.get("latest_train_loss") is not None or merged.get("latest_validation_loss") is not None:
+                self._runs.append_metric(
+                    run_id,
+                    {
+                        "created_at": now_iso(),
+                        "step": int(merged.get("current_step", 0) or 0),
+                        "train_loss": merged.get("latest_train_loss"),
+                        "validation_loss": merged.get("latest_validation_loss"),
+                    },
+                )
+            updates = {
+                "phase": str(merged.get("phase", run.get("phase", "")) or run.get("phase", "")),
+                "progress": merged,
+            }
+            self._runs.update(run_id, updates)
+            self._jobs.update(job_id, {"progress": merged, "status": "running"})
+
+    def _auto_promote_checkpoint(self, run: dict[str, Any], checkpoint: dict[str, Any], *, suffix: str) -> None:
+        checkpoint_path = str(checkpoint.get("path", "")).strip()
+        if not checkpoint_path:
+            return
+        adapter_id = f"train_{run['run_id']}_{suffix}"
+        MLX_RUNTIME.register_adapter(
+            adapter_id=adapter_id,
+            path=checkpoint_path,
+            name=f"{run.get('name', run['run_id'])} {suffix}",
+            metadata={
+                "source_type": f"training-{suffix}",
+                "run_id": str(run.get("run_id", "")),
+                "checkpoint_kind": str(checkpoint.get("kind", suffix)),
+                "step": int(checkpoint.get("step", 0) or 0),
+                "validation_loss": _coerce_optional_float(checkpoint.get("validation_loss")),
+                "dataset_id": str(run.get("dataset_id", "")),
+                "promoted": True,
+            },
+            activate=False,
+        )
+
+    def _run_job(self, job_id: str, payload: dict[str, Any]) -> None:
+        run_id = str(payload.get("run_id", ""))
+        training_config = payload.get("training_config") if isinstance(payload.get("training_config"), dict) else {}
+        initial_progress = self._initial_progress(
+            phase="preparing",
+            total_steps=int(training_config.get("iters", TRAINING_BALANCED_PROFILE["iters"]) or TRAINING_BALANCED_PROFILE["iters"]),
+            message="Preparing LoRA training worker.",
+        )
+        try:
+            self._jobs.update(job_id, {"status": "running", "progress": initial_progress})
+            self._runs.update(run_id, {"status": "running", "phase": "preparing", "progress": initial_progress})
+            if not self._config.training_worker_path.exists():
+                raise RuntimeError(f"Training worker script not found: {self._config.training_worker_path}")
+            worker_payload = {
+                "job_id": job_id,
+                "run_id": run_id,
+                "run_dir": str(self._runs.run_dir(run_id)),
+                "dataset_dir": str(self._datasets.dataset_dir(str((payload.get("dataset") or {}).get("dataset_id", "")))),
+                "dataset_id": str((payload.get("dataset") or {}).get("dataset_id", "")),
+                "model_path": str(payload.get("model_path", "")),
+                "training_config": training_config,
+                "resume": payload.get("resume"),
+                "trainer_python": self._config.mlx_worker_python,
+            }
+            result = stream_training_worker_events(
+                [self._config.training_worker_python, str(self._config.training_worker_path)],
+                input_payload=worker_payload,
+                timeout_sec=float(self._config.training_job_timeout_sec),
+                cancel_check=lambda: self._jobs.is_cancel_requested(job_id),
+                on_event=lambda envelope: self._handle_worker_event(job_id, run_id, envelope),
+            )
+            run = self._runs.update(
+                run_id,
+                {
+                    "status": "completed",
+                    "phase": "completed",
+                    "progress": sanitize_value_for_model(result.get("progress", {})),
+                    "summary": sanitize_value_for_model(result.get("summary", {})),
+                    "checkpoints": sanitize_value_for_model(result.get("checkpoints", [])),
+                    "best_checkpoint": sanitize_value_for_model(result.get("best_checkpoint")),
+                    "latest_checkpoint": sanitize_value_for_model(result.get("latest_checkpoint")),
+                    "error": None,
+                },
+            )
+            best_checkpoint = run.get("best_checkpoint") if isinstance(run.get("best_checkpoint"), dict) else {}
+            latest_checkpoint = run.get("latest_checkpoint") if isinstance(run.get("latest_checkpoint"), dict) else {}
+            if best_checkpoint:
+                self._auto_promote_checkpoint(run, best_checkpoint, suffix="best")
+            if latest_checkpoint:
+                self._auto_promote_checkpoint(run, latest_checkpoint, suffix="latest")
+            self._jobs.update(
+                job_id,
+                {
+                    "status": "completed",
+                    "progress": sanitize_value_for_model(result.get("progress", {})),
+                    "result": {
+                        "run_id": run_id,
+                        "best_checkpoint": sanitize_value_for_model(best_checkpoint),
+                        "latest_checkpoint": sanitize_value_for_model(latest_checkpoint),
+                        "summary": sanitize_value_for_model(result.get("summary", {})),
+                    },
+                    "error": None,
+                },
+            )
+        except RouteRequestCancelledError:
+            self._runs.update(
+                run_id,
+                {
+                    "status": "cancelled",
+                    "phase": "cancelled",
+                    "error": {"code": "cancelled", "message": "Job cancelled."},
+                },
+            )
+            self._jobs.update(
+                job_id,
+                {
+                    "status": "cancelled",
+                    "error": {"code": "cancelled", "message": "Job cancelled."},
+                },
+            )
+        except Exception as error:
+            self._runs.update(
+                run_id,
+                {
+                    "status": "failed",
+                    "phase": "failed",
+                    "error": {"code": "job_failed", "message": str(error)},
+                },
+            )
+            self._jobs.update(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": {"code": "job_failed", "message": str(error)},
+                },
+            )
+
+    def get_job(self, job_id: str) -> dict[str, Any]:
+        return self._jobs.get(job_id)
+
+    def list_jobs(self, *, status_filter: str = "") -> list[dict[str, Any]]:
+        return self._jobs.list_metadata(status_filter=status_filter)
+
+    def cancel_job(self, job_id: str) -> dict[str, Any]:
+        return {"ok": True, "job": self._jobs.cancel(job_id)}
+
+    def list_runs(self) -> dict[str, Any]:
+        return {"runs": self._runs.list_metadata()}
+
+    def get_run(self, run_id: str) -> dict[str, Any]:
+        return {"run": self._runs.get(run_id)}
+
+    def promote_checkpoint(self, payload: dict[str, Any]) -> dict[str, Any]:
+        run_id = str(payload.get("run_id", payload.get("runId", "")) or "").strip()
+        if not run_id:
+            raise ValueError("run_id is required.")
+        run = self._runs.get(run_id)
+        checkpoint = self._resolve_run_checkpoint(
+            run,
+            kind=str(payload.get("checkpoint_kind", payload.get("checkpointKind", "")) or "").strip(),
+            path=str(payload.get("checkpoint_path", payload.get("checkpointPath", "")) or "").strip(),
+        )
+        name = str(payload.get("name", "") or checkpoint.get("label", "") or f"{run.get('name', run_id)} checkpoint")
+        adapter_id = str(payload.get("adapter_id", payload.get("adapterId", "")) or "").strip()
+        registered = MLX_RUNTIME.register_adapter(
+            adapter_id=adapter_id,
+            path=str(checkpoint.get("path", "")),
+            name=name,
+            metadata={
+                "source_type": "training-checkpoint",
+                "run_id": run_id,
+                "checkpoint_kind": str(checkpoint.get("kind", "")),
+                "step": int(checkpoint.get("step", 0) or 0),
+                "validation_loss": _coerce_optional_float(checkpoint.get("validation_loss")),
+                "dataset_id": str(run.get("dataset_id", "")),
+                "promoted": True,
+            },
+            activate=False,
+        )
+        checkpoints = run.get("checkpoints") if isinstance(run.get("checkpoints"), list) else []
+        for item in checkpoints:
+            if str(item.get("path", "")) == str(checkpoint.get("path", "")):
+                item["promoted"] = True
+        self._runs.update(run_id, {"checkpoints": checkpoints})
+        return {"ok": True, "adapter": registered.get("adapter"), "adapters": registered.get("adapters", [])}
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "jobs": self._jobs.health(),
+            "datasets": len(self._datasets.list_metadata(limit=500)),
+            "runs": self._runs.health(),
+        }
 
 
 class ExtensionCommandRelay:
@@ -3766,6 +5558,9 @@ EXTENSION_RELAY = ExtensionCommandRelay(CONFIG.extension_client_stale_sec)
 BROWSER_AUTOMATION = BrowserAutomationManager(CONFIG.browser_default_domain_allowlist)
 CODEX_RUNS = CodexRunManager(CONFIG.data_dir)
 MLX_RUNTIME = MlxRuntimeManager(CONFIG)
+PAPERS = PaperManager(CONFIG)
+EXPERIMENTS = ExperimentManager(CONFIG)
+TRAININGS = TrainingManager(CONFIG)
 ROUTE_REQUESTS = RouteRequestRegistry()
 
 
@@ -3798,13 +5593,24 @@ def compact_whitespace(value: Any, limit: int) -> str:
     return cleaned[:limit]
 
 
+def compact_text_block(value: Any, limit: int) -> str:
+    raw = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    paragraphs: list[str] = []
+    for part in re.split(r"\n\s*\n", raw):
+        cleaned = " ".join(part.split())
+        if cleaned:
+            paragraphs.append(cleaned)
+    cleaned = "\n\n".join(paragraphs)
+    return cleaned[:limit]
+
+
 def normalize_page_context(value: Any) -> dict[str, Any] | None:
     if value is None:
         return None
     if not isinstance(value, dict):
         raise ValueError("page_context must be an object.")
     output: dict[str, Any] = {}
-    for key in ("title", "url", "selection", "text_excerpt"):
+    for key in ("url", "text_excerpt"):
         raw = value.get(key)
         if raw is None:
             continue
@@ -3812,7 +5618,7 @@ def normalize_page_context(value: Any) -> dict[str, Any] | None:
         if key == "url":
             cleaned = str(raw).strip()[:limit]
         else:
-            cleaned = compact_whitespace(raw, limit)
+            cleaned = compact_text_block(raw, limit)
         if cleaned:
             output[key] = cleaned
     return output
@@ -3822,16 +5628,13 @@ def format_page_context(page_context: dict[str, Any] | None) -> str:
     if not page_context:
         return ""
     sections: list[str] = []
-    for label, key in (
-        ("Title", "title"),
-        ("URL", "url"),
-        ("Selection", "selection"),
-        ("Excerpt", "text_excerpt"),
-    ):
-        value = str(page_context.get(key, "")).strip()
-        if value:
-            sections.append(f"{label}: {value}")
-    return "\n".join(sections)[:PAGE_CONTEXT_PROMPT_CHAR_BUDGET]
+    url = str(page_context.get("url", "")).strip()
+    if url:
+        sections.append(f"URL: {url}")
+    text_excerpt = str(page_context.get("text_excerpt", "")).strip()
+    if text_excerpt:
+        sections.append(text_excerpt)
+    return "\n\n".join(sections)[:PAGE_CONTEXT_PROMPT_CHAR_BUDGET]
 
 
 def inject_page_context(messages: list[dict[str, str]], content: str) -> list[dict[str, str]]:
@@ -3902,6 +5705,7 @@ def call_llama_completion(
     temperature: float = 0.1,
     max_tokens: int = 768,
 ) -> dict[str, Any]:
+    target_url = str(CONFIG.llama_url or "").strip() or "(unset LLAMA_URL)"
     payload = {
         "model": CONFIG.llama_model,
         "messages": messages,
@@ -3922,8 +5726,25 @@ def call_llama_completion(
         headers=headers,
         data=json.dumps(payload).encode("utf-8"),
     )
-    with urlopen(request, timeout=120) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urlopen(request, timeout=120) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            parsed = {}
+        message = str(
+            ((parsed.get("error") or {}).get("message"))
+            or body
+            or f"llama request failed with status {error.code}."
+        )
+        raise RuntimeError(f"llama request to {target_url} failed: {message}") from error
+    except URLError as error:
+        raise RuntimeError(f"llama request to {target_url} failed: {error.reason}") from error
+    except socket.timeout as error:
+        raise RuntimeError(f"llama request to {target_url} timed out.") from error
 
 
 def call_llama_completion_stream(
@@ -3937,6 +5758,7 @@ def call_llama_completion_stream(
     on_text_delta: Any = None,
     cancel_check: Any = None,
 ) -> str:
+    target_url = str(CONFIG.llama_url or "").strip() or "(unset LLAMA_URL)"
     payload = {
         "model": CONFIG.llama_model,
         "messages": messages,
@@ -4004,17 +5826,18 @@ def call_llama_completion_stream(
             or body
             or f"llama request failed with status {error.code}."
         )
-        raise RuntimeError(message) from error
+        raise RuntimeError(f"llama request to {target_url} failed: {message}") from error
     except URLError as error:
-        raise RuntimeError(f"llama request failed: {error.reason}") from error
+        raise RuntimeError(f"llama request to {target_url} failed: {error.reason}") from error
     except socket.timeout as error:
-        raise RuntimeError("llama streaming request timed out.") from error
+        raise RuntimeError(f"llama request to {target_url} timed out.") from error
     return accumulated
 
 
 def call_llama(messages: list[dict[str, str]], *, cancel_check: Any = None) -> str:
     if cancel_check and cancel_check():
         raise RouteRequestCancelledError("Request cancelled by user.")
+    ensure_llama_backend_available(CONFIG)
     guarded_messages = [
         {"role": "system", "content": LLAMA_CHAT_SYSTEM_PROMPT},
         *messages,
@@ -4033,6 +5856,7 @@ def call_llama_stream(
 ) -> str:
     if cancel_check and cancel_check():
         raise RouteRequestCancelledError("Request cancelled by user.")
+    ensure_llama_backend_available(CONFIG)
     guarded_messages = [
         {"role": "system", "content": LLAMA_CHAT_SYSTEM_PROMPT},
         *messages,
@@ -4104,6 +5928,214 @@ def run_subprocess_with_cancel(
         stdout,
         stderr,
     )
+
+
+def summarize_mlx_worker_failure(detail: Any) -> str:
+    text = " ".join(str(detail or "").split())[:600]
+    if not text:
+        return ""
+    if "NSRangeException" in text and ("DeviceC2Ev" in text or "MetalAllocator" in text):
+        return (
+            "MLX crashed during Metal device initialization. "
+            "The process does not appear to have a usable Metal device in this runtime."
+        )
+    return text
+
+
+def read_mlx_worker_response(
+    process: subprocess.Popen[str],
+    expected_request_id: str,
+    timeout_sec: float,
+) -> dict[str, Any]:
+
+    def _stderr_excerpt() -> str:
+        try:
+            if not process.stderr:
+                return ""
+            return summarize_mlx_worker_failure(process.stderr.read() or "")
+        except Exception:
+            return ""
+
+    deadline = time.monotonic() + max(0.1, timeout_sec)
+    fd = process.stdout.fileno()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if process.poll() is not None:
+                detail = _stderr_excerpt()
+                if detail:
+                    raise RuntimeError(f"MLX worker exited before responding: {detail}")
+            raise TimeoutError("Timed out waiting for MLX worker response.")
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            if process.poll() is not None:
+                detail = _stderr_excerpt()
+                if detail:
+                    raise RuntimeError(f"MLX worker exited before responding: {detail}")
+            continue
+        line = process.stdout.readline()
+        if line == "":
+            detail = _stderr_excerpt()
+            if detail:
+                raise RuntimeError(f"MLX worker closed its stdout stream: {detail}")
+            raise RuntimeError("MLX worker closed its stdout stream.")
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        if str(parsed.get("request_id", "")) == expected_request_id:
+            return parsed
+
+
+def run_ephemeral_mlx_completion(
+    messages: list[dict[str, str]],
+    *,
+    cancel_check: Any = None,
+) -> str:
+    if cancel_check and cancel_check():
+        raise RouteRequestCancelledError("Request cancelled by user.")
+    if not CONFIG.mlx_model_path:
+        raise RuntimeError("MLX is not configured. Set BROKER_MLX_MODEL_PATH first.")
+    if not CONFIG.mlx_worker_path.exists():
+        raise RuntimeError(f"MLX worker script not found: {CONFIG.mlx_worker_path}")
+    contract = {
+        **MLX_CHAT_CONTRACT_BASE,
+        "max_context_chars": MLX_RUNTIME.effective_max_context_chars(),
+    }
+    command = [
+        CONFIG.mlx_worker_python,
+        str(CONFIG.mlx_worker_path),
+        "--model-path",
+        str(Path(CONFIG.mlx_model_path).expanduser()),
+        "--max-context-chars",
+        str(contract["max_context_chars"]),
+    ]
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        startup = read_mlx_worker_response(process, "startup", float(CONFIG.mlx_start_timeout_sec))
+        if not bool(startup.get("ok")):
+            error = startup.get("error") if isinstance(startup.get("error"), dict) else {}
+            raise RuntimeError(str(error.get("message", "MLX worker startup failed.")))
+        request_id = f"mlx_{uuid.uuid4().hex[:12]}"
+        payload = {
+            "request_id": request_id,
+            "op": "generate",
+            "schema_version": contract["schema_version"],
+            "contract": contract,
+            "messages": messages,
+            "params": MLX_RUNTIME.status().get("generation_config", {}),
+        }
+        process.stdin.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        process.stdin.flush()
+        if cancel_check and cancel_check():
+            raise RouteRequestCancelledError("Request cancelled by user.")
+        response = read_mlx_worker_response(process, request_id, float(CONFIG.mlx_generation_timeout_sec))
+        if not bool(response.get("ok")):
+            error = response.get("error") if isinstance(response.get("error"), dict) else {}
+            raise RuntimeError(str(error.get("message", "MLX paper analysis failed.")))
+        data = response.get("data") if isinstance(response.get("data"), dict) else {}
+        return str(data.get("text", "")).strip()
+    finally:
+        try:
+            shutdown_id = f"mlx_{uuid.uuid4().hex[:12]}"
+            if process.stdin and process.poll() is None:
+                process.stdin.write(json.dumps({"request_id": shutdown_id, "op": "shutdown"}, ensure_ascii=True) + "\n")
+                process.stdin.flush()
+        except Exception:
+            pass
+        terminate_subprocess(process, timeout_sec=float(CONFIG.mlx_stop_timeout_sec))
+
+
+def select_paper_analysis_context(paper: dict[str, Any], *, char_budget: int = 12000) -> str:
+    title = str(paper.get("title", "")).strip()
+    authors = ", ".join(str(author).strip() for author in paper.get("authors", []) if str(author).strip())
+    abstract = str(paper.get("abstract", "")).strip()
+    headings = paper.get("headings") if isinstance(paper.get("headings"), list) else []
+    sections = paper.get("sections") if isinstance(paper.get("sections"), list) else []
+
+    selected_sections: list[dict[str, Any]] = []
+    preferred_patterns = [
+        re.compile(r"\babstract\b", re.IGNORECASE),
+        re.compile(r"\bintro", re.IGNORECASE),
+        re.compile(r"\bmethod|approach|model|architecture\b", re.IGNORECASE),
+        re.compile(r"\bresult|evaluation|experiment\b", re.IGNORECASE),
+        re.compile(r"\bdiscussion|conclusion|limitation\b", re.IGNORECASE),
+    ]
+    used_ids: set[str] = set()
+    for pattern in preferred_patterns:
+        for section in sections:
+            section_id = str(section.get("section_id", ""))
+            heading = str(section.get("heading", ""))
+            if section_id in used_ids:
+                continue
+            if pattern.search(heading):
+                selected_sections.append(section)
+                used_ids.add(section_id)
+                break
+    for section in sections:
+        if len(selected_sections) >= 4:
+            break
+        section_id = str(section.get("section_id", ""))
+        if section_id in used_ids:
+            continue
+        selected_sections.append(section)
+        used_ids.add(section_id)
+
+    parts: list[str] = []
+    if title:
+        parts.append(f"Title: {title}")
+    if authors:
+        parts.append(f"Authors: {authors}")
+    if abstract:
+        parts.append(f"Abstract:\n{abstract}")
+    if headings:
+        heading_lines = [str(item.get("heading", "")).strip() for item in headings[:12] if str(item.get("heading", "")).strip()]
+        if heading_lines:
+            parts.append("Headings:\n- " + "\n- ".join(heading_lines))
+    for section in selected_sections:
+        heading = str(section.get("heading", "")).strip() or "Section"
+        body = str(section.get("text", "")).strip()
+        if body:
+            parts.append(f"{heading}:\n{truncate_text(body, 2500)}")
+    joined = "\n\n".join(parts)
+    return truncate_text(joined, char_budget)
+
+
+def generate_paper_digest(paper: dict[str, Any], *, backend: str, cancel_check: Any = None) -> str:
+    normalized_backend = str(backend or "").strip().lower()
+    if normalized_backend not in {"llama", "mlx"}:
+        raise RuntimeError("paper analysis backend must be llama or mlx.")
+    context = select_paper_analysis_context(paper)
+    if not context:
+        raise RuntimeError("Paper artifact is empty after extraction.")
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a research assistant. Produce a concise paper digest with exactly these headings: "
+                "Summary, Key Claims, Method, Results, Limitations, Open Questions. "
+                "Use only the supplied paper content and avoid speculation."
+            ),
+        },
+        {
+            "role": "user",
+            "content": context,
+        },
+    ]
+    if normalized_backend == "llama":
+        return call_llama(messages, cancel_check=cancel_check).strip()
+    if MLX_RUNTIME.status().get("status") == "running":
+        return MLX_RUNTIME.generate(messages, cancel_check=cancel_check).strip()
+    return run_ephemeral_mlx_completion(messages, cancel_check=cancel_check).strip()
 
 
 def build_codex_cli_prompt(
@@ -4775,6 +6807,7 @@ def run_llama_browser_agent(
 ) -> str:
     if cancel_check and cancel_check():
         raise RouteRequestCancelledError("Request cancelled by user.")
+    ensure_llama_backend_available(CONFIG)
     session = BROWSER_AUTOMATION.session_create(
         {
             "policy": {
@@ -5403,6 +7436,74 @@ def handle_route_cancel(data: dict[str, Any]) -> dict[str, Any]:
     return ROUTE_REQUESTS.cancel(session_id, request_id)
 
 
+def handle_jobs_list(status_filter: str = "", kind: str = "") -> dict[str, Any]:
+    normalized_kind = str(kind or "").strip().lower()
+    jobs: list[dict[str, Any]] = []
+    if not normalized_kind or normalized_kind == "paper":
+        jobs.extend(PAPERS.list_jobs(status_filter=status_filter))
+    if not normalized_kind or normalized_kind == "experiment":
+        jobs.extend(EXPERIMENTS.list_jobs(status_filter=status_filter))
+    if not normalized_kind or normalized_kind == "training":
+        jobs.extend(TRAININGS.list_jobs(status_filter=status_filter))
+    jobs.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
+    return {"jobs": jobs[:40]}
+
+
+def handle_job_cancel(job_id: str) -> dict[str, Any]:
+    normalized = str(job_id or "").strip()
+    if normalized.startswith("paper_job_"):
+        return PAPERS.cancel_job(normalized)
+    if normalized.startswith("experiment_job_"):
+        return EXPERIMENTS.cancel_job(normalized)
+    if normalized.startswith("training_job_"):
+        return TRAININGS.cancel_job(normalized)
+    raise ValueError("Unsupported job id.")
+
+
+def handle_paper_inspect(data: dict[str, Any]) -> dict[str, Any]:
+    return PAPERS.inspect(data)
+
+
+def handle_paper_job_start(data: dict[str, Any]) -> dict[str, Any]:
+    return PAPERS.start_job(data)
+
+
+def handle_paper_job_get(job_id: str) -> dict[str, Any]:
+    return {"job": PAPERS.get_job(job_id)}
+
+
+def handle_papers_list() -> dict[str, Any]:
+    return PAPERS.list_papers()
+
+
+def handle_paper_get(paper_id: str) -> dict[str, Any]:
+    return PAPERS.get_paper(paper_id)
+
+
+def handle_paper_section_get(paper_id: str, section_id: str) -> dict[str, Any]:
+    return PAPERS.get_section(paper_id, section_id)
+
+
+def handle_experiment_job_start(data: dict[str, Any]) -> dict[str, Any]:
+    return EXPERIMENTS.start_job(data)
+
+
+def handle_experiment_job_get(job_id: str) -> dict[str, Any]:
+    return {"job": EXPERIMENTS.get_job(job_id)}
+
+
+def handle_experiments_list() -> dict[str, Any]:
+    return EXPERIMENTS.list_experiments()
+
+
+def handle_experiment_get(experiment_id: str) -> dict[str, Any]:
+    return EXPERIMENTS.get_experiment(experiment_id)
+
+
+def handle_experiment_compare(experiment_id: str, other_id: str) -> dict[str, Any]:
+    return EXPERIMENTS.compare(experiment_id, other_id)
+
+
 def handle_models_get() -> dict[str, Any]:
     return MLX_RUNTIME.models_payload()
 
@@ -5460,6 +7561,42 @@ def handle_mlx_adapters_load(data: dict[str, Any]) -> dict[str, Any]:
 def handle_mlx_adapters_unload(_data: dict[str, Any]) -> dict[str, Any]:
     payload = MLX_RUNTIME.unload_adapter()
     return {"ok": True, **payload}
+
+
+def handle_training_dataset_import(data: dict[str, Any]) -> dict[str, Any]:
+    return TRAININGS.import_dataset(data)
+
+
+def handle_training_datasets_list() -> dict[str, Any]:
+    return TRAININGS.list_datasets()
+
+
+def handle_training_dataset_get(dataset_id: str) -> dict[str, Any]:
+    return TRAININGS.get_dataset(dataset_id)
+
+
+def handle_training_dataset_delete(dataset_id: str) -> dict[str, Any]:
+    return TRAININGS.delete_dataset(dataset_id)
+
+
+def handle_training_job_start(data: dict[str, Any]) -> dict[str, Any]:
+    return TRAININGS.start_job(data)
+
+
+def handle_training_job_get(job_id: str) -> dict[str, Any]:
+    return {"job": TRAININGS.get_job(job_id)}
+
+
+def handle_training_runs_list() -> dict[str, Any]:
+    return TRAININGS.list_runs()
+
+
+def handle_training_run_get(run_id: str) -> dict[str, Any]:
+    return TRAININGS.get_run(run_id)
+
+
+def handle_training_checkpoint_promote(data: dict[str, Any]) -> dict[str, Any]:
+    return TRAININGS.promote_checkpoint(data)
 
 
 def handle_browser_config_get() -> dict[str, Any]:
@@ -5535,18 +7672,78 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     "browser_automation": BROWSER_AUTOMATION.health(),
                     "codex_runs": CODEX_RUNS.health(),
                     "route_requests": ROUTE_REQUESTS.health(),
+                    "llama": llama_backend_health(CONFIG),
                     "mlx": MLX_RUNTIME.health(),
+                    "papers": PAPERS.health(),
+                    "experiments": EXPERIMENTS.health(),
+                    "training": TRAININGS.health(),
                 },
             )
             return
         if path == "/models":
             self._send_json(HTTPStatus.OK, handle_models_get())
             return
+        if path == "/jobs":
+            params = self._query_params()
+            status_filter = str((params.get("status") or [""])[0] or "")
+            kind = str((params.get("kind") or [""])[0] or "")
+            self._send_json(HTTPStatus.OK, handle_jobs_list(status_filter=status_filter, kind=kind))
+            return
         if path == "/mlx/status":
             self._send_json(HTTPStatus.OK, handle_mlx_status_get())
             return
         if path == "/mlx/adapters":
             self._send_json(HTTPStatus.OK, handle_mlx_adapters_list())
+            return
+        if path == "/mlx/training/datasets":
+            self._send_json(HTTPStatus.OK, handle_training_datasets_list())
+            return
+        if path == "/mlx/training/runs":
+            self._send_json(HTTPStatus.OK, handle_training_runs_list())
+            return
+        paper_job_id = self._paper_job_id_from_path(path)
+        if paper_job_id:
+            self._send_json(HTTPStatus.OK, handle_paper_job_get(paper_job_id))
+            return
+        experiment_job_id = self._experiment_job_id_from_path(path)
+        if experiment_job_id:
+            self._send_json(HTTPStatus.OK, handle_experiment_job_get(experiment_job_id))
+            return
+        training_job_id = self._training_job_id_from_path(path)
+        if training_job_id:
+            self._send_json(HTTPStatus.OK, handle_training_job_get(training_job_id))
+            return
+        paper_section = self._paper_section_ids_from_path(path)
+        if paper_section:
+            paper_id, section_id = paper_section
+            self._send_json(HTTPStatus.OK, handle_paper_section_get(paper_id, section_id))
+            return
+        experiment_compare = self._experiment_compare_ids_from_path(path)
+        if experiment_compare:
+            experiment_id, other_id = experiment_compare
+            self._send_json(HTTPStatus.OK, handle_experiment_compare(experiment_id, other_id))
+            return
+        if path == "/papers":
+            self._send_json(HTTPStatus.OK, handle_papers_list())
+            return
+        paper_id = self._paper_id_from_path(path)
+        if paper_id:
+            self._send_json(HTTPStatus.OK, handle_paper_get(paper_id))
+            return
+        if path == "/experiments":
+            self._send_json(HTTPStatus.OK, handle_experiments_list())
+            return
+        experiment_id = self._experiment_id_from_path(path)
+        if experiment_id:
+            self._send_json(HTTPStatus.OK, handle_experiment_get(experiment_id))
+            return
+        training_dataset_id = self._training_dataset_id_from_path(path)
+        if training_dataset_id:
+            self._send_json(HTTPStatus.OK, handle_training_dataset_get(training_dataset_id))
+            return
+        training_run_id = self._training_run_id_from_path(path)
+        if training_run_id:
+            self._send_json(HTTPStatus.OK, handle_training_run_get(training_run_id))
             return
         if path == "/extension/next":
             params = self._query_params()
@@ -5605,6 +7802,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if not self._ensure_trusted():
             return
         path = self._path_without_query()
+        training_dataset_id = self._training_dataset_id_from_path(path)
+        if training_dataset_id:
+            self._send_json(HTTPStatus.OK, handle_training_dataset_delete(training_dataset_id))
+            return
         if not path.startswith("/conversations/"):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not Found"})
             return
@@ -5625,6 +7826,16 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 result = route_request(data)
             elif path == "/route/cancel":
                 result = handle_route_cancel(data)
+            elif path == "/papers/inspect":
+                result = handle_paper_inspect(data)
+            elif path == "/papers/jobs":
+                result = handle_paper_job_start(data)
+            elif path == "/experiments/jobs":
+                result = handle_experiment_job_start(data)
+            elif path == "/mlx/training/datasets/import":
+                result = handle_training_dataset_import(data)
+            elif path == "/mlx/training/jobs":
+                result = handle_training_job_start(data)
             elif path == "/codex/runs" or path == "/runs":
                 result = handle_codex_run_start(data)
             elif path == "/mlx/config":
@@ -5639,6 +7850,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 result = handle_mlx_adapters_load(data)
             elif path == "/mlx/adapters/unload":
                 result = handle_mlx_adapters_unload(data)
+            elif path == "/mlx/training/checkpoints/promote":
+                result = handle_training_checkpoint_promote(data)
             elif path.startswith("/conversations/") and path.endswith("/rewrite"):
                 conversation_id = self._conversation_rewrite_id_from_path(path)
                 if not conversation_id:
@@ -5667,14 +7880,18 @@ class BrokerHandler(BaseHTTPRequestHandler):
             elif path == "/browser/config":
                 result = handle_browser_config_post(data)
             else:
-                run_id, run_action = self._run_parts(path)
-                if run_id and run_action == "approval":
-                    result = handle_codex_run_approval(run_id, data)
-                elif run_id and run_action == "cancel":
-                    result = handle_codex_run_cancel(run_id)
+                job_cancel_id = self._job_cancel_id_from_path(path)
+                if job_cancel_id:
+                    result = handle_job_cancel(job_cancel_id)
                 else:
-                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not Found"})
-                    return
+                    run_id, run_action = self._run_parts(path)
+                    if run_id and run_action == "approval":
+                        result = handle_codex_run_approval(run_id, data)
+                    elif run_id and run_action == "cancel":
+                        result = handle_codex_run_cancel(run_id)
+                    else:
+                        self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not Found"})
+                        return
             self._send_json(HTTPStatus.OK, result)
         except Exception as error:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
@@ -5704,6 +7921,66 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if len(parts) == 3 and parts[0] == "runs":
             return parts[1], parts[2]
         return None, None
+
+    def _job_cancel_id_from_path(self, path: str) -> str | None:
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "cancel":
+            return parts[1]
+        return None
+
+    def _paper_job_id_from_path(self, path: str) -> str | None:
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 3 and parts[0] == "papers" and parts[1] == "jobs":
+            return parts[2]
+        return None
+
+    def _paper_id_from_path(self, path: str) -> str | None:
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 2 and parts[0] == "papers":
+            return parts[1]
+        return None
+
+    def _paper_section_ids_from_path(self, path: str) -> tuple[str, str] | None:
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 4 and parts[0] == "papers" and parts[2] == "sections":
+            return parts[1], parts[3]
+        return None
+
+    def _experiment_job_id_from_path(self, path: str) -> str | None:
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 3 and parts[0] == "experiments" and parts[1] == "jobs":
+            return parts[2]
+        return None
+
+    def _training_job_id_from_path(self, path: str) -> str | None:
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 4 and parts[0] == "mlx" and parts[1] == "training" and parts[2] == "jobs":
+            return parts[3]
+        return None
+
+    def _experiment_id_from_path(self, path: str) -> str | None:
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 2 and parts[0] == "experiments":
+            return parts[1]
+        return None
+
+    def _training_dataset_id_from_path(self, path: str) -> str | None:
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 4 and parts[0] == "mlx" and parts[1] == "training" and parts[2] == "datasets":
+            return parts[3]
+        return None
+
+    def _training_run_id_from_path(self, path: str) -> str | None:
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 4 and parts[0] == "mlx" and parts[1] == "training" and parts[2] == "runs":
+            return parts[3]
+        return None
+
+    def _experiment_compare_ids_from_path(self, path: str) -> tuple[str, str] | None:
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 4 and parts[0] == "experiments" and parts[2] == "compare":
+            return parts[1], parts[3]
+        return None
 
     def _ensure_trusted(self) -> bool:
         if not is_loopback_client(self.client_address[0]):

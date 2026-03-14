@@ -1,5 +1,25 @@
 const $ = (id) => document.getElementById(id);
 const SAFE_LINK_PROTOCOLS = new Set(["http:", "https:"]);
+const ACTIVE_JOB_STATUSES = new Set(["queued", "running"]);
+const JOB_POLL_INTERVAL_MS = 4_000;
+const DETAIL_ITEM_LIMIT = 3;
+const TRAINING_BALANCED_PROFILE = Object.freeze({
+  rank: 8,
+  scale: 20,
+  dropout: 0,
+  num_layers: 8,
+  learning_rate: 0.00001,
+  iters: 600,
+  batch_size: 1,
+  grad_accumulation_steps: 4,
+  steps_per_report: 10,
+  steps_per_eval: 100,
+  save_every: 100,
+  val_batches: 25,
+  max_seq_length: 2048,
+  grad_checkpoint: true,
+  seed: 0
+});
 
 const state = {
   sessionId: crypto.randomUUID(),
@@ -24,7 +44,24 @@ const state = {
   toolsBusy: false,
   toolsPolicy: null,
   toolsActiveTab: null,
-  toolsBrowserConfig: null
+  toolsBrowserConfig: null,
+  paperJobs: [],
+  papers: [],
+  paperInspect: null,
+  experimentJobs: [],
+  experiments: [],
+  experimentDetail: null,
+  experimentComparison: null,
+  trainingDatasets: [],
+  trainingJobs: [],
+  trainingRuns: [],
+  trainingRunDetail: null,
+  activeMlxAdapterPath: "",
+  mlxRuntime: null,
+  pollTimers: {
+    papers: 0,
+    experiments: 0
+  }
 };
 
 const appEl = document.querySelector(".app");
@@ -83,22 +120,257 @@ const mlxAdapterPathEl = $("mlx-adapter-path");
 const mlxAdapterNameEl = $("mlx-adapter-name");
 const mlxLoadAdapterBtn = $("mlx-load-adapter-btn");
 const mlxUnloadAdapterBtn = $("mlx-unload-adapter-btn");
+const trainingRefreshBtn = $("training-refresh-btn");
+const trainingStatusEl = $("training-status");
+const trainingDatasetPathEl = $("training-dataset-path");
+const trainingDatasetNameEl = $("training-dataset-name");
+const trainingDatasetImportBtn = $("training-dataset-import-btn");
+const trainingDatasetListEl = $("training-dataset-list");
+const trainingDatasetSelectEl = $("training-dataset-select");
+const trainingRunNameEl = $("training-run-name");
+const trainingModelPathEl = $("training-model-path");
+const trainingPresetEl = $("training-preset");
+const trainingRankEl = $("training-rank");
+const trainingScaleEl = $("training-scale");
+const trainingDropoutEl = $("training-dropout");
+const trainingNumLayersEl = $("training-num-layers");
+const trainingLearningRateEl = $("training-learning-rate");
+const trainingItersEl = $("training-iters");
+const trainingBatchSizeEl = $("training-batch-size");
+const trainingGradAccumulationEl = $("training-grad-accumulation");
+const trainingStepsReportEl = $("training-steps-report");
+const trainingStepsEvalEl = $("training-steps-eval");
+const trainingSaveEveryEl = $("training-save-every");
+const trainingValBatchesEl = $("training-val-batches");
+const trainingMaxSeqLengthEl = $("training-max-seq-length");
+const trainingSeedEl = $("training-seed");
+const trainingGradCheckpointEl = $("training-grad-checkpoint");
+const trainingStartBtn = $("training-start-btn");
+const trainingStopStartBtn = $("training-stop-start-btn");
+const trainingJobListEl = $("training-job-list");
+const trainingRunListEl = $("training-run-list");
+const trainingRunOutputEl = $("training-run-output");
 const mlxLatencyTrendEl = $("mlx-latency-trend");
 const mlxTpsTrendEl = $("mlx-tps-trend");
 const mlxRestartTrendEl = $("mlx-restart-trend");
 const mlxContractEl = $("mlx-contract");
+const experimentsRefreshBtn = $("experiments-refresh-btn");
+const experimentsStatusEl = $("experiments-status");
+const experimentPromptsEl = $("experiment-prompts");
+const experimentReferencesEl = $("experiment-references");
+const experimentRunBtn = $("experiment-run-btn");
+const experimentAdapterRunBtn = $("experiment-adapter-run-btn");
+const experimentJobListEl = $("experiment-job-list");
+const experimentListEl = $("experiment-list");
+const experimentCompareOutputEl = $("experiment-compare-output");
 const toolsRefreshBtn = $("tools-refresh-btn");
 const toolsPolicyStatusEl = $("tools-policy-status");
 const toolsHostInputEl = $("tools-host-input");
 const toolsAllowBtn = $("tools-allow-btn");
-const toolsBlockBtn = $("tools-block-btn");
 const toolsAllowActiveBtn = $("tools-allow-active-btn");
 const toolsAgentMaxStepsEl = $("tools-agent-max-steps");
 const toolsBrowserApplyBtn = $("tools-browser-apply-btn");
 const toolsAllowedListEl = $("tools-allowed-list");
-const toolsBlockedListEl = $("tools-blocked-list");
+const papersStatusEl = $("papers-status");
+const paperSourceInputEl = $("paper-source-input");
+const paperUseActiveBtn = $("paper-use-active-btn");
+const paperInspectBtn = $("paper-inspect-btn");
+const paperAnalyzeBtn = $("paper-analyze-btn");
+const paperInspectOutputEl = $("paper-inspect-output");
+const paperJobListEl = $("paper-job-list");
+const paperListEl = $("paper-list");
 
 void initializeApp();
+
+function truncatePreview(value, maxChars = 240) {
+  const text = String(value || "").trim().replace(/\s+/g, " ");
+  if (!text) {
+    return "";
+  }
+  return text.length > maxChars ? `${text.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…` : text;
+}
+
+function hasActiveJobs(jobs) {
+  return Array.isArray(jobs) && jobs.some((job) => ACTIVE_JOB_STATUSES.has(String(job?.status || "")));
+}
+
+function clearAutoRefresh(kind) {
+  const timerId = Number(state.pollTimers?.[kind] || 0);
+  if (timerId > 0) {
+    window.clearTimeout(timerId);
+  }
+  if (state.pollTimers) {
+    state.pollTimers[kind] = 0;
+  }
+}
+
+function scheduleAutoRefresh(kind, enabled) {
+  clearAutoRefresh(kind);
+  if (!enabled) {
+    return;
+  }
+  state.pollTimers[kind] = window.setTimeout(async () => {
+    state.pollTimers[kind] = 0;
+    if (kind === "papers") {
+      if (state.toolsBusy) {
+        scheduleAutoRefresh(kind, true);
+        return;
+      }
+      await refreshToolsState(false);
+      return;
+    }
+    if (state.modelsBusy) {
+      scheduleAutoRefresh(kind, true);
+      return;
+    }
+    await refreshModelsState(false);
+  }, JOB_POLL_INTERVAL_MS);
+}
+
+function formatMetricLabel(key) {
+  return String(key || "")
+    .replace(/_/g, " ")
+    .replace(/\bms\b/gi, "ms")
+    .replace(/\bid\b/gi, "ID")
+    .replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function formatMetricValue(value) {
+  if (typeof value === "number") {
+    return Number.isInteger(value) ? String(value) : String(value);
+  }
+  if (value === null || value === undefined || value === "") {
+    return "n/a";
+  }
+  return String(value);
+}
+
+function summarizeSummary(summary, maxItems = 3) {
+  const entries = summary && typeof summary === "object" ? Object.entries(summary) : [];
+  return entries
+    .slice(0, maxItems)
+    .map(([key, value]) => `${formatMetricLabel(key)}: ${formatMetricValue(value)}`)
+    .join(" · ");
+}
+
+function renderPaperDetail(paper) {
+  if (!paperInspectOutputEl) {
+    return;
+  }
+  const artifact = paper && typeof paper === "object" ? paper : {};
+  const lines = [];
+  const title = String(artifact.title || artifact.paper_id || "paper").trim();
+  lines.push(`Paper: ${title}`);
+  if (artifact.paper_id) {
+    lines.push(`Artifact ID: ${String(artifact.paper_id)}`);
+  }
+  const source = String(artifact.url || artifact.local_path || "").trim();
+  if (source) {
+    lines.push(`Source: ${source}`);
+  }
+  const authors = Array.isArray(artifact.authors)
+    ? artifact.authors.map((value) => String(value || "").trim()).filter(Boolean)
+    : [];
+  if (authors.length) {
+    lines.push(`Authors: ${authors.join(", ")}`);
+  }
+  lines.push(
+    `Sections: ${Number(artifact.section_count || (Array.isArray(artifact.sections) ? artifact.sections.length : 0) || 0)}`
+  );
+
+  const latestDigest =
+    artifact.latest_digest && typeof artifact.latest_digest === "object"
+      ? String(artifact.latest_digest.text || "").trim()
+      : "";
+  if (latestDigest) {
+    lines.push("");
+    lines.push("Digest:");
+    lines.push(truncatePreview(latestDigest, 1200));
+  } else if (artifact.abstract) {
+    lines.push("");
+    lines.push("Abstract:");
+    lines.push(truncatePreview(artifact.abstract, 900));
+  }
+
+  const sections = Array.isArray(artifact.sections) ? artifact.sections : [];
+  if (sections.length) {
+    lines.push("");
+    lines.push("Sections:");
+    for (const section of sections.slice(0, 6)) {
+      const heading = String(section?.heading || section?.section_id || "Section").trim();
+      const sectionId = String(section?.section_id || "").trim();
+      const preview = truncatePreview(section?.preview || section?.text || "", 180);
+      lines.push(`${sectionId ? `${sectionId} · ` : ""}${heading}`);
+      if (preview) {
+        lines.push(`  ${preview}`);
+      }
+    }
+    if (sections.length > 6) {
+      lines.push(`+${sections.length - 6} more section(s)`);
+    }
+  }
+  paperInspectOutputEl.textContent = lines.join("\n");
+}
+
+function renderExperimentDetail(experiment) {
+  if (!experimentCompareOutputEl) {
+    return;
+  }
+  const artifact = experiment && typeof experiment === "object" ? experiment : {};
+  const lines = [
+    `Experiment: ${String(artifact.experiment_id || "experiment")}`,
+    `Kind: ${String(artifact.kind || "unknown")}`,
+    `Prompts: ${Number(artifact.prompt_count || 0)}`
+  ];
+  const summary = artifact.summary && typeof artifact.summary === "object" ? artifact.summary : {};
+  const summaryEntries = Object.entries(summary);
+  if (summaryEntries.length) {
+    lines.push("");
+    lines.push("Summary:");
+    for (const [key, value] of summaryEntries) {
+      lines.push(`${formatMetricLabel(key)}: ${formatMetricValue(value)}`);
+    }
+  }
+
+  const items = Array.isArray(artifact.items) ? artifact.items : [];
+  if (items.length) {
+    lines.push("");
+    lines.push("Samples:");
+    for (const item of items.slice(0, DETAIL_ITEM_LIMIT)) {
+      lines.push(`${String(item?.id || "item")} · ${truncatePreview(item?.prompt || "", 140)}`);
+      if (artifact.kind === "adapter_eval") {
+        lines.push(`  Base: ${truncatePreview(item?.base?.output || "", 220)}`);
+        lines.push(`  Adapter: ${truncatePreview(item?.adapter?.output || "", 220)}`);
+      } else {
+        lines.push(`  Output: ${truncatePreview(item?.output || "", 220)}`);
+      }
+      if (item?.reference) {
+        lines.push(`  Reference: ${truncatePreview(item.reference, 180)}`);
+      }
+    }
+    if (items.length > DETAIL_ITEM_LIMIT) {
+      lines.push(`+${items.length - DETAIL_ITEM_LIMIT} more sample(s)`);
+    }
+  }
+  experimentCompareOutputEl.textContent = lines.join("\n");
+}
+
+function describeMlxBackendAvailability(mlx, label = "MLX") {
+  const runtime = mlx && typeof mlx === "object" ? mlx : {};
+  if (!runtime.available) {
+    return `${label} unavailable. Configure BROKER_MLX_MODEL_PATH on the broker.`;
+  }
+  if (String(runtime.status || "") === "failed") {
+    const errorText = truncatePreview(runtime.last_error || "worker startup failed", 180);
+    return `${label} startup failed: ${errorText}.`;
+  }
+  return "";
+}
+
+function describeExperimentAvailability(mlx) {
+  const message = describeMlxBackendAvailability(mlx, "MLX experiments");
+  return message ? `${message} Experiment jobs will keep failing until runtime startup is fixed.` : "";
+}
 
 function setContextUsageDisplay(contextUsage) {
   if (!contextUsageEl) {
@@ -269,16 +541,44 @@ mlxUnloadAdapterBtn?.addEventListener("click", async () => {
   await unloadMlxAdapter();
 });
 
+trainingRefreshBtn?.addEventListener("click", async () => {
+  await refreshModelsState(true);
+});
+
+trainingPresetEl?.addEventListener("change", () => {
+  applyTrainingPreset();
+});
+
+trainingDatasetImportBtn?.addEventListener("click", async () => {
+  await importTrainingDatasetFromInputs();
+});
+
+trainingStartBtn?.addEventListener("click", async () => {
+  await startTrainingJobFromInputs(false);
+});
+
+trainingStopStartBtn?.addEventListener("click", async () => {
+  await startTrainingJobFromInputs(true);
+});
+
+experimentsRefreshBtn?.addEventListener("click", async () => {
+  await refreshModelsState(true);
+});
+
+experimentRunBtn?.addEventListener("click", async () => {
+  await runExperimentJob("prompt_eval");
+});
+
+experimentAdapterRunBtn?.addEventListener("click", async () => {
+  await runExperimentJob("adapter_eval");
+});
+
 toolsRefreshBtn?.addEventListener("click", async () => {
   await refreshToolsState(true);
 });
 
 toolsAllowBtn?.addEventListener("click", async () => {
   await allowHostFromInput();
-});
-
-toolsBlockBtn?.addEventListener("click", async () => {
-  await blockHostFromInput();
 });
 
 toolsAllowActiveBtn?.addEventListener("click", async () => {
@@ -289,10 +589,29 @@ toolsBrowserApplyBtn?.addEventListener("click", async () => {
   await applyBrowserConfigFromInputs();
 });
 
+paperUseActiveBtn?.addEventListener("click", async () => {
+  await useActiveTabForPaperSource();
+});
+
+paperInspectBtn?.addEventListener("click", async () => {
+  await inspectPaperFromInputs();
+});
+
+paperAnalyzeBtn?.addEventListener("click", async () => {
+  await analyzePaperFromInputs();
+});
+
 toolsHostInputEl?.addEventListener("keydown", async (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
     await allowHostFromInput();
+  }
+});
+
+paperSourceInputEl?.addEventListener("keydown", async (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    await inspectPaperFromInputs();
   }
 });
 
@@ -405,7 +724,35 @@ function setModelsBusy(busy) {
     mlxRestartBtn,
     mlxApplyBtn,
     mlxLoadAdapterBtn,
-    mlxUnloadAdapterBtn
+    mlxUnloadAdapterBtn,
+    trainingRefreshBtn,
+    trainingDatasetPathEl,
+    trainingDatasetNameEl,
+    trainingDatasetImportBtn,
+    trainingDatasetSelectEl,
+    trainingRunNameEl,
+    trainingModelPathEl,
+    trainingPresetEl,
+    trainingRankEl,
+    trainingScaleEl,
+    trainingDropoutEl,
+    trainingNumLayersEl,
+    trainingLearningRateEl,
+    trainingItersEl,
+    trainingBatchSizeEl,
+    trainingGradAccumulationEl,
+    trainingStepsReportEl,
+    trainingStepsEvalEl,
+    trainingSaveEveryEl,
+    trainingValBatchesEl,
+    trainingMaxSeqLengthEl,
+    trainingSeedEl,
+    trainingGradCheckpointEl,
+    trainingStartBtn,
+    trainingStopStartBtn,
+    experimentsRefreshBtn,
+    experimentRunBtn,
+    experimentAdapterRunBtn
   ];
   for (const control of controls) {
     if (control) {
@@ -414,6 +761,21 @@ function setModelsBusy(busy) {
   }
   if (mlxEnableThinkingEl) {
     mlxEnableThinkingEl.disabled = busy;
+  }
+  for (const button of experimentJobListEl?.querySelectorAll("button") || []) {
+    button.disabled = busy;
+  }
+  for (const button of experimentListEl?.querySelectorAll("button") || []) {
+    button.disabled = busy;
+  }
+  for (const button of trainingDatasetListEl?.querySelectorAll("button") || []) {
+    button.disabled = busy;
+  }
+  for (const button of trainingJobListEl?.querySelectorAll("button") || []) {
+    button.disabled = busy;
+  }
+  for (const button of trainingRunListEl?.querySelectorAll("button") || []) {
+    button.disabled = busy;
   }
 }
 
@@ -447,12 +809,11 @@ function formatMlxContract(contract) {
   return lines.length ? lines.join("\n") : "(no contract metadata)";
 }
 
-function renderModelsBackends(backends = []) {
-  if (!modelsBackendEl) {
+function renderBackendOptions(selectEl, backends = [], current = "mlx") {
+  if (!selectEl) {
     return;
   }
-  const current = String(modelsBackendEl.value || backendEl.value || "mlx");
-  modelsBackendEl.textContent = "";
+  selectEl.textContent = "";
   const options = Array.isArray(backends) && backends.length
     ? backends
     : [{ id: "mlx", label: "MLX Local", available: true }];
@@ -463,19 +824,34 @@ function renderModelsBackends(backends = []) {
     }
     const option = document.createElement("option");
     option.value = id;
-    option.textContent = String(backend?.label || id);
     option.disabled = backend?.available === false;
-    modelsBackendEl.appendChild(option);
+    option.textContent = option.disabled
+      ? `${String(backend?.label || id)} (unavailable)`
+      : String(backend?.label || id);
+    selectEl.appendChild(option);
   }
-  const availableOptions = [...modelsBackendEl.options];
+  const availableOptions = [...selectEl.options];
   const activeOption = availableOptions.find((option) => option.value === current && !option.disabled);
   const firstAvailable = availableOptions.find((option) => !option.disabled);
   if (activeOption) {
-    modelsBackendEl.value = current;
+    selectEl.value = current;
   } else if (firstAvailable) {
-    modelsBackendEl.value = firstAvailable.value;
+    selectEl.value = firstAvailable.value;
   } else if (availableOptions.length > 0) {
-    modelsBackendEl.value = modelsBackendEl.options[0].value;
+    selectEl.value = selectEl.options[0].value;
+  }
+}
+
+function renderModelsBackends(backends = []) {
+  const current = String(modelsBackendEl?.value || backendEl?.value || "mlx");
+  renderBackendOptions(modelsBackendEl, backends, current);
+  renderBackendOptions(backendEl, backends, current);
+  const resolved = String(modelsBackendEl?.value || backendEl?.value || current);
+  if (modelsBackendEl) {
+    modelsBackendEl.value = resolved;
+  }
+  if (backendEl) {
+    backendEl.value = resolved;
   }
 }
 
@@ -522,18 +898,639 @@ function renderMlxAdapters(payload) {
   }
   const adapters = Array.isArray(payload?.adapters) ? payload.adapters : [];
   const activeId = String(payload?.active_adapter?.id || "");
+  state.activeMlxAdapterPath = String(payload?.active_adapter?.path || "");
+  mlxAdapterListEl.classList.add("structured");
+  mlxAdapterListEl.textContent = "";
   if (!adapters.length) {
     mlxAdapterListEl.textContent = "No adapters registered.";
+    mlxAdapterListEl.classList.remove("structured");
     return;
   }
-  const lines = [];
   for (const adapter of adapters) {
-    const id = String(adapter?.id || "");
-    const name = String(adapter?.name || id || "adapter");
-    const path = String(adapter?.path || "");
-    lines.push(`${id === activeId ? "●" : "○"} ${name}${path ? ` — ${path}` : ""}`);
+    const adapterId = String(adapter?.id || "");
+    const row = document.createElement("div");
+    row.className = "tools-item";
+    const meta = document.createElement("div");
+    meta.className = "tools-item-meta";
+    const title = document.createElement("p");
+    title.className = "tools-item-host";
+    title.textContent = String(adapter?.name || adapter?.id || "adapter");
+    meta.appendChild(title);
+    const detail = document.createElement("p");
+    detail.className = "tools-muted";
+    const source = String(adapter?.source_type || "imported");
+    const runId = String(adapter?.run_id || "");
+    const step = Number(adapter?.step || 0);
+    const validationLoss = adapter?.validation_loss ?? null;
+    detail.textContent =
+      `${source}${runId ? ` · ${runId}` : ""}${step > 0 ? ` · step ${step}` : ""}${validationLoss !== null ? ` · val ${validationLoss}` : ""}`;
+    meta.appendChild(detail);
+    const pathText = document.createElement("p");
+    pathText.className = "tools-muted";
+    pathText.textContent = String(adapter?.path || "");
+    meta.appendChild(pathText);
+    const tags = document.createElement("div");
+    tags.className = "tools-item-tags";
+    for (const tagText of [adapterId === activeId ? "active" : "", String(adapter?.checkpoint_kind || ""), String(adapter?.promoted ? "saved" : "")].filter(Boolean)) {
+      const chip = document.createElement("span");
+      chip.className = "tools-chip";
+      chip.textContent = tagText;
+      tags.appendChild(chip);
+    }
+    meta.appendChild(tags);
+    row.appendChild(meta);
+    const actions = document.createElement("div");
+    actions.className = "tools-item-actions";
+    if (adapterId !== activeId) {
+      const loadBtn = document.createElement("button");
+      loadBtn.className = "ghost small";
+      loadBtn.textContent = "Load";
+      loadBtn.addEventListener("click", async () => {
+        await loadMlxAdapterById(adapterId);
+      });
+      actions.appendChild(loadBtn);
+    }
+    row.appendChild(actions);
+    mlxAdapterListEl.appendChild(row);
   }
-  mlxAdapterListEl.textContent = lines.join("\n");
+}
+
+function setTrainingStatus(text) {
+  if (trainingStatusEl) {
+    trainingStatusEl.textContent = text;
+  }
+}
+
+function applyTrainingPreset() {
+  const preset = String(trainingPresetEl?.value || "balanced");
+  if (preset !== "balanced") {
+    return;
+  }
+  fillTrainingConfigInputs(TRAINING_BALANCED_PROFILE);
+}
+
+function fillTrainingConfigInputs(config) {
+  const training = config && typeof config === "object" ? config : TRAINING_BALANCED_PROFILE;
+  if (trainingRankEl) {
+    trainingRankEl.value = String(training.rank ?? TRAINING_BALANCED_PROFILE.rank);
+  }
+  if (trainingScaleEl) {
+    trainingScaleEl.value = String(training.scale ?? TRAINING_BALANCED_PROFILE.scale);
+  }
+  if (trainingDropoutEl) {
+    trainingDropoutEl.value = String(training.dropout ?? TRAINING_BALANCED_PROFILE.dropout);
+  }
+  if (trainingNumLayersEl) {
+    trainingNumLayersEl.value = String(training.num_layers ?? TRAINING_BALANCED_PROFILE.num_layers);
+  }
+  if (trainingLearningRateEl) {
+    trainingLearningRateEl.value = String(training.learning_rate ?? TRAINING_BALANCED_PROFILE.learning_rate);
+  }
+  if (trainingItersEl) {
+    trainingItersEl.value = String(training.iters ?? TRAINING_BALANCED_PROFILE.iters);
+  }
+  if (trainingBatchSizeEl) {
+    trainingBatchSizeEl.value = String(training.batch_size ?? TRAINING_BALANCED_PROFILE.batch_size);
+  }
+  if (trainingGradAccumulationEl) {
+    trainingGradAccumulationEl.value = String(
+      training.grad_accumulation_steps ?? TRAINING_BALANCED_PROFILE.grad_accumulation_steps
+    );
+  }
+  if (trainingStepsReportEl) {
+    trainingStepsReportEl.value = String(training.steps_per_report ?? TRAINING_BALANCED_PROFILE.steps_per_report);
+  }
+  if (trainingStepsEvalEl) {
+    trainingStepsEvalEl.value = String(training.steps_per_eval ?? TRAINING_BALANCED_PROFILE.steps_per_eval);
+  }
+  if (trainingSaveEveryEl) {
+    trainingSaveEveryEl.value = String(training.save_every ?? TRAINING_BALANCED_PROFILE.save_every);
+  }
+  if (trainingValBatchesEl) {
+    trainingValBatchesEl.value = String(training.val_batches ?? TRAINING_BALANCED_PROFILE.val_batches);
+  }
+  if (trainingMaxSeqLengthEl) {
+    trainingMaxSeqLengthEl.value = String(training.max_seq_length ?? TRAINING_BALANCED_PROFILE.max_seq_length);
+  }
+  if (trainingSeedEl) {
+    trainingSeedEl.value = String(training.seed ?? TRAINING_BALANCED_PROFILE.seed);
+  }
+  if (trainingGradCheckpointEl) {
+    trainingGradCheckpointEl.checked = Boolean(
+      training.grad_checkpoint ?? TRAINING_BALANCED_PROFILE.grad_checkpoint
+    );
+  }
+}
+
+function readTrainingConfigInputs() {
+  return {
+    rank: Number(trainingRankEl?.value || TRAINING_BALANCED_PROFILE.rank),
+    scale: Number(trainingScaleEl?.value || TRAINING_BALANCED_PROFILE.scale),
+    dropout: Number(trainingDropoutEl?.value || TRAINING_BALANCED_PROFILE.dropout),
+    num_layers: Number(trainingNumLayersEl?.value || TRAINING_BALANCED_PROFILE.num_layers),
+    learning_rate: Number(trainingLearningRateEl?.value || TRAINING_BALANCED_PROFILE.learning_rate),
+    iters: Number(trainingItersEl?.value || TRAINING_BALANCED_PROFILE.iters),
+    batch_size: Number(trainingBatchSizeEl?.value || TRAINING_BALANCED_PROFILE.batch_size),
+    grad_accumulation_steps: Number(
+      trainingGradAccumulationEl?.value || TRAINING_BALANCED_PROFILE.grad_accumulation_steps
+    ),
+    steps_per_report: Number(trainingStepsReportEl?.value || TRAINING_BALANCED_PROFILE.steps_per_report),
+    steps_per_eval: Number(trainingStepsEvalEl?.value || TRAINING_BALANCED_PROFILE.steps_per_eval),
+    save_every: Number(trainingSaveEveryEl?.value || TRAINING_BALANCED_PROFILE.save_every),
+    val_batches: Number(trainingValBatchesEl?.value || TRAINING_BALANCED_PROFILE.val_batches),
+    max_seq_length: Number(trainingMaxSeqLengthEl?.value || TRAINING_BALANCED_PROFILE.max_seq_length),
+    seed: Number(trainingSeedEl?.value || TRAINING_BALANCED_PROFILE.seed),
+    grad_checkpoint: Boolean(trainingGradCheckpointEl?.checked)
+  };
+}
+
+function formatTrainingProgress(progress) {
+  const currentStep = Number(progress?.current_step || 0);
+  const totalSteps = Number(progress?.total_steps || 0);
+  const percent = Number(progress?.percent || 0);
+  const phase = String(progress?.phase || "queued");
+  const trainLoss = progress?.latest_train_loss ?? null;
+  const validationLoss = progress?.latest_validation_loss ?? null;
+  return `${phase} · ${currentStep}/${totalSteps || "?"} · ${percent.toFixed(1)}%${trainLoss !== null ? ` · train ${trainLoss}` : ""}${validationLoss !== null ? ` · val ${validationLoss}` : ""}`;
+}
+
+function fillTrainingDatasetSelect(items = []) {
+  if (!trainingDatasetSelectEl) {
+    return;
+  }
+  const datasets = Array.isArray(items) ? items : [];
+  const current = String(trainingDatasetSelectEl.value || "");
+  trainingDatasetSelectEl.textContent = "";
+  if (!datasets.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "Import a dataset first";
+    trainingDatasetSelectEl.appendChild(option);
+    return;
+  }
+  for (const dataset of datasets) {
+    const option = document.createElement("option");
+    option.value = String(dataset?.dataset_id || "");
+    option.textContent = `${String(dataset?.name || dataset?.dataset_id || "dataset")} (${Number(dataset?.record_counts?.train || 0)} train)`;
+    trainingDatasetSelectEl.appendChild(option);
+  }
+  if (current && [...trainingDatasetSelectEl.options].some((option) => option.value === current)) {
+    trainingDatasetSelectEl.value = current;
+  }
+}
+
+function renderTrainingDatasets(items = []) {
+  if (!trainingDatasetListEl) {
+    return;
+  }
+  trainingDatasetListEl.textContent = "";
+  const datasets = Array.isArray(items) ? items : [];
+  fillTrainingDatasetSelect(datasets);
+  if (!datasets.length) {
+    const empty = document.createElement("p");
+    empty.className = "tools-empty";
+    empty.textContent = "No imported training datasets yet.";
+    trainingDatasetListEl.appendChild(empty);
+    return;
+  }
+  for (const dataset of datasets) {
+    const row = document.createElement("div");
+    row.className = "tools-item";
+    const meta = document.createElement("div");
+    meta.className = "tools-item-meta";
+    const title = document.createElement("p");
+    title.className = "tools-item-host";
+    title.textContent = String(dataset?.name || dataset?.dataset_id || "dataset");
+    meta.appendChild(title);
+    const detail = document.createElement("p");
+    detail.className = "tools-muted";
+    detail.textContent = `${String(dataset?.split_mode || "imported")} · train ${Number(dataset?.record_counts?.train || 0)} · valid ${Number(dataset?.record_counts?.valid || 0)}${Number(dataset?.record_counts?.test || 0) > 0 ? ` · test ${Number(dataset?.record_counts?.test || 0)}` : ""}`;
+    meta.appendChild(detail);
+    const pathText = document.createElement("p");
+    pathText.className = "tools-muted";
+    pathText.textContent = String(dataset?.source_path || "");
+    meta.appendChild(pathText);
+    row.appendChild(meta);
+    const actions = document.createElement("div");
+    actions.className = "tools-item-actions";
+    const selectBtn = document.createElement("button");
+    selectBtn.className = "ghost small";
+    selectBtn.textContent = "Use";
+    selectBtn.addEventListener("click", () => {
+      if (trainingDatasetSelectEl) {
+        trainingDatasetSelectEl.value = String(dataset?.dataset_id || "");
+      }
+      if (trainingRunNameEl && !String(trainingRunNameEl.value || "").trim()) {
+        trainingRunNameEl.value = `${String(dataset?.name || dataset?.dataset_id || "dataset")} LoRA`;
+      }
+    });
+    actions.appendChild(selectBtn);
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "ghost small";
+    deleteBtn.textContent = "Delete";
+    deleteBtn.addEventListener("click", async () => {
+      await deleteTrainingDatasetById(String(dataset?.dataset_id || ""));
+    });
+    actions.appendChild(deleteBtn);
+    row.appendChild(actions);
+    trainingDatasetListEl.appendChild(row);
+  }
+}
+
+function createProgressBar(percent) {
+  const wrap = document.createElement("div");
+  wrap.className = "models-progress";
+  const bar = document.createElement("div");
+  bar.className = "models-progress-bar";
+  bar.style.width = `${Math.max(0, Math.min(100, Number(percent || 0)))}%`;
+  wrap.appendChild(bar);
+  return wrap;
+}
+
+function renderTrainingJobs(items = []) {
+  if (!trainingJobListEl) {
+    return;
+  }
+  trainingJobListEl.textContent = "";
+  const jobs = Array.isArray(items) ? items : [];
+  if (!jobs.length) {
+    const empty = document.createElement("p");
+    empty.className = "tools-empty";
+    empty.textContent = "No training jobs yet.";
+    trainingJobListEl.appendChild(empty);
+    return;
+  }
+  for (const job of jobs) {
+    const progress = job?.progress && typeof job.progress === "object" ? job.progress : {};
+    const row = document.createElement("div");
+    row.className = "tools-item";
+    const meta = document.createElement("div");
+    meta.className = "tools-item-meta";
+    const title = document.createElement("p");
+    title.className = "tools-item-host";
+    title.textContent = `${String(job?.input_summary?.dataset_name || job?.job_id || "training")} · ${String(job?.status || "unknown")}`;
+    meta.appendChild(title);
+    const detail = document.createElement("p");
+    detail.className = "models-job-meta";
+    detail.textContent = formatTrainingProgress(progress);
+    meta.appendChild(detail);
+    meta.appendChild(createProgressBar(progress?.percent || 0));
+    row.appendChild(meta);
+    const actions = document.createElement("div");
+    actions.className = "tools-item-actions";
+    if (job?.result?.run_id) {
+      const viewBtn = document.createElement("button");
+      viewBtn.className = "ghost small";
+      viewBtn.textContent = "View";
+      viewBtn.addEventListener("click", async () => {
+        await viewTrainingRun(String(job?.result?.run_id || ""));
+      });
+      actions.appendChild(viewBtn);
+    }
+    if (!["completed", "failed", "cancelled"].includes(String(job?.status || ""))) {
+      const cancelBtn = document.createElement("button");
+      cancelBtn.className = "ghost small";
+      cancelBtn.textContent = "Cancel";
+      cancelBtn.addEventListener("click", async () => {
+        await cancelBrokerJob(String(job?.job_id || ""));
+      });
+      actions.appendChild(cancelBtn);
+    }
+    row.appendChild(actions);
+    trainingJobListEl.appendChild(row);
+  }
+}
+
+function renderTrainingRunDetail(run) {
+  if (!trainingRunOutputEl) {
+    return;
+  }
+  const artifact = run && typeof run === "object" ? run : {};
+  const progress = artifact.progress && typeof artifact.progress === "object" ? artifact.progress : {};
+  const lines = [
+    `Run: ${String(artifact.name || artifact.run_id || "training")}`,
+    `Status: ${String(artifact.status || "unknown")}`,
+    `Progress: ${formatTrainingProgress(progress)}`
+  ];
+  const summary = artifact.summary && typeof artifact.summary === "object" ? artifact.summary : {};
+  if (Object.keys(summary).length) {
+    lines.push(`Summary: ${summarizeSummary(summary, 4)}`);
+  }
+  const checkpoints = Array.isArray(artifact.checkpoints) ? artifact.checkpoints : [];
+  if (checkpoints.length) {
+    lines.push("");
+    lines.push("Checkpoints:");
+    for (const checkpoint of checkpoints.slice(-8)) {
+      lines.push(
+        `${String(checkpoint?.kind || "checkpoint")} · step ${Number(checkpoint?.step || 0)} · ${String(checkpoint?.path || "")}`
+      );
+    }
+  }
+  const recentEvents = Array.isArray(artifact.recent_events) ? artifact.recent_events : [];
+  if (recentEvents.length) {
+    lines.push("");
+    lines.push("Recent Events:");
+    for (const event of recentEvents.slice(-6)) {
+      lines.push(`${String(event?.event || "event")} · ${String(event?.data?.message || event?.data?.progress?.status_message || "")}`);
+    }
+  }
+  trainingRunOutputEl.textContent = lines.join("\n");
+}
+
+function renderTrainingRuns(items = []) {
+  if (!trainingRunListEl) {
+    return;
+  }
+  trainingRunListEl.textContent = "";
+  const runs = Array.isArray(items) ? items : [];
+  if (!runs.length) {
+    const empty = document.createElement("p");
+    empty.className = "tools-empty";
+    empty.textContent = "No saved training runs yet.";
+    trainingRunListEl.appendChild(empty);
+    if (trainingRunOutputEl && !state.trainingRunDetail) {
+      trainingRunOutputEl.textContent = "(view a training run to inspect details)";
+    }
+    return;
+  }
+  for (const run of runs) {
+    const row = document.createElement("div");
+    row.className = "tools-item";
+    const meta = document.createElement("div");
+    meta.className = "tools-item-meta";
+    const title = document.createElement("p");
+    title.className = "tools-item-host";
+    title.textContent = `${String(run?.name || run?.run_id || "run")} · ${String(run?.status || "unknown")}`;
+    meta.appendChild(title);
+    const detail = document.createElement("p");
+    detail.className = "models-job-meta";
+    detail.textContent = formatTrainingProgress(run?.progress || {});
+    meta.appendChild(detail);
+    row.appendChild(meta);
+    const actions = document.createElement("div");
+    actions.className = "tools-item-actions";
+    const viewBtn = document.createElement("button");
+    viewBtn.className = "ghost small";
+    viewBtn.textContent = "View";
+    viewBtn.addEventListener("click", async () => {
+      await viewTrainingRun(String(run?.run_id || ""));
+    });
+    actions.appendChild(viewBtn);
+    const bestCheckpoint = run?.best_checkpoint && typeof run.best_checkpoint === "object"
+      ? run.best_checkpoint
+      : null;
+    const latestCheckpoint = run?.latest_checkpoint && typeof run.latest_checkpoint === "object"
+      ? run.latest_checkpoint
+      : null;
+    if (bestCheckpoint?.path) {
+      const loadBtn = document.createElement("button");
+      loadBtn.className = "ghost small";
+      loadBtn.textContent = "Load Best";
+      loadBtn.addEventListener("click", async () => {
+        await loadCheckpointAsAdapter(String(run?.name || run?.run_id || "training"), bestCheckpoint);
+      });
+      actions.appendChild(loadBtn);
+      const saveBtn = document.createElement("button");
+      saveBtn.className = "ghost small";
+      saveBtn.textContent = "Promote";
+      saveBtn.addEventListener("click", async () => {
+        await promoteTrainingCheckpoint(String(run?.run_id || ""), "best", String(run?.name || ""));
+      });
+      actions.appendChild(saveBtn);
+    }
+    if (latestCheckpoint?.path) {
+      const resumeBtn = document.createElement("button");
+      resumeBtn.className = "ghost small";
+      resumeBtn.textContent = "Resume";
+      resumeBtn.addEventListener("click", async () => {
+        await resumeTrainingRun(String(run?.run_id || ""), "latest");
+      });
+      actions.appendChild(resumeBtn);
+    }
+    row.appendChild(actions);
+    trainingRunListEl.appendChild(row);
+  }
+}
+
+async function importTrainingDatasetFromInputs() {
+  const path = String(trainingDatasetPathEl?.value || "").trim();
+  const name = String(trainingDatasetNameEl?.value || "").trim();
+  if (!path) {
+    setTrainingStatus("Enter a dataset path first.");
+    return;
+  }
+  setModelsBusy(true);
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.mlx.training.datasets.import",
+      path,
+      name
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Dataset import failed.");
+    }
+    if (trainingDatasetPathEl) {
+      trainingDatasetPathEl.value = "";
+    }
+    if (trainingDatasetNameEl) {
+      trainingDatasetNameEl.value = "";
+    }
+    setTrainingStatus(`Imported dataset ${String(result?.dataset?.name || result?.dataset?.dataset_id || "")}.`);
+    await refreshModelsState(false);
+  } catch (error) {
+    setTrainingStatus(`Training dataset error: ${String(error.message || error)}`);
+  } finally {
+    setModelsBusy(false);
+  }
+}
+
+async function deleteTrainingDatasetById(datasetId) {
+  if (!datasetId) {
+    return;
+  }
+  setModelsBusy(true);
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.mlx.training.datasets.delete",
+      datasetId
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Dataset delete failed.");
+    }
+    setTrainingStatus(`Deleted dataset ${datasetId}.`);
+    await refreshModelsState(false);
+  } catch (error) {
+    setTrainingStatus(`Training dataset error: ${String(error.message || error)}`);
+  } finally {
+    setModelsBusy(false);
+  }
+}
+
+async function startTrainingJobFromInputs(stopRuntimeFirst) {
+  const datasetId = String(trainingDatasetSelectEl?.value || "").trim();
+  if (!datasetId) {
+    setTrainingStatus("Select a dataset first.");
+    return;
+  }
+  setModelsBusy(true);
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.mlx.training.job.start",
+      datasetId,
+      name: String(trainingRunNameEl?.value || "").trim(),
+      modelPath: String(trainingModelPathEl?.value || mlxModelPathEl?.value || "").trim(),
+      trainingConfig: readTrainingConfigInputs(),
+      stopRuntimeFirst
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Failed to start training job.");
+    }
+    if (trainingStopStartBtn) {
+      trainingStopStartBtn.classList.add("hidden");
+    }
+    setTrainingStatus(`Started training job ${String(result?.job?.job_id || "")}.`);
+    await refreshModelsState(false);
+  } catch (error) {
+    const message = String(error.message || error);
+    if (trainingStopStartBtn) {
+      trainingStopStartBtn.classList.toggle("hidden", !message.includes("Stop MLX and Train"));
+    }
+    setTrainingStatus(`Training error: ${message}`);
+  } finally {
+    setModelsBusy(false);
+  }
+}
+
+async function viewTrainingRun(runId) {
+  if (!runId) {
+    return;
+  }
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.mlx.training.runs.get",
+      runId
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Failed to load training run.");
+    }
+    const run = result.run && typeof result.run === "object" ? result.run : {};
+    state.trainingRunDetail = {
+      runId: String(run.run_id || runId)
+    };
+    renderTrainingRunDetail(run);
+  } catch (error) {
+    if (trainingRunOutputEl) {
+      trainingRunOutputEl.textContent = `Training run error: ${String(error.message || error)}`;
+    }
+  }
+}
+
+async function resumeTrainingRun(runId, checkpointKind = "latest") {
+  if (!runId) {
+    return;
+  }
+  setModelsBusy(true);
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.mlx.training.job.start",
+      resumeRunId: runId,
+      resumeCheckpointKind: checkpointKind,
+      stopRuntimeFirst: false
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Failed to resume training.");
+    }
+    setTrainingStatus(`Resumed training from ${runId}.`);
+    await refreshModelsState(false);
+  } catch (error) {
+    const message = String(error.message || error);
+    if (trainingStopStartBtn) {
+      trainingStopStartBtn.classList.toggle("hidden", !message.includes("Stop MLX and Train"));
+    }
+    setTrainingStatus(`Training error: ${message}`);
+  } finally {
+    setModelsBusy(false);
+  }
+}
+
+async function loadMlxAdapterById(adapterId) {
+  if (!adapterId) {
+    return;
+  }
+  setModelsBusy(true);
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.mlx.adapters.load",
+      adapterId
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Adapter load failed.");
+    }
+    renderMlxAdapters(result);
+    await refreshModelsState(false);
+  } catch (error) {
+    if (mlxRuntimeStatusEl) {
+      mlxRuntimeStatusEl.textContent = `Adapter load error: ${String(error.message || error)}`;
+    }
+  } finally {
+    setModelsBusy(false);
+  }
+}
+
+async function loadCheckpointAsAdapter(runLabel, checkpoint) {
+  if (!checkpoint?.path) {
+    return;
+  }
+  setModelsBusy(true);
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.mlx.adapters.load",
+      path: String(checkpoint.path || ""),
+      name: `${String(runLabel || "training")} ${String(checkpoint.kind || "checkpoint")}`
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Checkpoint load failed.");
+    }
+    renderMlxAdapters(result);
+    if (mlxRuntimeStatusEl) {
+      mlxRuntimeStatusEl.textContent = `Loaded ${String(checkpoint.kind || "checkpoint")} checkpoint.`;
+    }
+    await refreshModelsState(false);
+  } catch (error) {
+    if (mlxRuntimeStatusEl) {
+      mlxRuntimeStatusEl.textContent = `Checkpoint load error: ${String(error.message || error)}`;
+    }
+  } finally {
+    setModelsBusy(false);
+  }
+}
+
+async function promoteTrainingCheckpoint(runId, checkpointKind, runLabel) {
+  if (!runId || !checkpointKind) {
+    return;
+  }
+  setModelsBusy(true);
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.mlx.training.checkpoint.promote",
+      runId,
+      checkpointKind,
+      name: `${String(runLabel || runId)} ${checkpointKind}`
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Checkpoint promotion failed.");
+    }
+    if (mlxRuntimeStatusEl) {
+      mlxRuntimeStatusEl.textContent = `Saved ${checkpointKind} checkpoint to adapters.`;
+    }
+    await refreshModelsState(false);
+  } catch (error) {
+    if (mlxRuntimeStatusEl) {
+      mlxRuntimeStatusEl.textContent = `Checkpoint promotion error: ${String(error.message || error)}`;
+    }
+  } finally {
+    setModelsBusy(false);
+  }
 }
 
 function readGenerationInputs() {
@@ -585,15 +1582,349 @@ function fillSystemPromptInput(value) {
   }
 }
 
+function buildPromptSetFromInputs() {
+  const prompts = String(experimentPromptsEl?.value || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const references = String(experimentReferencesEl?.value || "")
+    .split("\n")
+    .map((line) => line.trim());
+  return prompts.map((prompt, index) => ({
+    id: `prompt_${String(index + 1).padStart(2, "0")}`,
+    prompt,
+    reference: references[index] || ""
+  }));
+}
+
+function getPaperAnalysisBackend() {
+  const backend = String(modelsBackendEl?.value || backendEl?.value || "llama").trim().toLowerCase();
+  return backend === "mlx" ? "mlx" : "llama";
+}
+
+function summarizePaperInspect(inspect, cachedPaper) {
+  if (!paperInspectOutputEl) {
+    return;
+  }
+  if (!inspect || typeof inspect !== "object") {
+    paperInspectOutputEl.textContent = "No paper inspected yet.";
+    return;
+  }
+  const lines = [];
+  const title = String(inspect.title || "").trim();
+  if (title) {
+    lines.push(`Title: ${title}`);
+  }
+  const authors = Array.isArray(inspect.authors) ? inspect.authors.map((value) => String(value || "").trim()).filter(Boolean) : [];
+  if (authors.length) {
+    lines.push(`Authors: ${authors.join(", ")}`);
+  }
+  const source = String(inspect.url || inspect.local_path || "").trim();
+  if (source) {
+    lines.push(`Source: ${source}`);
+  }
+  if (inspect.abstract) {
+    lines.push("");
+    lines.push(`Abstract:\n${String(inspect.abstract).trim()}`);
+  } else if (inspect.preview_text) {
+    lines.push("");
+    lines.push(`Preview:\n${String(inspect.preview_text).trim()}`);
+  }
+  if (cachedPaper?.paper_id) {
+    lines.push("");
+    lines.push(`Cached artifact: ${cachedPaper.paper_id}`);
+  }
+  paperInspectOutputEl.textContent = lines.join("\n") || "Paper inspect completed.";
+}
+
+function renderPaperJobs(jobs = []) {
+  if (!paperJobListEl) {
+    return;
+  }
+  paperJobListEl.textContent = "";
+  const list = Array.isArray(jobs) ? jobs : [];
+  if (!list.length) {
+    const empty = document.createElement("p");
+    empty.className = "tools-empty";
+    empty.textContent = "No paper jobs yet.";
+    paperJobListEl.appendChild(empty);
+    return;
+  }
+  for (const job of list) {
+    const row = document.createElement("div");
+    row.className = "tools-item";
+    const meta = document.createElement("div");
+    meta.className = "tools-item-meta";
+    const title = document.createElement("p");
+    title.className = "tools-item-host";
+    const inputSummary = job?.input_summary && typeof job.input_summary === "object" ? job.input_summary : {};
+    title.textContent =
+      String(job?.result?.title || inputSummary.url || inputSummary.pdf_path || inputSummary.html_path || inputSummary.text_path || job?.job_type || "paper job");
+    meta.appendChild(title);
+    const detail = document.createElement("p");
+    detail.className = "tools-muted";
+    const errorMessage = truncatePreview(job?.error?.message || "", 180);
+    const latestDigest = truncatePreview(job?.result?.latest_digest_excerpt || "", 180);
+    if (errorMessage) {
+      detail.textContent = errorMessage;
+    } else if (latestDigest) {
+      detail.textContent = latestDigest;
+    } else if (job?.result?.paper_id) {
+      detail.textContent = `${Number(job?.result?.section_count || 0)} sections · ${Number(job?.result?.char_count || 0)} chars`;
+    } else {
+      detail.textContent = `Updated ${formatTime(job?.updated_at)}`;
+    }
+    meta.appendChild(detail);
+    const tags = document.createElement("div");
+    tags.className = "tools-item-tags";
+    for (const tagText of [String(job?.status || "unknown"), String(job?.job_type || "")].filter(Boolean)) {
+      const chip = document.createElement("span");
+      chip.className = "tools-chip";
+      chip.textContent = tagText;
+      tags.appendChild(chip);
+    }
+    meta.appendChild(tags);
+    row.appendChild(meta);
+    const actions = document.createElement("div");
+    actions.className = "tools-item-actions";
+    const refreshBtn = document.createElement("button");
+    refreshBtn.className = "ghost small";
+    refreshBtn.textContent = "Refresh";
+    refreshBtn.addEventListener("click", async () => {
+      await refreshToolsState(true);
+    });
+    actions.appendChild(refreshBtn);
+    if (job?.result?.paper_id) {
+      const viewBtn = document.createElement("button");
+      viewBtn.className = "ghost small";
+      viewBtn.textContent = "View";
+      viewBtn.addEventListener("click", async () => {
+        await viewPaperArtifact(String(job?.result?.paper_id || ""));
+      });
+      actions.appendChild(viewBtn);
+    }
+    if (String(job?.status || "") !== "completed" && String(job?.status || "") !== "failed" && String(job?.status || "") !== "cancelled") {
+      const cancelBtn = document.createElement("button");
+      cancelBtn.className = "ghost small";
+      cancelBtn.textContent = "Cancel";
+      cancelBtn.addEventListener("click", async () => {
+        await cancelBrokerJob(String(job?.job_id || ""));
+      });
+      actions.appendChild(cancelBtn);
+    }
+    row.appendChild(actions);
+    paperJobListEl.appendChild(row);
+  }
+}
+
+function renderPaperLibrary(items = []) {
+  if (!paperListEl) {
+    return;
+  }
+  paperListEl.textContent = "";
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) {
+    const empty = document.createElement("p");
+    empty.className = "tools-empty";
+    empty.textContent = "No paper artifacts yet.";
+    paperListEl.appendChild(empty);
+    return;
+  }
+  for (const paper of list) {
+    const row = document.createElement("div");
+    row.className = "tools-item";
+    const meta = document.createElement("div");
+    meta.className = "tools-item-meta";
+    const title = document.createElement("p");
+    title.className = "tools-item-host";
+    title.textContent = String(paper?.title || paper?.paper_id || "paper");
+    meta.appendChild(title);
+    const detail = document.createElement("p");
+    detail.className = "tools-muted";
+    detail.textContent = truncatePreview(paper?.latest_digest_excerpt || paper?.abstract || paper?.url || paper?.local_path || "", 180)
+      || `Updated ${formatTime(paper?.updated_at)}`;
+    meta.appendChild(detail);
+    const tags = document.createElement("div");
+    tags.className = "tools-item-tags";
+    for (const tagText of [
+      String(paper?.source_format || ""),
+      `${Number(paper?.section_count || 0)} section${Number(paper?.section_count || 0) === 1 ? "" : "s"}`
+    ]) {
+      if (!tagText) {
+        continue;
+      }
+      const chip = document.createElement("span");
+      chip.className = "tools-chip";
+      chip.textContent = tagText;
+      tags.appendChild(chip);
+    }
+    meta.appendChild(tags);
+    row.appendChild(meta);
+    const actions = document.createElement("div");
+    actions.className = "tools-item-actions";
+    const openBtn = document.createElement("button");
+    openBtn.className = "ghost small";
+    openBtn.textContent = "View";
+    openBtn.addEventListener("click", async () => {
+      await viewPaperArtifact(String(paper?.paper_id || ""));
+    });
+    actions.appendChild(openBtn);
+    row.appendChild(actions);
+    paperListEl.appendChild(row);
+  }
+}
+
+function renderExperimentJobs(jobs = []) {
+  if (!experimentJobListEl) {
+    return;
+  }
+  experimentJobListEl.textContent = "";
+  const list = Array.isArray(jobs) ? jobs : [];
+  if (!list.length) {
+    const empty = document.createElement("p");
+    empty.className = "tools-empty";
+    empty.textContent = "No experiment jobs yet.";
+    experimentJobListEl.appendChild(empty);
+    return;
+  }
+  for (const job of list) {
+    const row = document.createElement("div");
+    row.className = "tools-item";
+    const meta = document.createElement("div");
+    meta.className = "tools-item-meta";
+    const title = document.createElement("p");
+    title.className = "tools-item-host";
+    title.textContent = `${String(job?.job_type || "experiment")} · ${Number(job?.result?.prompt_count || job?.input_summary?.prompt_count || 0)} prompt(s)`;
+    meta.appendChild(title);
+    const detail = document.createElement("p");
+    detail.className = "tools-muted";
+    const errorMessage = truncatePreview(job?.error?.message || "", 180);
+    const resultSummary = summarizeSummary(job?.result?.summary, 3);
+    detail.textContent = errorMessage || resultSummary || `Updated ${formatTime(job?.updated_at)}`;
+    meta.appendChild(detail);
+    const tags = document.createElement("div");
+    tags.className = "tools-item-tags";
+    for (const tagText of [String(job?.status || "unknown"), String(job?.input_summary?.adapter_path ? "adapter" : "base")]) {
+      const chip = document.createElement("span");
+      chip.className = "tools-chip";
+      chip.textContent = tagText;
+      tags.appendChild(chip);
+    }
+    meta.appendChild(tags);
+    row.appendChild(meta);
+    const actions = document.createElement("div");
+    actions.className = "tools-item-actions";
+    const refreshBtn = document.createElement("button");
+    refreshBtn.className = "ghost small";
+    refreshBtn.textContent = "Refresh";
+    refreshBtn.addEventListener("click", async () => {
+      await refreshModelsState(true);
+    });
+    actions.appendChild(refreshBtn);
+    if (job?.result?.experiment_id) {
+      const viewBtn = document.createElement("button");
+      viewBtn.className = "ghost small";
+      viewBtn.textContent = "View";
+      viewBtn.addEventListener("click", async () => {
+        await viewExperimentArtifact(String(job?.result?.experiment_id || ""));
+      });
+      actions.appendChild(viewBtn);
+    }
+    if (String(job?.status || "") !== "completed" && String(job?.status || "") !== "failed" && String(job?.status || "") !== "cancelled") {
+      const cancelBtn = document.createElement("button");
+      cancelBtn.className = "ghost small";
+      cancelBtn.textContent = "Cancel";
+      cancelBtn.addEventListener("click", async () => {
+        await cancelBrokerJob(String(job?.job_id || ""));
+      });
+      actions.appendChild(cancelBtn);
+    }
+    row.appendChild(actions);
+    experimentJobListEl.appendChild(row);
+  }
+}
+
+function renderExperimentLibrary(items = []) {
+  if (!experimentListEl) {
+    return;
+  }
+  experimentListEl.textContent = "";
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) {
+    const empty = document.createElement("p");
+    empty.className = "tools-empty";
+    empty.textContent = "No saved experiment artifacts yet.";
+    experimentListEl.appendChild(empty);
+    if (experimentCompareOutputEl && !state.experimentDetail) {
+      experimentCompareOutputEl.textContent = "(no comparison yet)";
+    }
+    return;
+  }
+  for (const experiment of list) {
+    const row = document.createElement("div");
+    row.className = "tools-item";
+    const meta = document.createElement("div");
+    meta.className = "tools-item-meta";
+    const title = document.createElement("p");
+    title.className = "tools-item-host";
+    title.textContent = `${String(experiment?.kind || "experiment")} · ${Number(experiment?.prompt_count || 0)} prompt(s)`;
+    meta.appendChild(title);
+    const detail = document.createElement("p");
+    detail.className = "tools-muted";
+    detail.textContent = summarizeSummary(experiment?.summary, 3) || `Completed ${formatTime(experiment?.completed_at || experiment?.created_at)}`;
+    meta.appendChild(detail);
+    const tags = document.createElement("div");
+    tags.className = "tools-item-tags";
+    for (const tagText of [String(experiment?.experiment_id || ""), String(experiment?.adapter_path ? "adapter" : "base")].filter(Boolean)) {
+      const chip = document.createElement("span");
+      chip.className = "tools-chip";
+      chip.textContent = tagText;
+      tags.appendChild(chip);
+    }
+    meta.appendChild(tags);
+    row.appendChild(meta);
+    const actions = document.createElement("div");
+    actions.className = "tools-item-actions";
+    const viewBtn = document.createElement("button");
+    viewBtn.className = "ghost small";
+    viewBtn.textContent = "View";
+    viewBtn.addEventListener("click", async () => {
+      await viewExperimentArtifact(String(experiment?.experiment_id || ""));
+    });
+    actions.appendChild(viewBtn);
+    row.appendChild(actions);
+    experimentListEl.appendChild(row);
+  }
+  if (list.length >= 2 && state.experimentDetail?.mode !== "artifact") {
+    void compareLatestExperiments(list);
+  } else if (list.length < 2 && experimentCompareOutputEl && state.experimentDetail?.mode !== "artifact") {
+    experimentCompareOutputEl.textContent = "(view an experiment to inspect details)";
+  }
+}
+
 async function refreshModelsState(showErrors = true) {
   setModelsBusy(true);
   try {
-    const modelsResult = await sendRuntimeMessage({ type: "assistant.models.get" });
+    const [modelsState, adaptersState, jobsState, experimentsState, trainingDatasetsState, trainingJobsState, trainingRunsState] = await Promise.allSettled([
+      sendRuntimeMessage({ type: "assistant.models.get" }),
+      sendRuntimeMessage({ type: "assistant.mlx.adapters.list" }),
+      sendRuntimeMessage({ type: "assistant.jobs.list", kind: "experiment" }),
+      sendRuntimeMessage({ type: "assistant.experiments.list" }),
+      sendRuntimeMessage({ type: "assistant.mlx.training.datasets.list" }),
+      sendRuntimeMessage({ type: "assistant.jobs.list", kind: "training" }),
+      sendRuntimeMessage({ type: "assistant.mlx.training.runs.list" })
+    ]);
+
+    if (modelsState.status === "rejected") {
+      throw modelsState.reason;
+    }
+    const modelsResult = modelsState.value;
     if (!modelsResult.ok) {
       throw new Error(modelsResult.error || "Failed to load models metadata.");
     }
     const backends = Array.isArray(modelsResult.backends) ? modelsResult.backends : [];
     const mlx = modelsResult.mlx && typeof modelsResult.mlx === "object" ? modelsResult.mlx : {};
+    state.mlxRuntime = mlx;
     renderModelsBackends(backends);
     if (modelsBackendEl?.value) {
       backendEl.value = modelsBackendEl.value;
@@ -601,6 +1932,9 @@ async function refreshModelsState(showErrors = true) {
     updateComposerState();
     if (mlxModelPathEl) {
       mlxModelPathEl.value = String(mlx.model_path || "");
+    }
+    if (trainingModelPathEl && !String(trainingModelPathEl.value || "").trim()) {
+      trainingModelPathEl.value = String(mlx.model_path || "");
     }
     if (mlxRuntimeStatusEl) {
       mlxRuntimeStatusEl.textContent = formatMlxStatus(mlx);
@@ -611,17 +1945,78 @@ async function refreshModelsState(showErrors = true) {
     fillGenerationInputs(mlx.generation_config || {});
     fillSystemPromptInput(mlx.system_prompt);
     renderMlxTrends(mlx);
-
-    const adaptersResult = await sendRuntimeMessage({ type: "assistant.mlx.adapters.list" });
-    if (adaptersResult.ok) {
-      renderMlxAdapters(adaptersResult);
+    if (trainingPresetEl && !trainingRankEl?.value) {
+      applyTrainingPreset();
     }
+
+    if (adaptersState.status === "fulfilled" && adaptersState.value?.ok) {
+      renderMlxAdapters(adaptersState.value);
+    }
+
+    state.experimentJobs =
+      jobsState.status === "fulfilled" && jobsState.value?.ok && Array.isArray(jobsState.value.jobs)
+        ? jobsState.value.jobs
+        : [];
+    state.experiments =
+      experimentsState.status === "fulfilled" && experimentsState.value?.ok && Array.isArray(experimentsState.value.experiments)
+        ? experimentsState.value.experiments
+        : [];
+    state.trainingDatasets =
+      trainingDatasetsState.status === "fulfilled"
+      && trainingDatasetsState.value?.ok
+      && Array.isArray(trainingDatasetsState.value.datasets)
+        ? trainingDatasetsState.value.datasets
+        : [];
+    state.trainingJobs =
+      trainingJobsState.status === "fulfilled"
+      && trainingJobsState.value?.ok
+      && Array.isArray(trainingJobsState.value.jobs)
+        ? trainingJobsState.value.jobs
+        : [];
+    state.trainingRuns =
+      trainingRunsState.status === "fulfilled"
+      && trainingRunsState.value?.ok
+      && Array.isArray(trainingRunsState.value.runs)
+        ? trainingRunsState.value.runs
+        : [];
+    renderExperimentJobs(state.experimentJobs);
+    renderExperimentLibrary(state.experiments);
+    renderTrainingDatasets(state.trainingDatasets);
+    renderTrainingJobs(state.trainingJobs);
+    renderTrainingRuns(state.trainingRuns);
+    if (experimentsStatusEl) {
+      const runningJobs = state.experimentJobs.filter((job) => ACTIVE_JOB_STATUSES.has(String(job?.status || ""))).length;
+      const availabilityMessage = describeExperimentAvailability(mlx);
+      experimentsStatusEl.textContent =
+        runningJobs > 0
+          ? `${runningJobs} experiment job${runningJobs === 1 ? "" : "s"} running. Auto-refreshing every ${Math.round(JOB_POLL_INTERVAL_MS / 1000)}s.`
+          : availabilityMessage
+            || `${state.experiments.length} saved experiment artifact${state.experiments.length === 1 ? "" : "s"}.`;
+    }
+    const runningTrainingJobs = state.trainingJobs.filter((job) => ACTIVE_JOB_STATUSES.has(String(job?.status || ""))).length;
+    if (runningTrainingJobs > 0) {
+      setTrainingStatus(
+        `${runningTrainingJobs} training job${runningTrainingJobs === 1 ? "" : "s"} running. Auto-refreshing every ${Math.round(JOB_POLL_INTERVAL_MS / 1000)}s.`
+      );
+    } else {
+      setTrainingStatus(
+        `${state.trainingDatasets.length} dataset${state.trainingDatasets.length === 1 ? "" : "s"} · ${state.trainingRuns.length} run${state.trainingRuns.length === 1 ? "" : "s"}`
+      );
+    }
+    scheduleAutoRefresh("experiments", hasActiveJobs(state.experimentJobs) || hasActiveJobs(state.trainingJobs));
   } catch (error) {
+    scheduleAutoRefresh("experiments", false);
     if (showErrors && mlxRuntimeStatusEl) {
       mlxRuntimeStatusEl.textContent = `MLX status error: ${String(error.message || error)}`;
     }
     if (showErrors && mlxContractEl) {
       mlxContractEl.textContent = "(contract unavailable)";
+    }
+    if (showErrors && experimentsStatusEl) {
+      experimentsStatusEl.textContent = `Experiment error: ${String(error.message || error)}`;
+    }
+    if (showErrors) {
+      setTrainingStatus(`Training error: ${String(error.message || error)}`);
     }
   } finally {
     setModelsBusy(false);
@@ -719,6 +2114,139 @@ async function unloadMlxAdapter() {
     }
   } finally {
     setModelsBusy(false);
+  }
+}
+
+async function runExperimentJob(kind) {
+  const promptSet = buildPromptSetFromInputs();
+  if (!promptSet.length) {
+    if (experimentsStatusEl) {
+      experimentsStatusEl.textContent = "Enter at least one prompt.";
+    }
+    return;
+  }
+  const adapterPath = String(mlxAdapterPathEl?.value || "").trim() || String(state.activeMlxAdapterPath || "").trim();
+  if (kind === "adapter_eval" && !adapterPath) {
+    if (experimentsStatusEl) {
+      experimentsStatusEl.textContent = "Load an adapter or enter an adapter path before running adapter eval.";
+    }
+    return;
+  }
+  const availabilityMessage = describeExperimentAvailability(state.mlxRuntime);
+  if (availabilityMessage && experimentsStatusEl) {
+    experimentsStatusEl.textContent = availabilityMessage;
+  }
+  setModelsBusy(true);
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.experiments.job.start",
+      kind,
+      modelPath: String(mlxModelPathEl?.value || "").trim(),
+      adapterPath,
+      promptSet,
+      generation: readGenerationInputs(),
+      systemPrompt: readMlxSystemPromptInput()
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Failed to start experiment job.");
+    }
+    state.experimentDetail = null;
+    if (experimentsStatusEl) {
+      experimentsStatusEl.textContent = `Started ${kind.replace("_", " ")} job ${String(result.job?.job_id || "")}.`;
+    }
+    await refreshModelsState(false);
+  } catch (error) {
+    if (experimentsStatusEl) {
+      experimentsStatusEl.textContent = `Experiment error: ${String(error.message || error)}`;
+    }
+  } finally {
+    setModelsBusy(false);
+  }
+}
+
+async function viewExperimentArtifact(experimentId) {
+  if (!experimentId) {
+    return;
+  }
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.experiments.get",
+      experimentId
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Failed to load experiment artifact.");
+    }
+    const experiment = result.experiment && typeof result.experiment === "object" ? result.experiment : {};
+    state.experimentDetail = {
+      mode: "artifact",
+      experimentId: String(experiment.experiment_id || experimentId)
+    };
+    renderExperimentDetail(experiment);
+  } catch (error) {
+    if (experimentCompareOutputEl) {
+      experimentCompareOutputEl.textContent = `Experiment error: ${String(error.message || error)}`;
+    }
+  }
+}
+
+async function compareLatestExperiments(items) {
+  const list = Array.isArray(items) ? items : [];
+  if (list.length < 2 || !experimentCompareOutputEl) {
+    return;
+  }
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.experiments.compare",
+      experimentId: String(list[0]?.experiment_id || ""),
+      otherExperimentId: String(list[1]?.experiment_id || "")
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Failed to compare experiments.");
+    }
+    const comparison = result.comparison && typeof result.comparison === "object" ? result.comparison : {};
+    state.experimentDetail = {
+      mode: "comparison",
+      leftId: String(list[0]?.experiment_id || ""),
+      rightId: String(list[1]?.experiment_id || "")
+    };
+    const lines = [
+      `Latest comparison: ${String(list[0]?.experiment_id || "")} vs ${String(list[1]?.experiment_id || "")}`,
+      `Latency: ${String(comparison.left_average_latency_ms ?? "n/a")} ms vs ${String(comparison.right_average_latency_ms ?? "n/a")} ms`,
+      `Latency delta (second - first): ${String(comparison.average_latency_delta_ms ?? "")}`,
+      `Exact match: ${String(comparison.left_exact_match_rate ?? "n/a")} vs ${String(comparison.right_exact_match_rate ?? "n/a")}`,
+      `Exact match delta (second - first): ${String(comparison.exact_match_rate_delta ?? "n/a")}`,
+      `Contains reference: ${String(comparison.left_contains_reference_rate ?? "n/a")} vs ${String(comparison.right_contains_reference_rate ?? "n/a")}`,
+      `Contains delta (second - first): ${String(comparison.contains_reference_rate_delta ?? "n/a")}`
+    ];
+    experimentCompareOutputEl.textContent = lines.join("\n");
+  } catch (error) {
+    experimentCompareOutputEl.textContent = `Comparison error: ${String(error.message || error)}`;
+  }
+}
+
+async function cancelBrokerJob(jobId) {
+  if (!jobId) {
+    return;
+  }
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.jobs.cancel",
+      jobId
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Failed to cancel job.");
+    }
+    if (String(jobId).startsWith("paper_job_")) {
+      await refreshToolsState(false);
+    } else {
+      await refreshModelsState(false);
+    }
+  } catch (error) {
+    if (String(jobId).startsWith("paper_job_")) {
+      updateToolsStatus(`Paper job error: ${String(error.message || error)}`);
+    } else if (experimentsStatusEl) {
+      experimentsStatusEl.textContent = `Experiment error: ${String(error.message || error)}`;
+    }
   }
 }
 
@@ -827,7 +2355,6 @@ function normalizeToolsPolicy(policy) {
   return {
     default_hosts: normalizeHostArray(raw.default_hosts),
     custom_allowed_hosts: normalizeHostArray(raw.custom_allowed_hosts),
-    blocked_hosts: normalizeHostArray(raw.blocked_hosts),
     effective_allowed_hosts: normalizeHostArray(raw.effective_allowed_hosts)
   };
 }
@@ -870,10 +2397,13 @@ function setToolsBusy(busy) {
     toolsRefreshBtn,
     toolsHostInputEl,
     toolsAllowBtn,
-    toolsBlockBtn,
     toolsAllowActiveBtn,
     toolsAgentMaxStepsEl,
-    toolsBrowserApplyBtn
+    toolsBrowserApplyBtn,
+    paperSourceInputEl,
+    paperUseActiveBtn,
+    paperInspectBtn,
+    paperAnalyzeBtn
   ];
   for (const control of controls) {
     if (control) {
@@ -883,7 +2413,10 @@ function setToolsBusy(busy) {
   for (const button of toolsAllowedListEl?.querySelectorAll("button") || []) {
     button.disabled = busy;
   }
-  for (const button of toolsBlockedListEl?.querySelectorAll("button") || []) {
+  for (const button of paperJobListEl?.querySelectorAll("button") || []) {
+    button.disabled = busy;
+  }
+  for (const button of paperListEl?.querySelectorAll("button") || []) {
     button.disabled = busy;
   }
 }
@@ -891,6 +2424,12 @@ function setToolsBusy(busy) {
 function updateToolsStatus(text) {
   if (toolsPolicyStatusEl) {
     toolsPolicyStatusEl.textContent = text;
+  }
+}
+
+function updatePapersStatus(text) {
+  if (papersStatusEl) {
+    papersStatusEl.textContent = text;
   }
 }
 
@@ -944,17 +2483,6 @@ function renderToolsPolicy(policy) {
         const actions = document.createElement("div");
         actions.className = "tools-item-actions";
 
-        const disallowBtn = document.createElement("button");
-        disallowBtn.className = "ghost small";
-        disallowBtn.textContent = "Disallow";
-        disallowBtn.addEventListener("click", async () => {
-          await runHostPolicyAction(
-            { type: "assistant.tools.page_hosts.block", host },
-            `${host} moved to disallow list.`
-          );
-        });
-        actions.appendChild(disallowBtn);
-
         if (customHosts.has(host)) {
           const removeBtn = document.createElement("button");
           removeBtn.className = "ghost small";
@@ -973,99 +2501,109 @@ function renderToolsPolicy(policy) {
       }
     }
   }
-
-  if (toolsBlockedListEl) {
-    toolsBlockedListEl.textContent = "";
-    if (!normalized.blocked_hosts.length) {
-      const empty = document.createElement("p");
-      empty.className = "tools-empty";
-      empty.textContent = "No disallowed hosts.";
-      toolsBlockedListEl.appendChild(empty);
-    } else {
-      for (const host of normalized.blocked_hosts) {
-        const row = document.createElement("div");
-        row.className = "tools-item";
-
-        const meta = document.createElement("div");
-        meta.className = "tools-item-meta";
-
-        const hostEl = document.createElement("div");
-        hostEl.className = "tools-item-host";
-        hostEl.textContent = host;
-        meta.appendChild(hostEl);
-
-        const tags = document.createElement("div");
-        tags.className = "tools-item-tags";
-        const chip = document.createElement("span");
-        chip.className = "tools-chip blocked";
-        chip.textContent = defaultHosts.has(host) ? "blocked default" : "blocked";
-        tags.appendChild(chip);
-        meta.appendChild(tags);
-        row.appendChild(meta);
-
-        const actions = document.createElement("div");
-        actions.className = "tools-item-actions";
-
-        const allowBtn = document.createElement("button");
-        allowBtn.className = "small";
-        allowBtn.textContent = "Allow";
-        allowBtn.addEventListener("click", async () => {
-          await runHostPolicyAction(
-            { type: "assistant.tools.page_hosts.allow", host },
-            `${host} added to allowlist.`
-          );
-        });
-        actions.appendChild(allowBtn);
-
-        const unblockBtn = document.createElement("button");
-        unblockBtn.className = "ghost small";
-        unblockBtn.textContent = "Unblock";
-        unblockBtn.addEventListener("click", async () => {
-          await runHostPolicyAction(
-            { type: "assistant.tools.page_hosts.unblock", host },
-            `${host} removed from disallow list.`
-          );
-        });
-        actions.appendChild(unblockBtn);
-
-        row.appendChild(actions);
-        toolsBlockedListEl.appendChild(row);
-      }
-    }
-  }
   setToolsBusy(state.toolsBusy);
 }
 
 async function refreshToolsState(showErrors = true) {
   setToolsBusy(true);
   try {
-    const [policyResult, activeResult, browserConfigResult] = await Promise.all([
+    const [policyState, activeState, browserConfigState, jobsState, papersState] = await Promise.allSettled([
       sendRuntimeMessage({ type: "assistant.tools.page_hosts.get" }),
       sendRuntimeMessage({ type: "assistant.tools.page_hosts.active_tab" }),
-      sendRuntimeMessage({ type: "assistant.tools.browser_config.get" })
+      sendRuntimeMessage({ type: "assistant.tools.browser_config.get" }),
+      sendRuntimeMessage({ type: "assistant.jobs.list", kind: "paper" }),
+      sendRuntimeMessage({ type: "assistant.papers.list" })
     ]);
+
+    if (policyState.status === "rejected") {
+      throw policyState.reason;
+    }
+    const policyResult = policyState.value;
     if (!policyResult.ok) {
       throw new Error(policyResult.error || "Failed to load tool policy.");
     }
-    if (!browserConfigResult.ok) {
-      throw new Error(browserConfigResult.error || "Failed to load browser settings.");
-    }
     renderToolsPolicy(policyResult.policy);
-    renderBrowserConfig(browserConfigResult.browser);
-    state.toolsActiveTab =
-      activeResult.ok && activeResult.active_tab && typeof activeResult.active_tab === "object"
-        ? activeResult.active_tab
-        : null;
 
-    if (state.toolsActiveTab?.host) {
-      const marker = state.toolsActiveTab.blocked ? "blocked" : state.toolsActiveTab.allowed ? "allowed" : "not allowed";
-      updateToolsStatus(`Active tab: ${state.toolsActiveTab.host} (${marker})`);
+    let browserConfigUnavailable = false;
+    if (browserConfigState.status === "fulfilled" && browserConfigState.value?.ok) {
+      renderBrowserConfig(browserConfigState.value.browser);
     } else {
-      updateToolsStatus("Active tab host unavailable.");
+      browserConfigUnavailable = true;
+      if (!state.toolsBrowserConfig) {
+        renderBrowserConfig({});
+      }
+      const errorText =
+        browserConfigState.status === "rejected"
+          ? String(browserConfigState.reason?.message || browserConfigState.reason)
+          : String(browserConfigState.value?.error || "Failed to load browser settings.");
+      console.warn("[secure-panel] tools refresh browser config failed:", errorText);
     }
+
+    let activeTabUnavailable = false;
+    if (activeState.status === "fulfilled") {
+      state.toolsActiveTab =
+        activeState.value?.ok && activeState.value.active_tab && typeof activeState.value.active_tab === "object"
+          ? activeState.value.active_tab
+          : null;
+      if (!activeState.value?.ok) {
+        activeTabUnavailable = true;
+        console.warn(
+          "[secure-panel] tools refresh active tab failed:",
+          String(activeState.value?.error || "Failed to load active tab details.")
+        );
+      }
+    } else {
+      activeTabUnavailable = true;
+      state.toolsActiveTab = null;
+      console.warn(
+        "[secure-panel] tools refresh active tab failed:",
+        String(activeState.reason?.message || activeState.reason)
+      );
+    }
+
+    const statusParts = [];
+    if (state.toolsActiveTab?.host) {
+      const marker = state.toolsActiveTab.allowed ? "allowed" : "not allowed";
+      statusParts.push(`Active tab: ${state.toolsActiveTab.host} (${marker})`);
+    } else {
+      statusParts.push("Allowlist loaded. Active tab host unavailable.");
+    }
+    if (activeTabUnavailable && !state.toolsActiveTab?.host) {
+      statusParts[0] = "Allowlist loaded. Active tab unavailable.";
+    }
+    if (browserConfigUnavailable) {
+      statusParts.push("Browser settings unavailable.");
+    }
+    updateToolsStatus(statusParts.join(" "));
+
+    state.paperJobs =
+      jobsState.status === "fulfilled" && jobsState.value?.ok && Array.isArray(jobsState.value.jobs)
+        ? jobsState.value.jobs
+        : [];
+    state.papers =
+      papersState.status === "fulfilled" && papersState.value?.ok && Array.isArray(papersState.value.papers)
+        ? papersState.value.papers
+        : [];
+    renderPaperJobs(state.paperJobs);
+    renderPaperLibrary(state.papers);
+    if (state.paperInspect?.paper) {
+      renderPaperDetail(state.paperInspect.paper);
+    } else {
+      summarizePaperInspect(state.paperInspect?.inspect, state.paperInspect?.cached_paper);
+    }
+    const runningJobs = state.paperJobs.filter((job) => ACTIVE_JOB_STATUSES.has(String(job?.status || ""))).length;
+    updatePapersStatus(
+      runningJobs > 0
+        ? `${runningJobs} paper job${runningJobs === 1 ? "" : "s"} running. Auto-refreshing every ${Math.round(JOB_POLL_INTERVAL_MS / 1000)}s.`
+        : `${state.papers.length} saved paper artifact${state.papers.length === 1 ? "" : "s"}.`
+    );
+    scheduleAutoRefresh("papers", hasActiveJobs(state.paperJobs));
   } catch (error) {
+    scheduleAutoRefresh("papers", false);
+    console.warn("[secure-panel] tools refresh failed:", String(error?.message || error));
     if (showErrors) {
       updateToolsStatus(`Tools error: ${String(error.message || error)}`);
+      updatePapersStatus(`Paper error: ${String(error.message || error)}`);
     }
   } finally {
     setToolsBusy(false);
@@ -1152,26 +2690,6 @@ async function allowHostFromInput() {
   }
 }
 
-async function blockHostFromInput() {
-  const rawHost = String(toolsHostInputEl?.value || "").trim();
-  if (!rawHost) {
-    updateToolsStatus("Enter a host to disallow.");
-    return;
-  }
-  const host = normalizeHostToken(rawHost);
-  if (!host) {
-    updateToolsStatus("Host must be a valid hostname like example.com.");
-    return;
-  }
-  const ok = await runHostPolicyAction(
-    { type: "assistant.tools.page_hosts.block", host },
-    `${host} moved to disallow list.`
-  );
-  if (ok && toolsHostInputEl) {
-    toolsHostInputEl.value = "";
-  }
-}
-
 async function allowActiveTabHost() {
   setToolsBusy(true);
   try {
@@ -1198,6 +2716,140 @@ async function allowActiveTabHost() {
     updateToolsStatus(`Tools error: ${String(error.message || error)}`);
   } finally {
     setToolsBusy(false);
+  }
+}
+
+function buildPaperSourceMessage(rawValue) {
+  const source = String(rawValue || "").trim();
+  if (!source) {
+    return null;
+  }
+  if (/^https?:\/\//i.test(source)) {
+    return { url: source };
+  }
+  if (/\.pdf$/i.test(source)) {
+    return { pdfPath: source };
+  }
+  if (/\.(html?|xhtml)$/i.test(source)) {
+    return { htmlPath: source };
+  }
+  return { textPath: source };
+}
+
+async function useActiveTabForPaperSource() {
+  try {
+    const result = await sendRuntimeMessage({ type: "assistant.tools.page_hosts.active_tab" });
+    if (!result.ok) {
+      throw new Error(result.error || "Unable to read active tab.");
+    }
+    const url = String(result.active_tab?.url || "").trim();
+    if (!url) {
+      throw new Error("Active tab URL is unavailable.");
+    }
+    if (paperSourceInputEl) {
+      paperSourceInputEl.value = url;
+    }
+    updatePapersStatus("Active tab URL copied into the paper source field.");
+  } catch (error) {
+    updatePapersStatus(`Paper error: ${String(error.message || error)}`);
+  }
+}
+
+async function inspectPaperFromInputs() {
+  const sourceBody = buildPaperSourceMessage(paperSourceInputEl?.value);
+  if (!sourceBody) {
+    updatePapersStatus("Enter a paper URL or local path first.");
+    return;
+  }
+  setToolsBusy(true);
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.papers.inspect",
+      ...sourceBody
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Paper inspect failed.");
+    }
+    state.paperInspect = result;
+    summarizePaperInspect(result.inspect, result.cached_paper);
+    updatePapersStatus("Paper inspect completed.");
+    await refreshToolsState(false);
+  } catch (error) {
+    updatePapersStatus(`Paper error: ${String(error.message || error)}`);
+  } finally {
+    setToolsBusy(false);
+  }
+}
+
+async function analyzePaperFromInputs() {
+  const sourceBody = buildPaperSourceMessage(paperSourceInputEl?.value);
+  if (!sourceBody) {
+    updatePapersStatus("Enter a paper URL or local path first.");
+    return;
+  }
+  const analysisBackend = getPaperAnalysisBackend();
+  const mlxPaperAvailability = describeMlxBackendAvailability(state.mlxRuntime, "MLX paper analysis");
+  if (analysisBackend === "mlx" && mlxPaperAvailability) {
+    updatePapersStatus(
+      `${mlxPaperAvailability} Switch the backend selector to llama if you want paper digests without MLX.`
+    );
+    return;
+  }
+  setToolsBusy(true);
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.papers.job.start",
+      ...sourceBody,
+      analysisMode: "digest",
+      backend: analysisBackend
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Failed to start paper job.");
+    }
+    updatePapersStatus(`Started paper analysis job ${String(result.job?.job_id || "")} using ${analysisBackend}.`);
+    await refreshToolsState(false);
+  } catch (error) {
+    updatePapersStatus(`Paper error: ${String(error.message || error)}`);
+  } finally {
+    setToolsBusy(false);
+  }
+}
+
+async function viewPaperArtifact(paperId) {
+  if (!paperId) {
+    return;
+  }
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.papers.get",
+      paperId
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Failed to load paper artifact.");
+    }
+    const paper = result.paper && typeof result.paper === "object" ? result.paper : {};
+    const latestDigest =
+      paper.latest_digest && typeof paper.latest_digest === "object"
+        ? String(paper.latest_digest.text || "").trim()
+        : "";
+    state.paperInspect = {
+      inspect: {
+        title: String(paper.title || ""),
+        authors: Array.isArray(paper.authors) ? paper.authors : [],
+        abstract: String(paper.abstract || ""),
+        url: String(paper.url || paper.local_path || ""),
+        preview_text: latestDigest || String(paper.text_preview || "")
+      },
+      cached_paper: {
+        paper_id: String(paper.paper_id || ""),
+        title: String(paper.title || "")
+      },
+      paper
+    };
+    renderPaperDetail(paper);
+    updatePapersStatus(`Loaded paper artifact ${paperId}.`);
+  } catch (error) {
+    updatePapersStatus(`Paper error: ${String(error.message || error)}`);
   }
 }
 
@@ -1526,13 +3178,13 @@ async function maybeAllowBlockedHostAndRetry(result, pendingNode = null) {
   }
 
   const accepted = await requestActionConfirm({
-    title: "Page Host Blocked",
-    text: `${host} is blocked by your page policy. Add it to the allowlist and retry?`,
+    title: "Page Host Not Allowlisted",
+    text: `${host} is not in your allowlist. Add it and retry?`,
     confirmLabel: "Allow + Retry"
   });
 
   if (!accepted) {
-    const text = `Blocked by page policy: ${host}. Request canceled.`;
+    const text = `Not allowlisted by page policy: ${host}. Request canceled.`;
     if (pendingNode) {
       updateMessage(pendingNode, "assistant", text);
     } else {

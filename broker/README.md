@@ -57,6 +57,12 @@ Optional environment variables:
 - `BROKER_MLX_DEFAULT_SEED` (optional)
 - `BROKER_MLX_DEFAULT_ENABLE_THINKING` (default `false`)
 - `BROKER_MLX_DEFAULT_SYSTEM_PROMPT` (optional)
+- `BROKER_PAPER_WORKER_PYTHON` (default `python3`)
+- `BROKER_PAPER_WORKER_PATH` (default `broker/paper_worker.py`)
+- `BROKER_PAPER_JOB_TIMEOUT_SEC` (default `180`)
+- `BROKER_EXPERIMENT_WORKER_PYTHON` (default `python3`)
+- `BROKER_EXPERIMENT_WORKER_PATH` (default `broker/experiment_worker.py`)
+- `BROKER_EXPERIMENT_JOB_TIMEOUT_SEC` (default `900`)
 
 ## `/health`
 
@@ -410,6 +416,87 @@ Response shape:
   "is_error": false
 }
 ```
+
+## Paper analysis API
+
+Paper analysis is broker-managed and worker-executed. The broker stores normalized paper artifacts under `broker/.data/papers/`.
+
+- `POST /papers/inspect`
+- `POST /papers/jobs`
+- `GET /papers/jobs/<job_id>`
+- `GET /papers`
+- `GET /papers/<paper_id>`
+- `GET /papers/<paper_id>/sections/<section_id>`
+
+`POST /papers/inspect` accepts one of:
+
+```json
+{
+  "url": "https://arxiv.org/abs/...",
+  "pdf_path": "/path/to/paper.pdf",
+  "html_path": "/path/to/paper.html",
+  "text_path": "/path/to/paper.txt"
+}
+```
+
+`POST /papers/jobs` accepts the same source inputs plus:
+
+```json
+{
+  "analysis_mode": "extract | digest",
+  "backend": "mlx | llama"
+}
+```
+
+Notes:
+
+- `inspect` is synchronous and intended for metadata/abstract lookup.
+- `jobs` are asynchronous and persist extraction + optional digest artifacts.
+- HTML extraction now focuses on `<body>` content, preserves heading-bearing `<header>` blocks, and merges short preambles into the first strong heading when that removes redundant top-level `Document` sections.
+- PDF extraction failures return structured worker errors. If no extractor is installed the broker reports `pdf_extractor_unavailable` with suggested fixes; if installed extractors fail it reports `pdf_extract_failed`.
+- Full paper text is stored broker-side; models should consume targeted sections or digest output rather than the entire artifact by default.
+
+## Experiment API
+
+MLX experiments are broker-managed async jobs backed by a separate experiment worker.
+
+- `POST /experiments/jobs`
+- `GET /experiments/jobs/<job_id>`
+- `GET /experiments`
+- `GET /experiments/<experiment_id>`
+- `GET /experiments/<experiment_id>/compare/<other_experiment_id>`
+- `GET /jobs?kind=paper|experiment&status=...`
+- `POST /jobs/<job_id>/cancel`
+
+`POST /experiments/jobs` request shape:
+
+```json
+{
+  "kind": "prompt_eval | adapter_eval",
+  "model_path": "/models/my-mlx-model",
+  "adapter_path": "/path/to/adapter",
+  "prompt_set": [
+    { "id": "prompt_01", "prompt": "Say hello", "reference": "Hello" }
+  ],
+  "generation": {
+    "temperature": 0.2,
+    "top_p": 0.95,
+    "top_k": 50,
+    "max_tokens": 512,
+    "repetition_penalty": 1.0,
+    "seed": null,
+    "enable_thinking": false
+  },
+  "system_prompt": "optional"
+}
+```
+
+Notes:
+
+- Experiment jobs currently target `mlx` only.
+- Batch experiments use a separate worker process so adapter evaluation does not mutate the shared interactive MLX runtime.
+- Experiment comparison now reports latency deltas plus exact-match and contains-reference deltas when reference labels are available.
+- If local MLX startup fails, the job records the worker failure reason in `job.error.message`. On this runtime class of failure, the surfaced message may explicitly identify Metal/device initialization crashes rather than only reporting a closed stdout stream.
 
 ## Extension command relay API
 
