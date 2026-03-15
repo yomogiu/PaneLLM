@@ -270,15 +270,19 @@ class MlxRuntimeManager:
         self._config = config
         self._lock = threading.Lock()
         self._process: subprocess.Popen[str] | None = None
-        self._status = "disabled" if not config.mlx_model_path else "stopped"
+        self._status = "disabled" if not str(config.mlx_url or "").strip() else "ready"
         self._last_error = ""
         self._started_at = ""
         self._restart_success_count = 0
         self._restart_failure_count = 0
         self._telemetry: deque[dict[str, Any]] = deque(maxlen=120)
 
-        self._model_path = str(Path(config.mlx_model_path).expanduser()) if config.mlx_model_path else ""
-        self._worker_path = config.mlx_worker_path.expanduser()
+        self._url = str(config.mlx_url or "").strip()
+        self._model = str(config.mlx_model or "").strip()
+        self._api_key = str(config.mlx_api_key or "").strip()
+
+        self._model_path = ""
+        self._worker_path = Path()
         self._worker_python = str(config.mlx_worker_python or "python3")
 
         self._config_path = config.data_dir / "mlx_config.json"
@@ -286,18 +290,8 @@ class MlxRuntimeManager:
         self._adapters: list[dict[str, Any]] = []
         self._active_adapter_id = ""
 
-        self._generation_config = {
-            "temperature": float(config.mlx_default_temperature),
-            "top_p": float(config.mlx_default_top_p),
-            "top_k": int(config.mlx_default_top_k),
-            "max_tokens": int(config.mlx_default_max_tokens),
-            "repetition_penalty": float(config.mlx_default_repetition_penalty),
-            "seed": config.mlx_default_seed,
-            "enable_thinking": bool(config.mlx_default_enable_thinking),
-        }
-        self._system_prompt = str(config.mlx_default_system_prompt or "").strip()
-        self._load_persisted_config()
-        self._load_adapters()
+        self._generation_config: dict[str, Any] = {}
+        self._system_prompt = ""
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -416,7 +410,7 @@ class MlxRuntimeManager:
         )
 
     def is_available(self) -> bool:
-        return bool(self._model_path)
+        return bool(self._url)
 
     def _active_adapter_locked(self) -> dict[str, Any] | None:
         if not self._active_adapter_id:
@@ -454,32 +448,32 @@ class MlxRuntimeManager:
                 )
 
     def _status_payload_locked(self) -> dict[str, Any]:
-        process = self._process
-        running = bool(process and process.poll() is None)
-        if self._status == "running" and not running:
-            self._status = "failed"
-            if not self._last_error:
-                self._last_error = "MLX worker exited unexpectedly."
-        active_adapter = self._active_adapter_locked()
+        health = _lb().mlx_backend_health(self._config)
         latency_points = [int(item.get("latency_ms", 0)) for item in list(self._telemetry)[-30:]]
         tps_points = [float(item.get("tokens_per_sec", 0.0)) for item in list(self._telemetry)[-30:]]
         return {
-            "available": self.is_available(),
-            "status": self._status,
-            "model_path": self._model_path,
-            "worker_path": str(self._worker_path),
-            "worker_pid": process.pid if running else None,
-            "started_at": self._started_at,
-            "last_error": self._last_error,
-            "generation_config": dict(self._generation_config),
-            "system_prompt": self._system_prompt,
-            "active_adapter": active_adapter,
-            "contract": self._contract_locked(),
+            "available": bool(health.get("available")),
+            "status": str(health.get("status") or "disabled"),
+            "url": str(health.get("url") or ""),
+            "model": str(health.get("model") or ""),
+            "configured_model": str(health.get("configured_model") or ""),
+            "advertised_models": list(health.get("advertised_models") or []),
+            "model_source": str(health.get("model_source") or ""),
+            "last_error": str(health.get("last_error") or ""),
+            "capabilities": dict(health.get("capabilities") or {}),
+            "model_path": str(health.get("url") or ""),
+            "worker_path": "",
+            "worker_pid": None,
+            "started_at": "",
+            "generation_config": {},
+            "system_prompt": "",
+            "active_adapter": None,
+            "contract": {},
             "metrics": {
                 "latency_ms": latency_points,
                 "tokens_per_sec": tps_points,
-                "restart_success_count": self._restart_success_count,
-                "restart_failure_count": self._restart_failure_count,
+                "restart_success_count": 0,
+                "restart_failure_count": 0,
             },
         }
 
@@ -489,16 +483,7 @@ class MlxRuntimeManager:
 
     def models_payload(self) -> dict[str, Any]:
         with self._lock:
-            llama = _lb().llama_backend_health(self._config)
-            return {
-                "backends": [
-                    {"id": "codex", "label": "Codex", "available": _lb().codex_backend_mode() != "disabled"},
-                    {"id": "llama", "label": "llama.cpp", "available": bool(llama["available"])},
-                    {"id": "mlx", "label": "MLX Local", "available": self.is_available()},
-                ],
-                "llama": llama,
-                "mlx": self._status_payload_locked(),
-            }
+            return _lb().build_models_payload(mlx_payload=self._status_payload_locked())
 
     def _set_status_locked(self, status: str, error: str = "") -> None:
         self._status = status
@@ -920,39 +905,12 @@ class MlxRuntimeManager:
     ) -> str:
         if cancel_check and cancel_check():
             raise _lb().RouteRequestCancelledError("Request cancelled by user.")
-        with self._lock:
-            if self._status != "running" or not self._process or self._process.poll() is not None:
-                raise RuntimeError("MLX session is not running. Start MLX from the Models tab.")
-            contract = self._contract_locked()
-            worker_messages = self._messages_with_system_prompt_locked(messages)
-            data = self._rpc_locked(
-                "generate",
-                {
-                    "schema_version": contract["schema_version"],
-                    "contract": contract,
-                    "messages": worker_messages,
-                    "params": self._generation_config,
-                },
-                timeout_sec=float(self._config.mlx_generation_timeout_sec),
-            )
-            self._assert_worker_contract_locked(data.get("contract"))
-            text = str(data.get("text", "")).strip()
-            token_count = int(data.get("token_count", 0) or 0)
-            latency_ms = int(data.get("latency_ms", 0) or 0)
-            tokens_per_sec = 0.0
-            if latency_ms > 0 and token_count > 0:
-                tokens_per_sec = token_count / (latency_ms / 1000.0)
-            self._telemetry.append(
-                {
-                    "created_at": now_iso(),
-                    "latency_ms": latency_ms,
-                    "token_count": token_count,
-                    "tokens_per_sec": tokens_per_sec,
-                }
-            )
-        if cancel_check and cancel_check():
-            raise _lb().RouteRequestCancelledError("Request cancelled by user.")
-        return text
+        answer_text, _reasoning_text = _lb().call_local_backend(
+            messages,
+            backend="mlx",
+            cancel_check=cancel_check,
+        )
+        return answer_text
 
     def generate_stream(
         self,
@@ -963,72 +921,24 @@ class MlxRuntimeManager:
     ) -> str:
         if cancel_check and cancel_check():
             raise _lb().RouteRequestCancelledError("Request cancelled by user.")
-        with self._lock:
-            if self._status != "running" or not self._process or self._process.poll() is not None:
-                raise RuntimeError("MLX session is not running. Start MLX from the Models tab.")
-            contract = self._contract_locked()
-            worker_messages = self._messages_with_system_prompt_locked(messages)
-            process = self._process
-            request_id = f"mlx_{uuid.uuid4().hex[:12]}"
-            request_payload = {
-                "request_id": request_id,
-                "op": "generate_stream",
-                "schema_version": contract["schema_version"],
-                "contract": contract,
-                "messages": worker_messages,
-                "params": self._generation_config,
-            }
-            process.stdin.write(json.dumps(request_payload, ensure_ascii=True) + "\n")
-            process.stdin.flush()
+        accumulated_text = ""
 
-            accumulated_text = ""
+        def _on_state_delta(visible: str, _reasoning: str) -> None:
+            nonlocal accumulated_text
+            if cancel_check and cancel_check():
+                raise _lb().RouteRequestCancelledError("Request cancelled by user.")
+            delta = visible[len(accumulated_text) :] if visible.startswith(accumulated_text) else visible
+            accumulated_text = visible
+            if delta and on_text_delta:
+                on_text_delta(delta, visible)
 
-            def _on_stream_event(event: dict[str, Any]) -> None:
-                nonlocal accumulated_text
-                if cancel_check and cancel_check():
-                    raise _lb().RouteRequestCancelledError("Request cancelled by user.")
-                if str(event.get("event", "")).strip().lower() != "delta":
-                    return
-                data = event.get("data") if isinstance(event.get("data"), dict) else {}
-                delta = str(data.get("delta", "") or "")
-                text = str(data.get("text", "") or "")
-                if text:
-                    accumulated_text = text
-                elif delta:
-                    accumulated_text += delta
-                if delta and on_text_delta:
-                    on_text_delta(delta, accumulated_text)
-
-            data = self._read_stream_response_locked(
-                process,
-                request_id,
-                timeout_sec=float(self._config.mlx_generation_timeout_sec),
-                on_event=_on_stream_event,
-                cancel_check=cancel_check,
-            )
-            if not bool(data.get("ok")):
-                error = data.get("error") if isinstance(data.get("error"), dict) else {}
-                message = str(error.get("message", "")).strip() or "Unknown MLX worker error."
-                raise RuntimeError(message)
-            payload = data.get("data") if isinstance(data.get("data"), dict) else {}
-            self._assert_worker_contract_locked(payload.get("contract"))
-            text = str(payload.get("text", "")).strip() or accumulated_text.strip()
-            token_count = int(payload.get("token_count", 0) or 0)
-            latency_ms = int(payload.get("latency_ms", 0) or 0)
-            tokens_per_sec = 0.0
-            if latency_ms > 0 and token_count > 0:
-                tokens_per_sec = token_count / (latency_ms / 1000.0)
-            self._telemetry.append(
-                {
-                    "created_at": now_iso(),
-                    "latency_ms": latency_ms,
-                    "token_count": token_count,
-                    "tokens_per_sec": tokens_per_sec,
-                }
-            )
-        if cancel_check and cancel_check():
-            raise _lb().RouteRequestCancelledError("Request cancelled by user.")
-        return text
+        answer_text, _reasoning_text = _lb().call_local_backend_stream(
+            messages,
+            backend="mlx",
+            cancel_check=cancel_check,
+            on_state_delta=_on_state_delta,
+        )
+        return answer_text
 
     def health(self) -> dict[str, Any]:
         with self._lock:
@@ -1036,8 +946,9 @@ class MlxRuntimeManager:
             return {
                 "available": status["available"],
                 "status": status["status"],
-                "worker_pid": status["worker_pid"],
                 "last_error": status["last_error"],
+                "url": status.get("url", ""),
+                "model": status.get("model", ""),
             }
 
 def _run_experiment_job(

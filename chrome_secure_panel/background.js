@@ -390,149 +390,74 @@ async function getModels() {
   return await brokerRequest("GET", "/models");
 }
 
+
 async function getMlxStatus() {
-  return await brokerRequest("GET", "/mlx/status");
+  const models = await getModels();
+  return { mlx: models.mlx || {} };
 }
 
-async function updateMlxConfig(message) {
-  const generation = message?.generation && typeof message.generation === "object" ? message.generation : {};
-  const body = { generation };
-  if (Object.prototype.hasOwnProperty.call(message || {}, "systemPrompt")) {
-    body.system_prompt = typeof message.systemPrompt === "string" ? message.systemPrompt : "";
-  } else if (Object.prototype.hasOwnProperty.call(message || {}, "system_prompt")) {
-    body.system_prompt = typeof message.system_prompt === "string" ? message.system_prompt : "";
-  }
-  return await brokerRequest("POST", "/mlx/config", body);
+async function updateMlxConfig(_message) {
+  throw new Error("The Models tab has been deprecated.");
 }
 
 async function startMlxSession() {
-  return await brokerRequest("POST", "/mlx/session/start", {});
+  throw new Error("The Models tab has been deprecated.");
 }
 
 async function stopMlxSession() {
-  return await brokerRequest("POST", "/mlx/session/stop", {});
+  throw new Error("The Models tab has been deprecated.");
 }
 
 async function restartMlxSession() {
-  return await brokerRequest("POST", "/mlx/session/restart", {});
+  throw new Error("The Models tab has been deprecated.");
 }
 
 async function listMlxAdapters() {
-  return await brokerRequest("GET", "/mlx/adapters");
+  return { adapters: [], active_adapter: null };
 }
 
-async function loadMlxAdapter(message) {
-  const body = {};
-  if (typeof message?.adapterId === "string" && message.adapterId.trim()) {
-    body.adapter_id = message.adapterId.trim();
-  }
-  if (typeof message?.path === "string" && message.path.trim()) {
-    body.path = message.path.trim();
-  }
-  if (typeof message?.name === "string" && message.name.trim()) {
-    body.name = message.name.trim();
-  }
-  return await brokerRequest("POST", "/mlx/adapters/load", body);
+async function loadMlxAdapter(_message) {
+  throw new Error("The Models tab has been deprecated.");
 }
 
 async function unloadMlxAdapter() {
-  return await brokerRequest("POST", "/mlx/adapters/unload", {});
+  throw new Error("The Models tab has been deprecated.");
 }
 
-async function importTrainingDataset(message) {
-  const body = {};
-  if (typeof message?.path === "string" && message.path.trim()) {
-    body.path = message.path.trim();
-  }
-  if (typeof message?.name === "string" && message.name.trim()) {
-    body.name = message.name.trim();
-  }
-  return await brokerRequest("POST", "/mlx/training/datasets/import", body);
+async function importTrainingDataset(_message) {
+  throw new Error("The Models tab has been deprecated.");
 }
 
 async function listTrainingDatasets() {
-  return await brokerRequest("GET", "/mlx/training/datasets");
+  return { datasets: [] };
 }
 
-async function getTrainingDataset(message) {
-  if (!message?.datasetId || typeof message.datasetId !== "string") {
-    throw new Error("datasetId is required.");
-  }
-  return await brokerRequest("GET", `/mlx/training/datasets/${encodeURIComponent(message.datasetId)}`);
+async function getTrainingDataset(_message) {
+  throw new Error("The Models tab has been deprecated.");
 }
 
-async function deleteTrainingDataset(message) {
-  if (!message?.datasetId || typeof message.datasetId !== "string") {
-    throw new Error("datasetId is required.");
-  }
-  return await brokerRequest("DELETE", `/mlx/training/datasets/${encodeURIComponent(message.datasetId)}`);
+async function deleteTrainingDataset(_message) {
+  throw new Error("The Models tab has been deprecated.");
 }
 
-async function startTrainingJob(message) {
-  const body = {};
-  if (typeof message?.datasetId === "string" && message.datasetId.trim()) {
-    body.dataset_id = message.datasetId.trim();
-  }
-  if (typeof message?.name === "string" && message.name.trim()) {
-    body.name = message.name.trim();
-  }
-  if (typeof message?.modelPath === "string" && message.modelPath.trim()) {
-    body.model_path = message.modelPath.trim();
-  }
-  if (message?.trainingConfig && typeof message.trainingConfig === "object") {
-    body.training_config = message.trainingConfig;
-  }
-  if (typeof message?.resumeRunId === "string" && message.resumeRunId.trim()) {
-    body.resume_run_id = message.resumeRunId.trim();
-  }
-  if (typeof message?.resumeCheckpointKind === "string" && message.resumeCheckpointKind.trim()) {
-    body.resume_checkpoint_kind = message.resumeCheckpointKind.trim();
-  }
-  if (typeof message?.resumeCheckpointPath === "string" && message.resumeCheckpointPath.trim()) {
-    body.resume_checkpoint_path = message.resumeCheckpointPath.trim();
-  }
-  if (Number.isInteger(Number(message?.additionalIters))) {
-    body.additional_iters = Number(message.additionalIters);
-  }
-  if (typeof message?.stopRuntimeFirst === "boolean") {
-    body.stop_runtime_first = message.stopRuntimeFirst;
-  }
-  return await brokerRequest("POST", "/mlx/training/jobs", body);
+async function startTrainingJob(_message) {
+  throw new Error("The Models tab has been deprecated.");
 }
 
-async function getTrainingJob(message) {
-  if (!message?.jobId || typeof message.jobId !== "string") {
-    throw new Error("jobId is required.");
-  }
-  return await brokerRequest("GET", `/mlx/training/jobs/${encodeURIComponent(message.jobId)}`);
+async function getTrainingJob(_message) {
+  throw new Error("The Models tab has been deprecated.");
 }
 
 async function listTrainingRuns() {
-  return await brokerRequest("GET", "/mlx/training/runs");
+  return { runs: [] };
 }
 
-async function getTrainingRun(message) {
-  if (!message?.runId || typeof message.runId !== "string") {
-    throw new Error("runId is required.");
-  }
-  return await brokerRequest("GET", `/mlx/training/runs/${encodeURIComponent(message.runId)}`);
+async function getTrainingRun(_message) {
+  throw new Error("The Models tab has been deprecated.");
 }
 
-async function promoteTrainingCheckpoint(message) {
-  const body = {};
-  if (typeof message?.runId === "string" && message.runId.trim()) {
-    body.run_id = message.runId.trim();
-  }
-  if (typeof message?.checkpointKind === "string" && message.checkpointKind.trim()) {
-    body.checkpoint_kind = message.checkpointKind.trim();
-  }
-  if (typeof message?.checkpointPath === "string" && message.checkpointPath.trim()) {
-    body.checkpoint_path = message.checkpointPath.trim();
-  }
-  if (typeof message?.name === "string" && message.name.trim()) {
-    body.name = message.name.trim();
-  }
-  return await brokerRequest("POST", "/mlx/training/checkpoints/promote", body);
+async function promoteTrainingCheckpoint(_message) {
+  throw new Error("The Models tab has been deprecated.");
 }
 
 async function listJobs(message) {

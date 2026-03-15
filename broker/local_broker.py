@@ -256,6 +256,9 @@ class BrokerConfig:
     llama_url: str
     llama_model: str
     llama_api_key: str | None
+    mlx_url: str
+    mlx_model: str
+    mlx_api_key: str | None
     openai_api_key: str | None
     openai_base_url: str
     openai_codex_model: str
@@ -311,6 +314,9 @@ def load_config() -> BrokerConfig:
     llama_url = os.environ.get("LLAMA_URL", "http://127.0.0.1:18000/v1/chat/completions")
     llama_model = os.environ.get("LLAMA_MODEL", DEFAULT_LLAMA_MODEL)
     llama_api_key = os.environ.get("LLAMA_API_KEY")
+    mlx_url = os.environ.get("MLX_URL", "").strip()
+    mlx_model = os.environ.get("MLX_MODEL", "").strip()
+    mlx_api_key = os.environ.get("MLX_API_KEY")
     openai_api_key = os.environ.get("OPENAI_API_KEY")
     openai_base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     openai_codex_model = os.environ.get("OPENAI_CODEX_MODEL", "gpt-5.3-codex")
@@ -439,6 +445,9 @@ def load_config() -> BrokerConfig:
         llama_url=llama_url,
         llama_model=llama_model,
         llama_api_key=llama_api_key,
+        mlx_url=mlx_url,
+        mlx_model=mlx_model,
+        mlx_api_key=mlx_api_key,
         openai_api_key=openai_api_key,
         openai_base_url=openai_base_url,
         openai_codex_model=openai_codex_model,
@@ -555,38 +564,94 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def llama_backend_health(
+
+DEFAULT_MLX_MODEL = "model"
+LOCAL_BACKEND_LABELS = {
+    "llama": "llama.cpp",
+    "mlx": "MLX Local",
+}
+LOCAL_BACKEND_URL_ENVS = {
+    "llama": "LLAMA_URL",
+    "mlx": "MLX_URL",
+}
+
+
+def local_backend_capabilities(backend: str) -> dict[str, Any]:
+    normalized = str(backend or "").strip().lower()
+    supports_reasoning_controls = normalized == "llama"
+    return {
+        "supports_browser_tools": True,
+        "supports_tools": True,
+        "supports_reasoning_controls": supports_reasoning_controls,
+        "supports_chat_template_kwargs": supports_reasoning_controls,
+        "supports_reasoning_budget": supports_reasoning_controls,
+    }
+
+
+def local_backend_settings(config: BrokerConfig, backend: str) -> dict[str, Any]:
+    normalized = str(backend or "").strip().lower()
+    if normalized == "llama":
+        configured_model = str(config.llama_model or "").strip()
+        return {
+            "id": "llama",
+            "label": LOCAL_BACKEND_LABELS["llama"],
+            "url": str(config.llama_url or "").strip(),
+            "configured_model": configured_model,
+            "default_model": DEFAULT_LLAMA_MODEL,
+            "api_key": str(config.llama_api_key or "").strip(),
+            "url_env": LOCAL_BACKEND_URL_ENVS["llama"],
+            "capabilities": local_backend_capabilities("llama"),
+        }
+    if normalized == "mlx":
+        configured_model = str(config.mlx_model or "").strip()
+        return {
+            "id": "mlx",
+            "label": LOCAL_BACKEND_LABELS["mlx"],
+            "url": str(config.mlx_url or "").strip(),
+            "configured_model": configured_model,
+            "default_model": configured_model or DEFAULT_MLX_MODEL,
+            "api_key": str(config.mlx_api_key or "").strip(),
+            "url_env": LOCAL_BACKEND_URL_ENVS["mlx"],
+            "capabilities": local_backend_capabilities("mlx"),
+        }
+    raise ValueError(f"Unsupported local backend: {backend}")
+
+
+def local_backend_health(
     config: BrokerConfig,
+    backend: str,
     *,
     timeout_sec: float = LLAMA_HEALTHCHECK_TIMEOUT_SEC,
 ) -> dict[str, Any]:
-    configured_model = str(config.llama_model or "").strip()
-    llama_url = str(config.llama_url or "").strip()
-    models_url = derive_llama_models_url(llama_url)
+    settings = local_backend_settings(config, backend)
+    configured_model = settings["configured_model"]
+    target_url = settings["url"]
+    models_url = derive_openai_models_url(target_url)
     payload: dict[str, Any] = {
-        "configured": bool(llama_url),
+        "configured": bool(target_url),
         "available": False,
         "status": "disabled",
-        "url": llama_url,
+        "url": target_url,
         "host": "",
         "port": None,
-        "model": configured_model or DEFAULT_LLAMA_MODEL,
+        "model": configured_model or settings["default_model"],
         "configured_model": configured_model,
         "advertised_models": [],
         "model_source": "configured" if configured_model else "fallback_default",
         "models_url": models_url,
         "last_error": "",
+        "capabilities": dict(settings["capabilities"]),
     }
-    if not llama_url:
-        payload["last_error"] = "LLAMA_URL is not set."
+    if not target_url:
+        payload["last_error"] = f'{settings["url_env"]} is not set.'
         return payload
     try:
-        parsed = urlparse(llama_url)
+        parsed = urlparse(target_url)
     except Exception:
         parsed = None
     if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.hostname:
         payload["status"] = "invalid_url"
-        payload["last_error"] = f"LLAMA_URL is invalid: {llama_url}"
+        payload["last_error"] = f'{settings["url_env"]} is invalid: {target_url}'
         return payload
     host = str(parsed.hostname or "").strip()
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -597,10 +662,11 @@ def llama_backend_health(
             pass
     except OSError as error:
         payload["status"] = "unreachable"
-        payload["last_error"] = f"Cannot connect to llama.cpp at {llama_url} ({error})."
+        payload["last_error"] = f'Cannot connect to {settings["label"]} at {target_url} ({error}).'
         return payload
-    resolved_model, advertised_models, model_source = resolve_llama_model(
+    resolved_model, advertised_models, model_source = resolve_local_backend_model(
         config,
+        backend,
         timeout_sec=max(0.05, float(timeout_sec)),
     )
     payload["available"] = True
@@ -611,8 +677,24 @@ def llama_backend_health(
     return payload
 
 
-def derive_llama_models_url(llama_url: str) -> str:
-    raw_url = str(llama_url or "").strip()
+def llama_backend_health(
+    config: BrokerConfig,
+    *,
+    timeout_sec: float = LLAMA_HEALTHCHECK_TIMEOUT_SEC,
+) -> dict[str, Any]:
+    return local_backend_health(config, "llama", timeout_sec=timeout_sec)
+
+
+def mlx_backend_health(
+    config: BrokerConfig,
+    *,
+    timeout_sec: float = LLAMA_HEALTHCHECK_TIMEOUT_SEC,
+) -> dict[str, Any]:
+    return local_backend_health(config, "mlx", timeout_sec=timeout_sec)
+
+
+def derive_openai_models_url(target_url: str) -> str:
+    raw_url = str(target_url or "").strip()
     if not raw_url:
         return ""
     try:
@@ -632,17 +714,23 @@ def derive_llama_models_url(llama_url: str) -> str:
     return parsed._replace(path=models_path, query="", fragment="").geturl()
 
 
-def fetch_llama_advertised_models(
+def derive_llama_models_url(llama_url: str) -> str:
+    return derive_openai_models_url(llama_url)
+
+
+def fetch_local_backend_advertised_models(
     config: BrokerConfig,
+    backend: str,
     *,
     timeout_sec: float = 1.0,
 ) -> tuple[list[str], str]:
-    models_url = derive_llama_models_url(config.llama_url)
+    settings = local_backend_settings(config, backend)
+    models_url = derive_openai_models_url(settings["url"])
     if not models_url:
         return [], ""
     headers = {"Accept": "application/json"}
-    if config.llama_api_key:
-        headers["Authorization"] = f"Bearer {config.llama_api_key}"
+    if settings["api_key"]:
+        headers["Authorization"] = f'Bearer {settings["api_key"]}'
     request = Request(models_url, method="GET", headers=headers)
     try:
         with urlopen(request, timeout=max(0.05, float(timeout_sec))) as response:
@@ -662,36 +750,123 @@ def fetch_llama_advertised_models(
     return model_ids, models_url
 
 
-def resolve_llama_model(
+def fetch_llama_advertised_models(
     config: BrokerConfig,
     *,
     timeout_sec: float = 1.0,
+) -> tuple[list[str], str]:
+    return fetch_local_backend_advertised_models(config, "llama", timeout_sec=timeout_sec)
+
+
+def resolve_local_backend_model(
+    config: BrokerConfig,
+    backend: str,
+    *,
+    timeout_sec: float = 1.0,
 ) -> tuple[str, list[str], str]:
-    configured_model = str(config.llama_model or "").strip()
-    advertised_models, _models_url = fetch_llama_advertised_models(
+    settings = local_backend_settings(config, backend)
+    configured_model = settings["configured_model"]
+    advertised_models, _models_url = fetch_local_backend_advertised_models(
         config,
+        backend,
         timeout_sec=timeout_sec,
     )
     if configured_model and configured_model in advertised_models:
         return configured_model, advertised_models, "configured"
     if len(advertised_models) == 1:
         return advertised_models[0], advertised_models, "auto_detected"
-    if advertised_models and configured_model in {"", DEFAULT_LLAMA_MODEL}:
+    if advertised_models and configured_model in {"", settings["default_model"]}:
         return advertised_models[0], advertised_models, "auto_detected"
     if configured_model:
         return configured_model, advertised_models, "configured"
     if advertised_models:
         return advertised_models[0], advertised_models, "auto_detected"
-    return DEFAULT_LLAMA_MODEL, advertised_models, "fallback_default"
+    return settings["default_model"], advertised_models, "fallback_default"
+
+
+def resolve_llama_model(
+    config: BrokerConfig,
+    *,
+    timeout_sec: float = 1.0,
+) -> tuple[str, list[str], str]:
+    return resolve_local_backend_model(config, "llama", timeout_sec=timeout_sec)
+
+
+def ensure_local_backend_available(config: BrokerConfig, backend: str) -> dict[str, Any]:
+    health = local_backend_health(config, backend)
+    if bool(health.get("available")):
+        return health
+    settings = local_backend_settings(config, backend)
+    raise RuntimeError(
+        str(health.get("last_error") or f'Cannot connect to {settings["label"]} at {settings["url"]}.')
+    )
 
 
 def ensure_llama_backend_available(config: BrokerConfig) -> dict[str, Any]:
-    health = llama_backend_health(config)
-    if bool(health.get("available")):
-        return health
-    raise RuntimeError(
-        str(health.get("last_error") or f"Cannot connect to llama.cpp at {config.llama_url}.")
-    )
+    return ensure_local_backend_available(config, "llama")
+
+
+def ensure_mlx_backend_available(config: BrokerConfig) -> dict[str, Any]:
+    return ensure_local_backend_available(config, "mlx")
+
+
+def build_models_payload(*, mlx_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    codex_status = codex_backend_mode()
+    llama = llama_backend_health(CONFIG)
+    mlx_health = mlx_backend_health(CONFIG)
+    mlx = dict(mlx_payload or {})
+    if not mlx:
+        mlx = dict(mlx_health)
+    else:
+        for key in (
+            "available",
+            "status",
+            "url",
+            "host",
+            "port",
+            "model",
+            "configured_model",
+            "advertised_models",
+            "model_source",
+            "models_url",
+            "last_error",
+            "capabilities",
+        ):
+            mlx[key] = mlx_health.get(key)
+    codex_capabilities = {
+        "supports_browser_tools": True,
+        "supports_tools": True,
+        "supports_reasoning_controls": False,
+        "supports_chat_template_kwargs": False,
+        "supports_reasoning_budget": False,
+    }
+    return {
+        "backends": [
+            {
+                "id": "codex",
+                "label": "Codex",
+                "available": codex_status != "disabled",
+                "status": codex_status,
+                "capabilities": codex_capabilities,
+            },
+            {
+                "id": "llama",
+                "label": LOCAL_BACKEND_LABELS["llama"],
+                "available": bool(llama.get("available")),
+                "status": str(llama.get("status") or "disabled"),
+                "capabilities": dict(llama.get("capabilities") or {}),
+            },
+            {
+                "id": "mlx",
+                "label": LOCAL_BACKEND_LABELS["mlx"],
+                "available": bool(mlx.get("available")),
+                "status": str(mlx.get("status") or "disabled"),
+                "capabilities": dict(mlx.get("capabilities") or {}),
+            },
+        ],
+        "llama": llama,
+        "mlx": mlx,
+    }
 
 
 def read_codex_session_index(limit: int = 200) -> list[dict[str, Any]]:
@@ -2932,9 +3107,6 @@ def build_health_payload() -> dict[str, Any]:
         "browser_automation": BROWSER_AUTOMATION.health(),
         "codex_runs": CODEX_RUNS.health(),
         "llama": llama_backend_health(CONFIG),
-        "mlx": MLX_RUNTIME.health(),
-        "experiments": EXPERIMENTS.health(),
-        "training": TRAININGS.health(),
     }
 
 
@@ -3306,6 +3478,10 @@ class CodexRunManager:
             raise RuntimeError("Browser action mode requires a connected extension relay client.")
         if force_browser_action and not allowed_hosts:
             raise RuntimeError("Browser action mode requires at least one allowlisted host.")
+        if backend == "llama":
+            ensure_llama_backend_available(CONFIG)
+        elif backend == "mlx":
+            ensure_mlx_backend_available(CONFIG)
         if rewrite_message_index is None:
             conversation = CONVERSATIONS.append_message(session_id, "user", prompt)
         else:
@@ -4336,7 +4512,10 @@ def extract_llama_delta_parts(choice: Any) -> tuple[str, str]:
     return content_delta, reasoning_delta
 
 
-def call_llama_completion(
+
+
+def call_local_backend_completion(
+    backend: str,
     messages: list[dict[str, Any]],
     *,
     tools: list[dict[str, Any]] | None = None,
@@ -4348,8 +4527,12 @@ def call_llama_completion(
     temperature: float = 0.1,
     max_tokens: int | None = None,
 ) -> dict[str, Any]:
-    target_url = str(CONFIG.llama_url or "").strip() or "(unset LLAMA_URL)"
-    target_model = str(resolved_model or "").strip() or resolve_llama_model(CONFIG, timeout_sec=1.0)[0]
+    settings = local_backend_settings(CONFIG, backend)
+    target_url = settings["url"] or f'(unset {settings["url_env"]})'
+    target_model = (
+        str(resolved_model or "").strip()
+        or resolve_local_backend_model(CONFIG, backend, timeout_sec=1.0)[0]
+    )
     payload = {
         "model": target_model,
         "messages": messages,
@@ -4360,17 +4543,18 @@ def call_llama_completion(
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice or "auto"
-    if chat_template_kwargs:
+    capabilities = local_backend_capabilities(backend)
+    if chat_template_kwargs and capabilities.get("supports_chat_template_kwargs"):
         payload["chat_template_kwargs"] = chat_template_kwargs
-    if reasoning_budget is not None:
+    if reasoning_budget is not None and capabilities.get("supports_reasoning_budget"):
         payload["reasoning_budget"] = reasoning_budget
     if stop:
         payload["stop"] = stop
     headers = {"Content-Type": "application/json"}
-    if CONFIG.llama_api_key:
-        headers["Authorization"] = f"Bearer {CONFIG.llama_api_key}"
+    if settings["api_key"]:
+        headers["Authorization"] = f'Bearer {settings["api_key"]}'
     request = Request(
-        CONFIG.llama_url,
+        settings["url"],
         method="POST",
         headers=headers,
         data=json.dumps(payload).encode("utf-8"),
@@ -4387,16 +4571,18 @@ def call_llama_completion(
         message = str(
             ((parsed.get("error") or {}).get("message"))
             or body
-            or f"llama request failed with status {error.code}."
+            or f'{settings["label"]} request failed with status {error.code}.'
         )
-        raise RuntimeError(f"llama request to {target_url} failed: {message}") from error
+        raise RuntimeError(f'{settings["label"]} request to {target_url} failed: {message}') from error
     except URLError as error:
-        raise RuntimeError(f"llama request to {target_url} failed: {error.reason}") from error
+        raise RuntimeError(f'{settings["label"]} request to {target_url} failed: {error.reason}') from error
     except socket.timeout as error:
-        raise RuntimeError(f"llama request to {target_url} timed out.") from error
+        raise RuntimeError(f'{settings["label"]} request to {target_url} timed out.') from error
 
 
-def call_llama_completion_stream(
+
+def call_local_backend_completion_stream(
+    backend: str,
     messages: list[dict[str, Any]],
     *,
     tools: list[dict[str, Any]] | None = None,
@@ -4410,8 +4596,12 @@ def call_llama_completion_stream(
     on_state_delta: Any = None,
     cancel_check: Any = None,
 ) -> tuple[str, str]:
-    target_url = str(CONFIG.llama_url or "").strip() or "(unset LLAMA_URL)"
-    target_model = str(resolved_model or "").strip() or resolve_llama_model(CONFIG, timeout_sec=1.0)[0]
+    settings = local_backend_settings(CONFIG, backend)
+    target_url = settings["url"] or f'(unset {settings["url_env"]})'
+    target_model = (
+        str(resolved_model or "").strip()
+        or resolve_local_backend_model(CONFIG, backend, timeout_sec=1.0)[0]
+    )
     payload = {
         "model": target_model,
         "messages": messages,
@@ -4423,17 +4613,18 @@ def call_llama_completion_stream(
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice or "auto"
-    if chat_template_kwargs:
+    capabilities = local_backend_capabilities(backend)
+    if chat_template_kwargs and capabilities.get("supports_chat_template_kwargs"):
         payload["chat_template_kwargs"] = chat_template_kwargs
-    if reasoning_budget is not None:
+    if reasoning_budget is not None and capabilities.get("supports_reasoning_budget"):
         payload["reasoning_budget"] = reasoning_budget
     if stop:
         payload["stop"] = stop
     headers = {"Content-Type": "application/json"}
-    if CONFIG.llama_api_key:
-        headers["Authorization"] = f"Bearer {CONFIG.llama_api_key}"
+    if settings["api_key"]:
+        headers["Authorization"] = f'Bearer {settings["api_key"]}'
     request = Request(
-        CONFIG.llama_url,
+        settings["url"],
         method="POST",
         headers=headers,
         data=json.dumps(payload).encode("utf-8"),
@@ -4486,38 +4677,42 @@ def call_llama_completion_stream(
         message = str(
             ((parsed.get("error") or {}).get("message"))
             or body
-            or f"llama request failed with status {error.code}."
+            or f'{settings["label"]} request failed with status {error.code}.'
         )
-        raise RuntimeError(f"llama request to {target_url} failed: {message}") from error
+        raise RuntimeError(f'{settings["label"]} request to {target_url} failed: {message}') from error
     except URLError as error:
-        raise RuntimeError(f"llama request to {target_url} failed: {error.reason}") from error
+        raise RuntimeError(f'{settings["label"]} request to {target_url} failed: {error.reason}') from error
     except socket.timeout as error:
-        raise RuntimeError(f"llama request to {target_url} timed out.") from error
+        raise RuntimeError(f'{settings["label"]} request to {target_url} timed out.') from error
     visible, inline_reasoning = split_stream_text(accumulated_content)
     return visible, accumulated_reasoning or inline_reasoning
 
 
-def call_llama(
+
+def call_local_backend(
     messages: list[dict[str, str]],
     *,
+    backend: str,
     chat_template_kwargs: dict[str, Any] | None = None,
     reasoning_budget: int | None = None,
     cancel_check: Any = None,
 ) -> tuple[str, str]:
     if cancel_check and cancel_check():
         raise RouteRequestCancelledError("Request cancelled by user.")
-    llama_health = ensure_llama_backend_available(CONFIG)
-    resolved_model = str(llama_health.get("model") or "").strip() or DEFAULT_LLAMA_MODEL
-    guarded_messages = [
-        {"role": "system", "content": LLAMA_CHAT_SYSTEM_PROMPT},
-        *messages,
-    ]
-    parsed = call_llama_completion(
+    health = ensure_local_backend_available(CONFIG, backend)
+    resolved_model = str(health.get("model") or "").strip() or resolve_local_backend_model(CONFIG, backend)[0]
+    guarded_messages = list(messages)
+    stop_sequences: list[str] | None = None
+    if backend == "llama":
+        guarded_messages = [{"role": "system", "content": LLAMA_CHAT_SYSTEM_PROMPT}, *guarded_messages]
+        stop_sequences = LLAMA_STOP_SEQUENCES
+    parsed = call_local_backend_completion(
+        backend,
         guarded_messages,
         resolved_model=resolved_model,
         chat_template_kwargs=chat_template_kwargs,
         reasoning_budget=reasoning_budget,
-        stop=LLAMA_STOP_SEQUENCES,
+        stop=stop_sequences,
     )
     if cancel_check and cancel_check():
         raise RouteRequestCancelledError("Request cancelled by user.")
@@ -4528,6 +4723,116 @@ def call_llama(
     return extract_llama_message_parts(message)
 
 
+
+def call_local_backend_stream(
+    messages: list[dict[str, str]],
+    *,
+    backend: str,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    reasoning_budget: int | None = None,
+    cancel_check: Any = None,
+    on_state_delta: Any = None,
+) -> tuple[str, str]:
+    if cancel_check and cancel_check():
+        raise RouteRequestCancelledError("Request cancelled by user.")
+    health = ensure_local_backend_available(CONFIG, backend)
+    resolved_model = str(health.get("model") or "").strip() or resolve_local_backend_model(CONFIG, backend)[0]
+    guarded_messages = list(messages)
+    stop_sequences: list[str] | None = None
+    if backend == "llama":
+        guarded_messages = [{"role": "system", "content": LLAMA_CHAT_SYSTEM_PROMPT}, *guarded_messages]
+        stop_sequences = LLAMA_STOP_SEQUENCES
+    answer_text, reasoning_text = call_local_backend_completion_stream(
+        backend,
+        guarded_messages,
+        resolved_model=resolved_model,
+        chat_template_kwargs=chat_template_kwargs,
+        reasoning_budget=reasoning_budget,
+        stop=stop_sequences,
+        cancel_check=cancel_check,
+        on_state_delta=on_state_delta,
+    )
+    if cancel_check and cancel_check():
+        raise RouteRequestCancelledError("Request cancelled by user.")
+    return answer_text, reasoning_text
+
+
+
+def call_llama_completion(
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    resolved_model: str | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    reasoning_budget: int | None = None,
+    stop: list[str] | None = None,
+    temperature: float = 0.1,
+    max_tokens: int | None = None,
+) -> dict[str, Any]:
+    return call_local_backend_completion(
+        "llama",
+        messages,
+        tools=tools,
+        tool_choice=tool_choice,
+        resolved_model=resolved_model,
+        chat_template_kwargs=chat_template_kwargs,
+        reasoning_budget=reasoning_budget,
+        stop=stop,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+
+
+def call_llama_completion_stream(
+    messages: list[dict[str, Any]],
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+    resolved_model: str | None = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    reasoning_budget: int | None = None,
+    stop: list[str] | None = None,
+    temperature: float = 0.1,
+    max_tokens: int | None = None,
+    on_state_delta: Any = None,
+    cancel_check: Any = None,
+) -> tuple[str, str]:
+    return call_local_backend_completion_stream(
+        "llama",
+        messages,
+        tools=tools,
+        tool_choice=tool_choice,
+        resolved_model=resolved_model,
+        chat_template_kwargs=chat_template_kwargs,
+        reasoning_budget=reasoning_budget,
+        stop=stop,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        on_state_delta=on_state_delta,
+        cancel_check=cancel_check,
+    )
+
+
+
+def call_llama(
+    messages: list[dict[str, str]],
+    *,
+    chat_template_kwargs: dict[str, Any] | None = None,
+    reasoning_budget: int | None = None,
+    cancel_check: Any = None,
+) -> tuple[str, str]:
+    return call_local_backend(
+        messages,
+        backend="llama",
+        chat_template_kwargs=chat_template_kwargs,
+        reasoning_budget=reasoning_budget,
+        cancel_check=cancel_check,
+    )
+
+
+
 def call_llama_stream(
     messages: list[dict[str, str]],
     *,
@@ -4536,26 +4841,14 @@ def call_llama_stream(
     cancel_check: Any = None,
     on_state_delta: Any = None,
 ) -> tuple[str, str]:
-    if cancel_check and cancel_check():
-        raise RouteRequestCancelledError("Request cancelled by user.")
-    llama_health = ensure_llama_backend_available(CONFIG)
-    resolved_model = str(llama_health.get("model") or "").strip() or DEFAULT_LLAMA_MODEL
-    guarded_messages = [
-        {"role": "system", "content": LLAMA_CHAT_SYSTEM_PROMPT},
-        *messages,
-    ]
-    answer_text, reasoning_text = call_llama_completion_stream(
-        guarded_messages,
-        resolved_model=resolved_model,
+    return call_local_backend_stream(
+        messages,
+        backend="llama",
         chat_template_kwargs=chat_template_kwargs,
         reasoning_budget=reasoning_budget,
-        stop=LLAMA_STOP_SEQUENCES,
         cancel_check=cancel_check,
         on_state_delta=on_state_delta,
     )
-    if cancel_check and cancel_check():
-        raise RouteRequestCancelledError("Request cancelled by user.")
-    return answer_text, reasoning_text
 
 
 def run_subprocess_with_cancel(
@@ -5664,7 +5957,7 @@ def handle_experiment_compare(experiment_id: str, other_id: str) -> dict[str, An
 
 
 def handle_models_get() -> dict[str, Any]:
-    return mlx_runtime_service.handle_models_get(MLX_RUNTIME)
+    return build_models_payload(mlx_payload=MLX_RUNTIME.status())
 
 
 def handle_mlx_status_get() -> dict[str, Any]:
@@ -5791,52 +6084,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if path == "/models":
             self._send_json(HTTPStatus.OK, handle_models_get())
             return
-        if path == "/jobs":
-            params = self._query_params()
-            status_filter = str((params.get("status") or [""])[0] or "")
-            kind = str((params.get("kind") or [""])[0] or "")
-            self._send_json(HTTPStatus.OK, handle_jobs_list(status_filter=status_filter, kind=kind))
-            return
-        if path == "/mlx/status":
-            self._send_json(HTTPStatus.OK, handle_mlx_status_get())
-            return
-        if path == "/mlx/adapters":
-            self._send_json(HTTPStatus.OK, handle_mlx_adapters_list())
-            return
-        if path == "/mlx/training/datasets":
-            self._send_json(HTTPStatus.OK, handle_training_datasets_list())
-            return
-        if path == "/mlx/training/runs":
-            self._send_json(HTTPStatus.OK, handle_training_runs_list())
-            return
-        experiment_job_id = self._experiment_job_id_from_path(path)
-        if experiment_job_id:
-            self._send_json(HTTPStatus.OK, handle_experiment_job_get(experiment_job_id))
-            return
-        training_job_id = self._training_job_id_from_path(path)
-        if training_job_id:
-            self._send_json(HTTPStatus.OK, handle_training_job_get(training_job_id))
-            return
-        experiment_compare = self._experiment_compare_ids_from_path(path)
-        if experiment_compare:
-            experiment_id, other_id = experiment_compare
-            self._send_json(HTTPStatus.OK, handle_experiment_compare(experiment_id, other_id))
-            return
-        if path == "/experiments":
-            self._send_json(HTTPStatus.OK, handle_experiments_list())
-            return
-        experiment_id = self._experiment_id_from_path(path)
-        if experiment_id:
-            self._send_json(HTTPStatus.OK, handle_experiment_get(experiment_id))
-            return
-        training_dataset_id = self._training_dataset_id_from_path(path)
-        if training_dataset_id:
-            self._send_json(HTTPStatus.OK, handle_training_dataset_get(training_dataset_id))
-            return
-        training_run_id = self._training_run_id_from_path(path)
-        if training_run_id:
-            self._send_json(HTTPStatus.OK, handle_training_run_get(training_run_id))
-            return
         if path == "/extension/next":
             params = self._query_params()
             client_id = (params.get("client_id") or [""])[0]
@@ -5894,10 +6141,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if not self._ensure_trusted():
             return
         path = self._path_without_query()
-        training_dataset_id = self._training_dataset_id_from_path(path)
-        if training_dataset_id:
-            self._send_json(HTTPStatus.OK, handle_training_dataset_delete(training_dataset_id))
-            return
         if not path.startswith("/conversations/"):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not Found"})
             return
@@ -5914,28 +6157,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
         path = self._path_without_query()
         try:
             data = parse_json_body(self)
-            if path == "/experiments/jobs":
-                result = handle_experiment_job_start(data)
-            elif path == "/mlx/training/datasets/import":
-                result = handle_training_dataset_import(data)
-            elif path == "/mlx/training/jobs":
-                result = handle_training_job_start(data)
-            elif path == "/runs":
+            if path == "/runs":
                 result = handle_run_start(data)
-            elif path == "/mlx/config":
-                result = handle_mlx_config_post(data)
-            elif path == "/mlx/session/start":
-                result = handle_mlx_session_action("start")
-            elif path == "/mlx/session/stop":
-                result = handle_mlx_session_action("stop")
-            elif path == "/mlx/session/restart":
-                result = handle_mlx_session_action("restart")
-            elif path == "/mlx/adapters/load":
-                result = handle_mlx_adapters_load(data)
-            elif path == "/mlx/adapters/unload":
-                result = handle_mlx_adapters_unload(data)
-            elif path == "/mlx/training/checkpoints/promote":
-                result = handle_training_checkpoint_promote(data)
             elif path == "/extension/register":
                 result = EXTENSION_RELAY.register(data.get("client_id"))
             elif path == "/extension/result":
@@ -6071,12 +6294,8 @@ def main() -> int:
     server = ThreadingHTTPServer((CONFIG.host, CONFIG.port), BrokerHandler)
     print(f"local broker listening on http://{CONFIG.host}:{CONFIG.port}")
     print(f"llama endpoint: {CONFIG.llama_url}")
+    print(f"mlx endpoint: {CONFIG.mlx_url or "(unset MLX_URL)"}")
     print(f"codex backend: {codex_backend_mode()}")
-    print(
-        "mlx backend: "
-        + ("configured" if CONFIG.mlx_model_path else "disabled")
-        + (f" ({CONFIG.mlx_model_path})" if CONFIG.mlx_model_path else "")
-    )
     print(f"conversation store: {CONFIG.data_dir / 'conversations'}")
     try:
         server.serve_forever()
