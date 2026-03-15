@@ -62,7 +62,6 @@ const state = {
   activeMlxAdapterPath: "",
   mlxRuntime: null,
   pollTimers: {
-    papers: 0,
     experiments: 0
   }
 };
@@ -178,53 +177,8 @@ const toolsAllowActiveBtn = $("tools-allow-active-btn");
 const toolsAgentMaxStepsEl = $("tools-agent-max-steps");
 const toolsBrowserApplyBtn = $("tools-browser-apply-btn");
 const toolsAllowedListEl = $("tools-allowed-list");
-const papersStatusEl = $("read-assistant-status");
-const paperSourceInputEl = null;
-const paperUseActiveBtn = $("read-context-refresh-btn");
-const paperInspectBtn = $("read-explain-btn");
-const paperAnalyzeBtn = $("read-guide-btn");
-const readShowWhereBtn = $("read-show-btn");
-const paperInspectOutputEl = $("read-assistant-preview");
-const paperJobListEl = null;
-const paperListEl = null;
-
-function renderReadAssistantPreview(context) {
-  if (!paperInspectOutputEl) {
-    return;
-  }
-  if (!context || typeof context !== "object") {
-    paperInspectOutputEl.textContent = "No active page context.";
-    return;
-  }
-  const lines = [];
-  if (context.title) {
-    lines.push(`Title: ${String(context.title)}`);
-  }
-  if (context.url) {
-    lines.push(`URL: ${String(context.url)}`);
-  }
-  if (Array.isArray(context.heading_path) && context.heading_path.length) {
-    lines.push(`Section: ${context.heading_path.join(" > ")}`);
-  }
-  if (context.selection) {
-    lines.push(`Selection:\n${String(context.selection)}`);
-  }
-  const local = context.selection_context && typeof context.selection_context === "object"
-    ? context.selection_context
-    : null;
-  if (local?.focus) {
-    const parts = [local.before, local.focus, local.after].filter(Boolean);
-    lines.push(`Local context:\n${parts.join("\n")}`);
-  } else if (context.text_excerpt) {
-    lines.push(`Page excerpt:\n${truncatePreview(String(context.text_excerpt), 360)}`);
-  }
-  paperInspectOutputEl.textContent = lines.join("\n\n") || "No active page context.";
-}
 
 function setReadAssistantExplainEnabled() {
-  if (paperInspectBtn) {
-    paperInspectBtn.disabled = state.toolsBusy;
-  }
   const composerExplainBtn = $("composer-read-explain-btn");
   if (composerExplainBtn) {
     composerExplainBtn.disabled = state.busy || state.toolsBusy;
@@ -410,7 +364,6 @@ async function captureReadAssistantContext(showErrors = true) {
     if (result.active_tab && typeof result.active_tab === "object") {
       state.toolsActiveTab = result.active_tab;
     }
-    renderReadAssistantPreview(state.readContext);
     setReadAssistantExplainEnabled();
     updateReadAssistantStatus();
     if (!result.ok) {
@@ -423,7 +376,6 @@ async function captureReadAssistantContext(showErrors = true) {
     return state.readContext;
   } catch (error) {
     state.readContext = null;
-    renderReadAssistantPreview(null);
     setReadAssistantExplainEnabled();
     if (showErrors) {
       updatePapersStatus(`Read assistant error: ${String(error.message || error)}`);
@@ -535,14 +487,6 @@ function scheduleAutoRefresh(kind, enabled) {
   }
   state.pollTimers[kind] = window.setTimeout(async () => {
     state.pollTimers[kind] = 0;
-    if (kind === "papers") {
-      if (state.toolsBusy) {
-        scheduleAutoRefresh(kind, true);
-        return;
-      }
-      await refreshToolsState(false);
-      return;
-    }
     if (state.modelsBusy) {
       scheduleAutoRefresh(kind, true);
       return;
@@ -575,65 +519,6 @@ function summarizeSummary(summary, maxItems = 3) {
     .slice(0, maxItems)
     .map(([key, value]) => `${formatMetricLabel(key)}: ${formatMetricValue(value)}`)
     .join(" · ");
-}
-
-function renderPaperDetail(paper) {
-  if (!paperInspectOutputEl) {
-    return;
-  }
-  const artifact = paper && typeof paper === "object" ? paper : {};
-  const lines = [];
-  const title = String(artifact.title || artifact.paper_id || "paper").trim();
-  lines.push(`Paper: ${title}`);
-  if (artifact.paper_id) {
-    lines.push(`Artifact ID: ${String(artifact.paper_id)}`);
-  }
-  const source = String(artifact.url || artifact.local_path || "").trim();
-  if (source) {
-    lines.push(`Source: ${source}`);
-  }
-  const authors = Array.isArray(artifact.authors)
-    ? artifact.authors.map((value) => String(value || "").trim()).filter(Boolean)
-    : [];
-  if (authors.length) {
-    lines.push(`Authors: ${authors.join(", ")}`);
-  }
-  lines.push(
-    `Sections: ${Number(artifact.section_count || (Array.isArray(artifact.sections) ? artifact.sections.length : 0) || 0)}`
-  );
-
-  const latestDigest =
-    artifact.latest_digest && typeof artifact.latest_digest === "object"
-      ? String(artifact.latest_digest.text || "").trim()
-      : "";
-  if (latestDigest) {
-    lines.push("");
-    lines.push("Digest:");
-    lines.push(truncatePreview(latestDigest, 1200));
-  } else if (artifact.abstract) {
-    lines.push("");
-    lines.push("Abstract:");
-    lines.push(truncatePreview(artifact.abstract, 900));
-  }
-
-  const sections = Array.isArray(artifact.sections) ? artifact.sections : [];
-  if (sections.length) {
-    lines.push("");
-    lines.push("Sections:");
-    for (const section of sections.slice(0, 6)) {
-      const heading = String(section?.heading || section?.section_id || "Section").trim();
-      const sectionId = String(section?.section_id || "").trim();
-      const preview = truncatePreview(section?.preview || section?.text || "", 180);
-      lines.push(`${sectionId ? `${sectionId} · ` : ""}${heading}`);
-      if (preview) {
-        lines.push(`  ${preview}`);
-      }
-    }
-    if (sections.length > 6) {
-      lines.push(`+${sections.length - 6} more section(s)`);
-    }
-  }
-  paperInspectOutputEl.textContent = lines.join("\n");
 }
 
 function renderExperimentDetail(experiment) {
@@ -960,33 +845,10 @@ toolsBrowserApplyBtn?.addEventListener("click", async () => {
   await applyBrowserConfigFromInputs();
 });
 
-paperUseActiveBtn?.addEventListener("click", async () => {
-  await useActiveTabForPaperSource();
-});
-
-paperInspectBtn?.addEventListener("click", async () => {
-  await inspectPaperFromInputs();
-});
-
-paperAnalyzeBtn?.addEventListener("click", async () => {
-  await analyzePaperFromInputs();
-});
-
-readShowWhereBtn?.addEventListener("click", async () => {
-  await showReadAssistantTarget();
-});
-
 toolsHostInputEl?.addEventListener("keydown", async (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
     await allowHostFromInput();
-  }
-});
-
-paperSourceInputEl?.addEventListener("keydown", async (event) => {
-  if (event.key === "Enter") {
-    event.preventDefault();
-    await inspectPaperFromInputs();
   }
 });
 
@@ -1972,183 +1834,6 @@ function buildPromptSetFromInputs() {
   }));
 }
 
-function getPaperAnalysisBackend() {
-  const backend = String(modelsBackendEl?.value || backendEl?.value || "llama").trim().toLowerCase();
-  return backend === "mlx" ? "mlx" : "llama";
-}
-
-function summarizePaperInspect(inspect, cachedPaper) {
-  if (!paperInspectOutputEl) {
-    return;
-  }
-  if (!inspect || typeof inspect !== "object") {
-    paperInspectOutputEl.textContent = "No paper inspected yet.";
-    return;
-  }
-  const lines = [];
-  const title = String(inspect.title || "").trim();
-  if (title) {
-    lines.push(`Title: ${title}`);
-  }
-  const authors = Array.isArray(inspect.authors) ? inspect.authors.map((value) => String(value || "").trim()).filter(Boolean) : [];
-  if (authors.length) {
-    lines.push(`Authors: ${authors.join(", ")}`);
-  }
-  const source = String(inspect.url || inspect.local_path || "").trim();
-  if (source) {
-    lines.push(`Source: ${source}`);
-  }
-  if (inspect.abstract) {
-    lines.push("");
-    lines.push(`Abstract:\n${String(inspect.abstract).trim()}`);
-  } else if (inspect.preview_text) {
-    lines.push("");
-    lines.push(`Preview:\n${String(inspect.preview_text).trim()}`);
-  }
-  if (cachedPaper?.paper_id) {
-    lines.push("");
-    lines.push(`Cached artifact: ${cachedPaper.paper_id}`);
-  }
-  paperInspectOutputEl.textContent = lines.join("\n") || "Paper inspect completed.";
-}
-
-function renderPaperJobs(jobs = []) {
-  if (!paperJobListEl) {
-    return;
-  }
-  paperJobListEl.textContent = "";
-  const list = Array.isArray(jobs) ? jobs : [];
-  if (!list.length) {
-    const empty = document.createElement("p");
-    empty.className = "tools-empty";
-    empty.textContent = "No paper jobs yet.";
-    paperJobListEl.appendChild(empty);
-    return;
-  }
-  for (const job of list) {
-    const row = document.createElement("div");
-    row.className = "tools-item";
-    const meta = document.createElement("div");
-    meta.className = "tools-item-meta";
-    const title = document.createElement("p");
-    title.className = "tools-item-host";
-    const inputSummary = job?.input_summary && typeof job.input_summary === "object" ? job.input_summary : {};
-    title.textContent =
-      String(job?.result?.title || inputSummary.url || inputSummary.pdf_path || inputSummary.html_path || inputSummary.text_path || job?.job_type || "paper job");
-    meta.appendChild(title);
-    const detail = document.createElement("p");
-    detail.className = "tools-muted";
-    const errorMessage = truncatePreview(job?.error?.message || "", 180);
-    const latestDigest = truncatePreview(job?.result?.latest_digest_excerpt || "", 180);
-    if (errorMessage) {
-      detail.textContent = errorMessage;
-    } else if (latestDigest) {
-      detail.textContent = latestDigest;
-    } else if (job?.result?.paper_id) {
-      detail.textContent = `${Number(job?.result?.section_count || 0)} sections · ${Number(job?.result?.char_count || 0)} chars`;
-    } else {
-      detail.textContent = `Updated ${formatTime(job?.updated_at)}`;
-    }
-    meta.appendChild(detail);
-    const tags = document.createElement("div");
-    tags.className = "tools-item-tags";
-    for (const tagText of [String(job?.status || "unknown"), String(job?.job_type || "")].filter(Boolean)) {
-      const chip = document.createElement("span");
-      chip.className = "tools-chip";
-      chip.textContent = tagText;
-      tags.appendChild(chip);
-    }
-    meta.appendChild(tags);
-    row.appendChild(meta);
-    const actions = document.createElement("div");
-    actions.className = "tools-item-actions";
-    const refreshBtn = document.createElement("button");
-    refreshBtn.className = "ghost small";
-    refreshBtn.textContent = "Refresh";
-    refreshBtn.addEventListener("click", async () => {
-      await refreshToolsState(true);
-    });
-    actions.appendChild(refreshBtn);
-    if (job?.result?.paper_id) {
-      const viewBtn = document.createElement("button");
-      viewBtn.className = "ghost small";
-      viewBtn.textContent = "View";
-      viewBtn.addEventListener("click", async () => {
-        await viewPaperArtifact(String(job?.result?.paper_id || ""));
-      });
-      actions.appendChild(viewBtn);
-    }
-    if (String(job?.status || "") !== "completed" && String(job?.status || "") !== "failed" && String(job?.status || "") !== "cancelled") {
-      const cancelBtn = document.createElement("button");
-      cancelBtn.className = "ghost small";
-      cancelBtn.textContent = "Cancel";
-      cancelBtn.addEventListener("click", async () => {
-        await cancelBrokerJob(String(job?.job_id || ""));
-      });
-      actions.appendChild(cancelBtn);
-    }
-    row.appendChild(actions);
-    paperJobListEl.appendChild(row);
-  }
-}
-
-function renderPaperLibrary(items = []) {
-  if (!paperListEl) {
-    return;
-  }
-  paperListEl.textContent = "";
-  const list = Array.isArray(items) ? items : [];
-  if (!list.length) {
-    const empty = document.createElement("p");
-    empty.className = "tools-empty";
-    empty.textContent = "No paper artifacts yet.";
-    paperListEl.appendChild(empty);
-    return;
-  }
-  for (const paper of list) {
-    const row = document.createElement("div");
-    row.className = "tools-item";
-    const meta = document.createElement("div");
-    meta.className = "tools-item-meta";
-    const title = document.createElement("p");
-    title.className = "tools-item-host";
-    title.textContent = String(paper?.title || paper?.paper_id || "paper");
-    meta.appendChild(title);
-    const detail = document.createElement("p");
-    detail.className = "tools-muted";
-    detail.textContent = truncatePreview(paper?.latest_digest_excerpt || paper?.abstract || paper?.url || paper?.local_path || "", 180)
-      || `Updated ${formatTime(paper?.updated_at)}`;
-    meta.appendChild(detail);
-    const tags = document.createElement("div");
-    tags.className = "tools-item-tags";
-    for (const tagText of [
-      String(paper?.source_format || ""),
-      `${Number(paper?.section_count || 0)} section${Number(paper?.section_count || 0) === 1 ? "" : "s"}`
-    ]) {
-      if (!tagText) {
-        continue;
-      }
-      const chip = document.createElement("span");
-      chip.className = "tools-chip";
-      chip.textContent = tagText;
-      tags.appendChild(chip);
-    }
-    meta.appendChild(tags);
-    row.appendChild(meta);
-    const actions = document.createElement("div");
-    actions.className = "tools-item-actions";
-    const openBtn = document.createElement("button");
-    openBtn.className = "ghost small";
-    openBtn.textContent = "View";
-    openBtn.addEventListener("click", async () => {
-      await viewPaperArtifact(String(paper?.paper_id || ""));
-    });
-    actions.appendChild(openBtn);
-    row.appendChild(actions);
-    paperListEl.appendChild(row);
-  }
-}
-
 function renderExperimentJobs(jobs = []) {
   if (!experimentJobListEl) {
     return;
@@ -2611,15 +2296,9 @@ async function cancelBrokerJob(jobId) {
     if (!result.ok) {
       throw new Error(result.error || "Failed to cancel job.");
     }
-    if (String(jobId).startsWith("paper_job_")) {
-      await refreshToolsState(false);
-    } else {
-      await refreshModelsState(false);
-    }
+    await refreshModelsState(false);
   } catch (error) {
-    if (String(jobId).startsWith("paper_job_")) {
-      updateToolsStatus(`Paper job error: ${String(error.message || error)}`);
-    } else if (experimentsStatusEl) {
+    if (experimentsStatusEl) {
       experimentsStatusEl.textContent = `Experiment error: ${String(error.message || error)}`;
     }
   }
@@ -2776,10 +2455,6 @@ function setToolsBusy(busy) {
     toolsAllowActiveBtn,
     toolsAgentMaxStepsEl,
     toolsBrowserApplyBtn,
-    paperUseActiveBtn,
-    paperInspectBtn,
-    paperAnalyzeBtn,
-    readShowWhereBtn,
     $("composer-read-explain-btn"),
     $("composer-read-guide-btn"),
     $("composer-read-show-btn")
@@ -2802,6 +2477,7 @@ function updateToolsStatus(text) {
 }
 
 function updatePapersStatus(text) {
+  const papersStatusEl = $("read-assistant-status");
   if (papersStatusEl) {
     papersStatusEl.textContent = text;
   }
@@ -2880,7 +2556,7 @@ function renderToolsPolicy(policy) {
 
 
 async function refreshToolsState(showErrors = true, options = {}) {
-  const captureReadContext = options.captureReadContext === true || state.activeMainTab === "tools";
+  const captureReadContext = options.captureReadContext === true;
   setToolsBusy(true);
   try {
     const [policyState, activeState, browserConfigState, readContextState] = await Promise.allSettled([
@@ -2942,7 +2618,7 @@ async function refreshToolsState(showErrors = true, options = {}) {
       );
     }
 
-    if (readContextState.status === "fulfilled") {
+    if (captureReadContext && readContextState.status === "fulfilled") {
       if (readContextState.value?.active_tab && typeof readContextState.value.active_tab === "object") {
         state.toolsActiveTab = readContextState.value.active_tab;
       }
@@ -2955,18 +2631,7 @@ async function refreshToolsState(showErrors = true, options = {}) {
             : readContextState.value.error?.message || "unknown_error"
         );
       }
-    } else {
-      state.readContext = null;
-      console.warn(
-        "[secure-panel] read assistant context refresh failed:",
-        String(readContextState.reason?.message || readContextState.reason)
-      );
     }
-
-    renderReadAssistantPreview(state.readContext);
-    setReadAssistantExplainEnabled();
-    updateReadAssistantStatus();
-
     const statusParts = [];
     if (state.toolsActiveTab?.host) {
       const marker = state.toolsActiveTab.allowed ? "allowed" : "not allowed";
@@ -2981,9 +2646,7 @@ async function refreshToolsState(showErrors = true, options = {}) {
       statusParts.push("Browser settings unavailable.");
     }
     updateToolsStatus(statusParts.join(" "));
-    scheduleAutoRefresh("papers", false);
   } catch (error) {
-    scheduleAutoRefresh("papers", false);
     console.warn("[secure-panel] tools refresh failed:", String(error?.message || error));
     if (showErrors) {
       updateToolsStatus(`Tools error: ${String(error.message || error)}`);
@@ -3100,83 +2763,6 @@ async function allowActiveTabHost() {
     updateToolsStatus(`Tools error: ${String(error.message || error)}`);
   } finally {
     setToolsBusy(false);
-  }
-}
-
-function buildPaperSourceMessage(rawValue) {
-  const source = String(rawValue || "").trim();
-  if (!source) {
-    return null;
-  }
-  if (/^https?:\/\//i.test(source)) {
-    return { url: source };
-  }
-  if (/\.pdf$/i.test(source)) {
-    return { pdfPath: source };
-  }
-  if (/\.(html?|xhtml)$/i.test(source)) {
-    return { htmlPath: source };
-  }
-  return { textPath: source };
-}
-
-
-async function useActiveTabForPaperSource() {
-  setToolsBusy(true);
-  try {
-    await captureReadAssistantContext(true);
-  } catch {
-    // Status messaging already happens inside captureReadAssistantContext.
-  } finally {
-    setToolsBusy(false);
-  }
-}
-
-
-async function inspectPaperFromInputs() {
-  await submitReadAssistantAction("explain_selection");
-}
-
-
-async function analyzePaperFromInputs() {
-  await submitReadAssistantAction("guide_page");
-}
-
-async function viewPaperArtifact(paperId) {
-  if (!paperId) {
-    return;
-  }
-  try {
-    const result = await sendRuntimeMessage({
-      type: "assistant.papers.get",
-      paperId
-    });
-    if (!result.ok) {
-      throw new Error(result.error || "Failed to load paper artifact.");
-    }
-    const paper = result.paper && typeof result.paper === "object" ? result.paper : {};
-    const latestDigest =
-      paper.latest_digest && typeof paper.latest_digest === "object"
-        ? String(paper.latest_digest.text || "").trim()
-        : "";
-    state.paperInspect = {
-      inspect: {
-        title: String(paper.title || ""),
-        authors: Array.isArray(paper.authors) ? paper.authors : [],
-        abstract: String(paper.abstract || ""),
-        url: String(paper.url || paper.local_path || ""),
-        preview_text: latestDigest || String(paper.text_preview || "")
-      },
-      cached_paper: {
-        paper_id: String(paper.paper_id || ""),
-        title: String(paper.title || "")
-      },
-      paper
-    };
-    renderPaperDetail(paper);
-    updatePapersStatus(`Loaded paper artifact ${paperId}.`);
-  } catch (error) {
-    updatePapersStatus(`Paper error: ${String(error.message || error)}`);
   }
 }
 

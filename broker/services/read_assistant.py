@@ -2,18 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-_DEPRECATED_PAPERS_ERROR = {
-    "code": "deprecated_feature",
-    "message": "Paper analysis has been replaced by the read assistant. Use chat with page context enabled.",
-}
-
-
-def deprecated_papers_payload() -> dict[str, Any]:
-    return {
-        "ok": False,
-        "error": dict(_DEPRECATED_PAPERS_ERROR),
-    }
-
 
 def _compact_whitespace(value: Any, limit: int) -> str:
     cleaned = " ".join(str(value or "").split())

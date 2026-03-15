@@ -10,25 +10,8 @@ atexit.register(shutil.rmtree, IMPORT_DATA_DIR, ignore_errors=True)
 os.environ["BROKER_DATA_DIR"] = IMPORT_DATA_DIR
 
 from broker import local_broker
-from broker.services import read_assistant
-
 
 class ReadAssistantBrokerTest(unittest.TestCase):
-    def test_deprecated_papers_payload_shape(self) -> None:
-        payload = read_assistant.deprecated_papers_payload()
-        self.assertEqual(False, payload["ok"])
-        self.assertEqual("deprecated_feature", payload["error"]["code"])
-        self.assertIn("read assistant", payload["error"]["message"].lower())
-
-    def test_paper_handlers_return_deprecated_payload(self) -> None:
-        expected = read_assistant.deprecated_papers_payload()
-        self.assertEqual(expected, local_broker.handle_paper_inspect({"url": "https://example.com"}))
-        self.assertEqual(expected, local_broker.handle_paper_job_start({"url": "https://example.com"}))
-        self.assertEqual(expected, local_broker.handle_paper_job_get("paper_job_123"))
-        self.assertEqual(expected, local_broker.handle_papers_list())
-        self.assertEqual(expected, local_broker.handle_paper_get("paper_123"))
-        self.assertEqual(expected, local_broker.handle_paper_section_get("paper_123", "intro"))
-
     def test_normalize_page_context_accepts_rich_read_context(self) -> None:
         normalized = local_broker.normalize_page_context(
             {

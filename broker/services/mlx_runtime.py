@@ -5,6 +5,7 @@ import select
 import subprocess
 import threading
 import time
+from datetime import datetime, timezone
 import uuid
 from collections import deque
 from pathlib import Path
@@ -29,6 +30,10 @@ def _coerce_optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 MLX_CHAT_CONTRACT_BASE = {

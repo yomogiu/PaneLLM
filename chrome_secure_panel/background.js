@@ -164,29 +164,8 @@ async function handleMessage(message) {
   if (message.type === "assistant.jobs.cancel") {
     return await cancelJob(message);
   }
-  if (typeof message.type === "string" && message.type.startsWith("assistant.papers.")) {
-    return deprecatedPapersResponse();
-  }
   if (message.type === "assistant.read.context.capture") {
     return await captureReadAssistantContext(message);
-  }
-  if (message.type === "assistant.papers.inspect") {
-    return await inspectPaper(message);
-  }
-  if (message.type === "assistant.papers.job.start") {
-    return await startPaperJob(message);
-  }
-  if (message.type === "assistant.papers.job.get") {
-    return await getPaperJob(message);
-  }
-  if (message.type === "assistant.papers.list") {
-    return await listPapers();
-  }
-  if (message.type === "assistant.papers.get") {
-    return await getPaper(message);
-  }
-  if (message.type === "assistant.papers.section.get") {
-    return await getPaperSection(message);
   }
   if (message.type === "assistant.experiments.job.start") {
     return await startExperimentJob(message);
@@ -260,16 +239,6 @@ async function checkBrokerHealth() {
   return await brokerRequest("GET", "/health");
 }
 
-
-function deprecatedPapersResponse() {
-  return {
-    ok: false,
-    error: {
-      code: "deprecated_feature",
-      message: "Paper analysis has been replaced by the read assistant. Use chat with page context enabled."
-    }
-  };
-}
 
 async function captureReadAssistantContext(_message) {
   const activeTab = await getActiveTab();
@@ -690,54 +659,6 @@ async function cancelJob(message) {
   return await brokerRequest("POST", path, {});
 }
 
-async function inspectPaper(message) {
-  const body = buildPaperSourceBody(message);
-  return await brokerRequest("POST", "/papers/inspect", body);
-}
-
-async function startPaperJob(message) {
-  const body = buildPaperSourceBody(message);
-  if (typeof message?.analysisMode === "string" && message.analysisMode.trim()) {
-    body.analysis_mode = message.analysisMode.trim();
-  }
-  if (typeof message?.backend === "string" && message.backend.trim()) {
-    body.backend = message.backend.trim();
-  }
-  return await brokerRequest("POST", "/papers/jobs", body);
-}
-
-async function getPaperJob(message) {
-  if (!message?.jobId || typeof message.jobId !== "string") {
-    throw new Error("jobId is required.");
-  }
-  const path = `/papers/jobs/${encodeURIComponent(message.jobId)}`;
-  return await brokerRequest("GET", path);
-}
-
-async function listPapers() {
-  return await brokerRequest("GET", "/papers");
-}
-
-async function getPaper(message) {
-  if (!message?.paperId || typeof message.paperId !== "string") {
-    throw new Error("paperId is required.");
-  }
-  const path = `/papers/${encodeURIComponent(message.paperId)}`;
-  return await brokerRequest("GET", path);
-}
-
-async function getPaperSection(message) {
-  if (!message?.paperId || typeof message.paperId !== "string") {
-    throw new Error("paperId is required.");
-  }
-  if (!message?.sectionId || typeof message.sectionId !== "string") {
-    throw new Error("sectionId is required.");
-  }
-  const path =
-    `/papers/${encodeURIComponent(message.paperId)}/sections/${encodeURIComponent(message.sectionId)}`;
-  return await brokerRequest("GET", path);
-}
-
 async function startExperimentJob(message) {
   const body = {};
   if (typeof message?.kind === "string" && message.kind.trim()) {
@@ -794,23 +715,6 @@ async function compareExperiments(message) {
   const path =
     `/experiments/${encodeURIComponent(message.experimentId)}/compare/${encodeURIComponent(message.otherExperimentId)}`;
   return await brokerRequest("GET", path);
-}
-
-function buildPaperSourceBody(message) {
-  const body = {};
-  if (typeof message?.url === "string" && message.url.trim()) {
-    body.url = message.url.trim();
-  }
-  if (typeof message?.pdfPath === "string" && message.pdfPath.trim()) {
-    body.pdf_path = message.pdfPath.trim();
-  }
-  if (typeof message?.htmlPath === "string" && message.htmlPath.trim()) {
-    body.html_path = message.htmlPath.trim();
-  }
-  if (typeof message?.textPath === "string" && message.textPath.trim()) {
-    body.text_path = message.textPath.trim();
-  }
-  return body;
 }
 
 async function getBrowserConfig() {
