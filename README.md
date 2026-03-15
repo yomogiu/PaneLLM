@@ -237,4 +237,3 @@ Open side panel, confirm broker status is online, and send a prompt. If browser 
 - [broker/README.md](broker/README.md): broker endpoints, contracts, env vars
 - [chrome_secure_panel/README.md](chrome_secure_panel/README.md): extension behavior and RPC surface
 - [tools/README.md](tools/README.md): tool and MCP layout
-- [WEB_SEARCH.md](WEB_SEARCH.md): architecture notes and planning context

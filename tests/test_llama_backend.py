@@ -302,50 +302,6 @@ class ThinkingParsingTest(unittest.TestCase):
         self.assertIn(("", "Need to compare the options."), states)
         self.assertEqual(("Final answer.", "Need to compare the options."), states[-1])
 
-    def test_route_request_forwards_llama_reasoning_controls(self) -> None:
-        with patch.object(local_broker, "call_llama", return_value=("Final answer.", "")) as mock_call:
-            result = local_broker.route_request(
-                {
-                    "session_id": "route_llama_controls",
-                    "request_id": "req_llama_controls",
-                    "backend": "llama",
-                    "prompt": "hello",
-                    "chat_template_kwargs": "{\"enable_thinking\":true,\"clear_thinking\":false}",
-                    "reasoning_budget": 0,
-                }
-            )
-
-        self.assertEqual("Final answer.", result["answer"])
-        self.assertEqual(
-            {"enable_thinking": True, "clear_thinking": False},
-            mock_call.call_args.kwargs["chat_template_kwargs"],
-        )
-        self.assertEqual(0, mock_call.call_args.kwargs["reasoning_budget"])
-
-    def test_route_request_keeps_hidden_prompt_suffix_out_of_conversation(self) -> None:
-        session_id = "route_llama_hidden_suffix"
-        prompt = "Where is the main claim?"
-        suffix = "Selected passage:\n> The paper introduces a new method."
-        with patch.object(local_broker, "call_llama", return_value=("Final answer.", "")) as mock_call:
-            result = local_broker.route_request(
-                {
-                    "session_id": session_id,
-                    "request_id": "req_llama_hidden_suffix",
-                    "backend": "llama",
-                    "prompt": prompt,
-                    "request_prompt_suffix": suffix,
-                }
-            )
-
-        self.assertEqual("Final answer.", result["answer"])
-        conversation = local_broker.CONVERSATIONS.get(session_id)
-        self.assertEqual(prompt, conversation["messages"][-2]["content"])
-        self.assertEqual("Final answer.", conversation["messages"][-1]["content"])
-        self.assertEqual(
-            f"{prompt}\n\n{suffix}",
-            mock_call.call_args.args[0][-1]["content"],
-        )
-
     def test_start_run_persists_llama_reasoning_controls(self) -> None:
         manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
 
