@@ -8,82 +8,146 @@ Current release target: `v0.1.0`.
 
 ```
 Chrome Side Panel (UI + user actions)
-  -> Extension background worker (policy checks, broker RPC)
-    -> Local broker (routing, persistence, run state, security gates)
-      -> Model backends (llama / MLX worker / Codex Responses / Codex CLI / legacy command)
+  -> Extension background worker (policy checks, broker RPC, host list enforcement)
+    -> Local broker (routing, persistence, run/job state, security gates)
+      -> Model backends (llama / MLX / Codex Responses / Codex CLI)
       -> Extension relay loop for browser actions (Chrome tabs/scripting APIs)
 ```
 
 ### Core components
 
 - `broker/local_broker.py`
-  - Single-process HTTP broker and conversation store.
-  - Routes chat requests, manages Codex run lifecycle, MLX runtime lifecycle, and browser session/run state.
+  - Single-process HTTP control plane and API entrypoint.
+  - Owns run lifecycle, browser tool policy, extension relay, async jobs, and persistence orchestration.
+- `broker/browser_tools.py`
+  - Canonical browser tool catalog used by broker-native and MCP-exposed tool calls.
+- `broker/services/mlx_runtime.py`
+  - MLX runtime control and status primitives.
+- `broker/mlx_worker.py`
+  - MLX backend process entrypoint.
+- `broker/experiment_worker.py`
+  - Async experiment executor.
+- `broker/training_worker.py`
+  - Async LoRA training/checkpoint executor.
 - `chrome_secure_panel/`
   - MV3 side panel extension (`sidepanel.js`, `background.js`, `manifest.json`).
-  - Handles UI, prompt submission, history, and extension-side browser execution.
-- `llama_browser_tool_loop.py`
-  - Standalone CLI loop for local ask/tool/agent workflows.
+  - Polls broker state, submits runs, manages the relay loop, and renders Models/Tools/History UI.
 - `tools/mcp-servers/browser-use/server.py`
-  - MCP bridge that proxies browser tool calls through broker APIs.
+  - MCP wrapper over broker browser tools (`/browser/tools/call`).
 
 ## Runtime flows
 
 ### 1) Chat flow
 
-1. Side panel sends prompt to extension background worker.
-2. Background worker captures optional page context and calls broker (`/route` or `/codex/runs`).
-3. Broker builds model context from persisted conversation and routes to selected backend (`llama`, `mlx`, `codex`).
-4. Broker persists user/assistant turns and returns response/events.
+1. Side panel submits a prompt through `assistant.run.start`.
+2. Background worker optionally captures page context and calls broker `POST /runs`.
+3. Broker resolves model backend (`codex`, `llama`, `mlx`) and writes conversation state to `broker/.data/conversations/*.json`.
+4. Assistant stream events are returned from `GET /runs/<run_id>/events`.
+5. Risks can block a run until confirmed via `POST /runs/<run_id>/approval`.
+6. Runs can be canceled with `POST /runs/<run_id>/cancel`.
 
-### 2) Browser automation flow
+### 2) Read-assistant context flow
 
-1. Model emits browser tool intent (llama tool loop or Codex run tools).
-2. Broker validates policy and pushes commands to extension relay.
-3. Extension executes via Chrome APIs on allowlisted hosts only.
-4. Results return to broker, then back into the model/run stream.
+1. Side panel requests context capture with `assistant.read.context.capture`.
+2. Background extracts the active-tab summary if the active host is allowlisted.
+3. Captured context is attached to the next run as `page_context` and is bounded by broker prompt-size limits.
 
-### 3) Conversation/history flow
+### 3) Browser automation flow
 
-- Broker persists conversations in `broker/.data/conversations/*.json`.
-- Extension uses history APIs for list/get/delete/rewrite.
-- Prompt rewrite is linear today: editing an older user turn truncates later turns and regenerates.
+1. Broker receives a browser tool request (`POST /browser/tools/call`) from model or MCP.
+2. Tool call is validated against the allowlist and tool catalog.
+3. Broker enqueues extension relay command.
+4. Extension executes Chrome APIs on allowlisted hosts only.
+5. Results return through broker and into the run stream.
+
+### 4) Async jobs flow
+
+- Experiments and MLX training jobs are async: `POST /experiments/jobs`, `POST /mlx/training/jobs`, etc.
+- Jobs appear under `/jobs` and can be cancelled by `POST /jobs/<job_id>/cancel`.
+- Side panel tools surfaces job/run state across experiments and training flows.
+
+## API surface (implemented now)
+
+- `GET /health`
+- `GET /models`
+- `POST /runs`
+- `GET /runs/<run_id>/events`
+- `POST /runs/<run_id>/approval`
+- `POST /runs/<run_id>/cancel`
+- `GET /browser/health`
+- `GET /browser/config`
+- `POST /browser/config`
+- `POST /browser/tools/call`
+- `POST /extension/register`
+- `GET /extension/next`
+- `POST /extension/result`
+- `GET /jobs?kind=<experiment|training>&status=<queued|running|completed|failed|cancelled>`
+- `POST /jobs/<job_id>/cancel`
+- `GET /conversations`
+- `GET /conversations/<conversation_id>`
+- `DELETE /conversations/<conversation_id>`
+- `POST /experiments/jobs`
+- `GET /experiments/jobs/<job_id>`
+- `GET /experiments`
+- `GET /experiments/<experiment_id>`
+- `GET /experiments/<experiment_id>/compare/<other_experiment_id>`
+- `POST /mlx/training/datasets/import`
+- `GET /mlx/training/datasets`
+- `GET /mlx/training/datasets/<dataset_id>`
+- `DELETE /mlx/training/datasets/<dataset_id>`
+- `POST /mlx/training/jobs`
+- `GET /mlx/training/jobs/<job_id>`
+- `GET /mlx/training/runs`
+- `GET /mlx/training/runs/<run_id>`
+- `POST /mlx/training/checkpoints/promote`
+- `POST /mlx/config`
+- `GET /mlx/status`
+- `POST /mlx/session/start`
+- `POST /mlx/session/stop`
+- `POST /mlx/session/restart`
+- `GET /mlx/adapters`
+- `POST /mlx/adapters/load`
+- `POST /mlx/adapters/unload`
 
 ## MLX backend
 
 ### Runtime architecture
 
 - MLX runs as a broker-managed worker process in [broker/mlx_worker.py](broker/mlx_worker.py).
-- Broker owns MLX lifecycle (`start`/`stop`/`restart`), generation settings, adapter registry, and telemetry.
-- Side panel `Models` tab is the operator UI for MLX runtime control.
-
-### Models tab capabilities
-
-- Backend selection includes `MLX Local`.
-- Runtime controls: start, stop, restart, refresh status.
-- Generation controls: `temperature`, `top_p`, `top_k`, `max_tokens`, `repetition_penalty`, `seed`, `enable_thinking`.
-- Adapter controls: list/load/unload LoRA checkpoints (checkpoint reload only, no merge in v1).
-- Runtime trends: latency, tokens/sec, restart success/failure counters.
+- Broker owns runtime lifecycle (`start`/`stop`/`restart`), generation settings, adapter registry, and telemetry.
+- Side panel `Models` tab controls MLX runtime.
 
 ### Stable MLX contract (v1)
 
 - Versioned schema: `schema_version: mlx_chat_v1`.
 - Message shape: OpenAI-style chat messages (`role`, `content`).
 - Tool calls: disabled in v1 (`tool_call_format: none_v1`).
-- Template assumption: tokenizer `apply_chat_template` (Qwen-style Jinja, with plaintext role-header fallback).
 - Context behavior: tail truncation by char budget (`max_context_behavior: tail_truncate_chars_v1`).
-- Llama/Codex use the shared `BROKER_MAX_CONTEXT_CHARS` budget (default `24000` chars).
-- MLX uses `BROKER_MLX_MAX_CONTEXT_CHARS` (default `56000` chars, capped at `56000`).
-- Contract metadata is exposed by broker status payloads and shown in the Models tab.
-- `/route` responses now include `context_usage` on successful assistant replies, with backend-aware char and message window usage.
-- The side panel now surfaces `context_usage` as `Context: used/limit` in the chat header.
+- Llama/Codex use `BROKER_MAX_CONTEXT_CHARS` (default `24000` chars).
+- MLX uses `BROKER_MLX_MAX_CONTEXT_CHARS` (default `56000`, capped at `56000`).
+- Contract metadata is exposed from `/health` and `/mlx/status` payloads.
 
 ### MLX local data
 
 - Conversations (all backends): `broker/.data/conversations/*.json`
+- Run state: `broker/.data/codex_runs/*.json`
 - MLX generation settings: `broker/.data/mlx_config.json`
 - MLX adapter registry: `broker/.data/mlx_adapters.json`
+- Browser policy config: `broker/.data/browser_config.json`
+- Jobs:
+  - `broker/.data/jobs/experiment/*.json`
+  - `broker/.data/jobs/training/*.json`
+- Experiments/training metadata:
+  - `broker/.data/experiments/`
+  - `broker/.data/mlx_training/datasets/<dataset_id>/`
+  - `broker/.data/mlx_training/runs/<run_id>/`
 - MLX reasoning mode: runtime toggle via Models tab (`generation.enable_thinking`)
+
+## Legacy workflow status
+
+- `IMPROVEMENTS.md` notes reflected retired paper endpoints and are now folded in here.
+- The legacy paper route family (`/papers/inspect`, `/papers/jobs`) is not present in the broker now.
+- The active first-party content-reading path is read-assistant capture (`assistant.read.context.capture`) + prompt context on `/runs`.
 
 ## Security model
 
@@ -92,9 +156,9 @@ Chrome Side Panel (UI + user actions)
 - If `Origin` exists, it must be `chrome-extension://...`.
 - Browser/page-context actions are host-allowlisted in extension runtime.
 - Default extension allowlist: `127.0.0.1`, `localhost`, `google.com`, `www.google.com`, `arxiv.org`, `www.arxiv.org`.
-- Runtime allow/disallow hosts can be customized in the side panel **Tools** tab. Permanent defaults live in `chrome_secure_panel/background.js` and matching `manifest.json` host permissions.
-- High-risk prompts require explicit confirmation.
-- OpenAI/Codex credentials stay broker-side; extension never stores chat in persistent local storage.
+- Runtime allowlist can be edited in the side panel **Tools** tab.
+- High-risk prompts can require explicit confirmation.
+- OpenAI/Codex credentials stay broker-side; extension has no persistent chat store.
 
 ## Install
 
@@ -104,57 +168,46 @@ You need three things before the side panel will answer:
 - Chrome or Chromium with Developer mode enabled
 - At least one configured backend: Codex Responses, Codex CLI, llama.cpp, or MLX
 
-The broker itself is stdlib-only. Backend setup depends on which model path you want to use.
-
 ### 1) Run the macOS checker
-
-For macOS, start here:
 
 ```bash
 python3 scripts/check_macos.py
 ```
 
-The checker is read-only. It verifies core requirements, probes each backend path, and prints exact follow-up commands for anything missing. It exits non-zero until core requirements are satisfied and at least one backend is ready.
+### 2) Configure and start a backend
 
-### 2) Choose a backend
-
-Pick one working backend before you start the broker.
-
-Codex Responses via API key:
+Codex Responses:
 
 ```bash
 export OPENAI_API_KEY="<your-api-key>"
 python3 broker/local_broker.py
 ```
 
-Codex CLI via local ChatGPT login:
+Codex CLI:
 
 ```bash
 codex login
 python3 broker/local_broker.py
 ```
 
-llama.cpp via an OpenAI-compatible local endpoint:
+llama.cpp endpoint:
 
 ```bash
 export LLAMA_URL="http://127.0.0.1:18000/v1/chat/completions"
 python3 broker/local_broker.py
 ```
 
-MLX via a local model directory:
+MLX:
 
 ```bash
 python3 -m pip install mlx-lm
 export BROKER_MLX_MODEL_PATH="$HOME/models/mlx/<your-model-folder>"
-export BROKER_MLX_MAX_CONTEXT_CHARS=56000
 python3 broker/local_broker.py
 ```
 
-If you use MLX, install `mlx-lm` in the Python environment used by the broker worker. If that is not the same interpreter as `python3`, set `BROKER_MLX_WORKER_PYTHON` as well.
+If you use MLX, install `mlx-lm` in the same interpreter as `BROKER_MLX_WORKER_PYTHON`/worker if needed.
 
-### 3) Verify the broker
-
-The broker rejects requests without the required client header. This check should return `200` and a JSON body with `"ok": true`:
+### 3) Verify broker health
 
 ```bash
 curl -i \
@@ -162,37 +215,26 @@ curl -i \
   http://127.0.0.1:7777/health
 ```
 
-Expected signals in the response:
+Expected response clues:
 
-- `codex_backend: responses_ready` if `OPENAI_API_KEY` is set
-- `codex_backend: cli_ready` if the local `codex` CLI is installed and logged in
-- `codex_backend: legacy_command` if `CODEX_COMMAND` is configured
-- `codex_backend: disabled` if no Codex path is configured yet
+- `codex_backend: responses_ready` when `OPENAI_API_KEY` is set
+- `codex_backend: cli_ready` when logged-in local `codex` CLI is available
+- `codex_backend: disabled` if no Codex path is configured
 
-If you call `/health` without `X-Assistant-Client`, `403` is expected.
-
-### 4) Load the Chrome extension
+### 4) Load Chrome extension
 
 1. Open `chrome://extensions`
 2. Enable **Developer mode**
 3. Click **Load unpacked**
 4. Select `chrome_secure_panel/`
 
-### 5) Confirm the first run
+### 5) First run
 
-Open the side panel and check that broker status shows online. Then send a simple prompt.
-
-If you plan to let the assistant read or act on live pages, check the side panel **Tools** tab first. The extension ships with a small built-in allowlist (`127.0.0.1`, `localhost`, `google.com`, `www.google.com`, `arxiv.org`, `www.arxiv.org`), and you can add or block hosts there at runtime.
-
-### 6) Optional CLI
-
-```bash
-python3 llama_browser_tool_loop.py --help
-```
+Open side panel, confirm broker status is online, and send a prompt. If browser actions will be used, confirm host allowlist in **Tools** first.
 
 ## Repo guide
 
 - [broker/README.md](broker/README.md): broker endpoints, contracts, env vars
 - [chrome_secure_panel/README.md](chrome_secure_panel/README.md): extension behavior and RPC surface
 - [tools/README.md](tools/README.md): tool and MCP layout
-- [WEB_SEARCH.md](WEB_SEARCH.md): longer-horizon task architecture notes
+- [WEB_SEARCH.md](WEB_SEARCH.md): architecture notes and planning context
