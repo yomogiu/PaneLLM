@@ -42,6 +42,7 @@ const state = {
   rewriteTargetIndex: null,
   composerExplainSelection: "",
   composerShowMeWhere: false,
+  composerGuidePageContext: false,
   activeMainTab: "chat",
   modelsBusy: false,
   toolsBusy: false,
@@ -214,9 +215,12 @@ function getComposerExplainSelectionBlock(selection = state.composerExplainSelec
 
 function syncReadAssistantQuickActionState() {
   const explainBtn = $("composer-read-explain-btn");
+  const guideBtn = $("composer-read-guide-btn");
   const showBtn = $("composer-read-show-btn");
   explainBtn?.classList.toggle("active", Boolean(state.composerExplainSelection));
   explainBtn?.setAttribute("aria-pressed", String(Boolean(state.composerExplainSelection)));
+  guideBtn?.classList.toggle("active", Boolean(state.composerGuidePageContext));
+  guideBtn?.setAttribute("aria-pressed", String(Boolean(state.composerGuidePageContext)));
   showBtn?.classList.toggle("active", state.composerShowMeWhere);
   showBtn?.setAttribute("aria-pressed", String(state.composerShowMeWhere));
 }
@@ -227,6 +231,28 @@ function clearComposerExplainSelection() {
 
 function clearComposerShowMeWhere() {
   state.composerShowMeWhere = false;
+}
+
+function setComposerGuidePageContext(enabled) {
+  state.composerGuidePageContext = Boolean(enabled);
+  if (includePageContextEl) {
+    includePageContextEl.checked = state.composerGuidePageContext;
+  }
+  syncReadAssistantQuickActionState();
+}
+
+function isComposerGuidePageContextEnabled() {
+  if (includePageContextEl) {
+    return includePageContextEl.checked === true;
+  }
+  return state.composerGuidePageContext === true;
+}
+
+function toggleComposerGuidePageContext() {
+  const next = !isComposerGuidePageContextEnabled();
+  setComposerGuidePageContext(next);
+  updatePapersStatus(next ? "Page context included with next message." : "Page context disabled.");
+  focusComposerToEnd();
 }
 
 function resetComposerReadAssistantModes() {
@@ -249,7 +275,7 @@ function armComposerExplainSelection(selection) {
     return;
   }
   state.composerExplainSelection = cleanedSelection;
-  includePageContextEl.checked = true;
+  setComposerGuidePageContext(true);
   syncReadAssistantQuickActionState();
   focusComposerToEnd();
 }
@@ -283,7 +309,7 @@ async function toggleComposerExplainSelectionMode() {
 function toggleComposerShowMeWhereMode() {
   state.composerShowMeWhere = !state.composerShowMeWhere;
   if (state.composerShowMeWhere) {
-    includePageContextEl.checked = true;
+    setComposerGuidePageContext(true);
     updatePapersStatus("Show Me Where is armed. Send a prompt to answer it and navigate to the best section.");
     focusComposerToEnd();
   } else {
@@ -410,7 +436,7 @@ async function submitReadAssistantAction(kind) {
     if (!promptEl || !sendBtn) {
       throw new Error("Chat composer is unavailable.");
     }
-    includePageContextEl.checked = true;
+    setComposerGuidePageContext(true);
     forceBrowserActionEl.checked = kind === "show_me_where";
     promptEl.value = buildReadAssistantPrompt(kind, context);
     updateComposerState();
@@ -420,10 +446,6 @@ async function submitReadAssistantAction(kind) {
   } finally {
     setToolsBusy(false);
   }
-}
-
-async function showReadAssistantTarget() {
-  await submitReadAssistantAction("show_me_where");
 }
 
 function installReadAssistantQuickActions() {
@@ -449,8 +471,8 @@ function installReadAssistantQuickActions() {
   guideBtn.type = "button";
   guideBtn.className = "ghost composer-quick-action";
   guideBtn.textContent = "Guide This Page";
-  guideBtn.addEventListener("click", async () => {
-    await submitReadAssistantAction("guide_page");
+  guideBtn.addEventListener("click", () => {
+    toggleComposerGuidePageContext();
   });
 
   const showBtn = document.createElement("button");
@@ -2837,6 +2859,10 @@ async function loadConversation(sessionId) {
     state.runUi = new Map();
     state.rewriteTargetIndex = null;
     resetComposerReadAssistantModes();
+    const codex = conversation?.codex && typeof conversation.codex === "object" ? conversation.codex : {};
+    setComposerGuidePageContext(
+      String(codex.page_context_enabled || "").toLowerCase() === "true"
+    );
     hideRiskConfirm();
     renderConversationMessages(conversation.messages);
 
@@ -3035,7 +3061,7 @@ async function submitPrompt(confirmed) {
       sessionId: state.sessionId,
       prompt,
       requestPromptSuffix,
-      includePageContext: includePageContextEl.checked,
+      includePageContext: isComposerGuidePageContextEnabled(),
       forceBrowserAction,
       confirmed: false
     };
