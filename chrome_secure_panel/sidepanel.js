@@ -34,13 +34,10 @@ const state = {
   brokerHealth: null,
   busy: false,
   stopping: false,
-  activeCodexRunId: "",
-  activeLegacyRequestId: "",
-  activeLegacyPendingNode: null,
-  stoppedLegacyRequests: new Set(),
+  activeRunId: "",
   actionConfirmResolver: null,
-  codexRunUi: new Map(),
-  codexPollingRuns: new Set(),
+  runUi: new Map(),
+  pollingRuns: new Set(),
   rewriteTargetIndex: null,
   composerExplainSelection: "",
   composerShowMeWhere: false,
@@ -889,9 +886,6 @@ async function refreshBrokerHealth() {
         brokerStatusEl.style.color = "#75f0bc";
       } else if (backendMode === "cli_ready") {
         brokerStatusEl.textContent = "Online (Codex CLI)";
-        brokerStatusEl.style.color = "#ffd18c";
-      } else if (backendMode === "legacy_command") {
-        brokerStatusEl.textContent = "Online (Codex legacy)";
         brokerStatusEl.style.color = "#ffd18c";
       } else {
         brokerStatusEl.textContent = "Online (Llama only)";
@@ -2820,18 +2814,15 @@ async function loadConversation(sessionId) {
     state.pendingConfirmation = false;
     state.pendingRequest = null;
     state.stopping = false;
-    state.activeCodexRunId = "";
-    state.activeLegacyRequestId = "";
-    state.activeLegacyPendingNode = null;
-    state.stoppedLegacyRequests = new Set();
-    state.codexRunUi = new Map();
+    state.activeRunId = "";
+    state.runUi = new Map();
     state.rewriteTargetIndex = null;
     resetComposerReadAssistantModes();
     hideRiskConfirm();
     renderConversationMessages(conversation.messages);
 
     renderHistory(state.sessionId);
-    await restoreCodexRun(conversation);
+    await restoreRun(conversation);
   } catch (error) {
     appendMessage("system", `Conversation load failed: ${String(error.message || error)}`);
   } finally {
@@ -2879,11 +2870,8 @@ function startNewSession(message = "Started a new chat.") {
   state.pendingConfirmation = false;
   state.pendingRequest = null;
   state.stopping = false;
-  state.activeCodexRunId = "";
-  state.activeLegacyRequestId = "";
-  state.activeLegacyPendingNode = null;
-  state.stoppedLegacyRequests = new Set();
-  state.codexRunUi = new Map();
+  state.activeRunId = "";
+  state.runUi = new Map();
   state.rewriteTargetIndex = null;
   resetComposerReadAssistantModes();
   hideRiskConfirm();
@@ -2938,7 +2926,7 @@ function hideActionConfirm() {
   actionConfirmEl.setAttribute("aria-hidden", "true");
 }
 
-async function restoreCodexRun(conversation) {
+async function restoreRun(conversation) {
   const codex = conversation?.codex && typeof conversation.codex === "object" ? conversation.codex : null;
   if (!codex) {
     return;
@@ -2951,7 +2939,7 @@ async function restoreCodexRun(conversation) {
   }
 
   const allowAssistantBubble = Boolean(activeRunId);
-  const runUi = ensureCodexRunUi(runId, conversation.id, allowAssistantBubble, "codex");
+  const runUi = ensureRunUi(runId, conversation.id, allowAssistantBubble, "codex");
   runUi.lastSeq = 0;
   runUi.renderedSeqs.clear();
   runUi.waitingNode = null;
@@ -2963,23 +2951,23 @@ async function restoreCodexRun(conversation) {
 
   try {
     const result = await sendRuntimeMessage({
-      type: "assistant.codex.run.events",
+      type: "assistant.run.events",
       runId,
       after: 0,
       timeoutMs: 0
     });
     if (!result.ok) {
-      throw new Error(result.error || "Failed to restore Codex run.");
+      throw new Error(result.error || "Failed to restore run.");
     }
-    renderCodexEvents(runId, Array.isArray(result.events) ? result.events : []);
+    renderRunEvents(runId, Array.isArray(result.events) ? result.events : []);
     runUi.lastSeq = getLastRenderedSeq(runUi);
     if (activeRunId && !isTerminalRunStatus(result.status)) {
-      state.activeCodexRunId = runId;
+      state.activeRunId = runId;
       showRunWaitingIndicator(runUi);
-      void pollCodexRun(runId, conversation.id);
+      void pollRun(runId, conversation.id);
     }
   } catch (error) {
-    appendMessage("system", `Codex run restore failed: ${String(error.message || error)}`);
+    appendMessage("system", `Run restore failed: ${String(error.message || error)}`);
   }
 }
 
@@ -2991,8 +2979,8 @@ async function submitPrompt(confirmed) {
     appendMessage("system", "Confirm or cancel the pending high-risk request.");
     return;
   }
-  if (state.activeCodexRunId) {
-    appendMessage("system", "Wait for the active Codex run to finish or cancel it first.");
+  if (state.activeRunId) {
+    appendMessage("system", "Wait for the active run to finish or cancel it first.");
     return;
   }
 
@@ -3005,9 +2993,6 @@ async function submitPrompt(confirmed) {
       return;
     }
     request = { ...state.pendingRequest, confirmed: true };
-    if ((request.type === "assistant.query" || request.type === "assistant.history.rewrite") && !request.requestId) {
-      request.requestId = crypto.randomUUID();
-    }
     backend = request.backend || "codex";
   } else {
     const prompt = buildComposerPromptForSubmit(promptEl.value);
@@ -3025,58 +3010,25 @@ async function submitPrompt(confirmed) {
     promptEl.value = "";
     resetComposerReadAssistantModes();
 
-    if (usesCodexRunProtocol()) {
-      request = {
-        type: "assistant.codex.run.start",
-        backend,
-        sessionId: state.sessionId,
-        prompt,
-        requestPromptSuffix,
-        includePageContext: includePageContextEl.checked,
-        forceBrowserAction,
-        confirmed: false
-      };
-      if (isRewrite) {
-        request.rewriteMessageIndex = rewriteIndex;
-      }
-    } else if (isRewrite) {
-      request = {
-        type: "assistant.history.rewrite",
-        backend,
-        sessionId: state.sessionId,
-        requestId: crypto.randomUUID(),
-        messageIndex: rewriteIndex,
-        prompt,
-        requestPromptSuffix,
-        includePageContext: includePageContextEl.checked,
-        forceBrowserAction,
-        confirmed: false
-      };
-    } else {
-      request = {
-        type: "assistant.query",
-        backend,
-        sessionId: state.sessionId,
-        requestId: crypto.randomUUID(),
-        prompt,
-        requestPromptSuffix,
-        includePageContext: includePageContextEl.checked,
-        forceBrowserAction,
-        confirmed: false
-      };
+    request = {
+      type: "assistant.run.start",
+      backend,
+      sessionId: state.sessionId,
+      prompt,
+      requestPromptSuffix,
+      includePageContext: includePageContextEl.checked,
+      forceBrowserAction,
+      confirmed: false
+    };
+    if (isRewrite) {
+      request.rewriteMessageIndex = rewriteIndex;
     }
     request = applyLlamaThinkingRequestFields(request, backend);
   }
 
-  if (request.type === "assistant.codex.run.start") {
-    clearContextUsageDisplay();
-    setBusy(true);
-    await submitCodexRun(request);
-    return;
-  }
-  setContextUsagePending();
+  clearContextUsageDisplay();
   setBusy(true);
-  await submitLegacyQuery(request);
+  await submitRun(request);
 }
 
 function extractBlockedHostFromResult(result) {
@@ -3134,151 +3086,32 @@ async function maybeAllowBlockedHostAndRetry(result, pendingNode = null) {
   return { handled: true, retry: true };
 }
 
-async function submitLegacyQuery(message) {
-  const requestId = String(message?.requestId || "").trim();
-  if (!requestId) {
-    appendMessage("assistant", "Error: Missing request id for cancellation.");
-    setBusy(false);
-    return;
-  }
-  const isRewrite = message?.type === "assistant.history.rewrite";
-  const pendingMessage = appendMessage(
-    "assistant",
-    isRewrite ? "Regenerating from edited prompt..." : "Thinking...",
-    true
-  );
-  hideRiskConfirm();
-  state.activeLegacyRequestId = requestId;
-  state.activeLegacyPendingNode = pendingMessage;
-  state.stoppedLegacyRequests.delete(requestId);
-
-  try {
-    let result = null;
-    let retriedAfterAllow = false;
-    while (true) {
-      result = await sendRuntimeMessage(message);
-      if (result.ok) {
-        break;
-      }
-      const recovery = retriedAfterAllow
-        ? { handled: false, retry: false }
-        : await maybeAllowBlockedHostAndRetry(result, pendingMessage);
-      if (recovery.retry && !retriedAfterAllow) {
-        retriedAfterAllow = true;
-        continue;
-      }
-      if (recovery.handled) {
-        clearContextUsageDisplay();
-        return;
-      }
-      throw new Error(result.error || "Unknown failure.");
-    }
-
-    if (state.stoppedLegacyRequests.has(requestId) || result.cancelled) {
-      state.pendingConfirmation = false;
-      state.pendingRequest = null;
-      hideRiskConfirm();
-      updateMessage(pendingMessage, "assistant", "Request stopped.");
-      clearContextUsageDisplay();
-      return;
-    }
-
-    if (result.requires_confirmation) {
-      state.pendingConfirmation = true;
-      state.pendingRequest = message;
-      clearContextUsageDisplay();
-      showRiskConfirm(result.risk_flags || ["high_risk_request"]);
-      updateMessage(pendingMessage, "assistant", "High-risk request detected. Confirmation required.");
-      return;
-    }
-
-    state.pendingConfirmation = false;
-    state.pendingRequest = null;
-    hideRiskConfirm();
-    setContextUsageDisplay(result.context_usage);
-    updateMessage(
-      pendingMessage,
-      "assistant",
-      result.answer || "(No answer returned)",
-      false,
-      "",
-      result.reasoning_blocks
-    );
-    clearRewriteTarget();
-    await refreshHistory(state.sessionId);
-    await loadConversation(state.sessionId);
-  } catch (error) {
-    if (state.stoppedLegacyRequests.has(requestId)) {
-      state.pendingConfirmation = false;
-      state.pendingRequest = null;
-      hideRiskConfirm();
-      updateMessage(pendingMessage, "assistant", "Request stopped.");
-    } else {
-      clearContextUsageDisplay();
-      updateMessage(pendingMessage, "assistant", `Error: ${String(error.message || error)}`);
-    }
-  } finally {
-    if (state.activeLegacyRequestId === requestId) {
-      state.activeLegacyRequestId = "";
-      state.activeLegacyPendingNode = null;
-    }
-    state.stoppedLegacyRequests.delete(requestId);
-    state.stopping = false;
-    setBusy(false);
-  }
-}
-
 async function stopActiveRequest() {
   if (state.stopping) {
     return;
   }
 
-  if (state.activeCodexRunId) {
-    state.stopping = true;
-    updateComposerState();
-    try {
-      await cancelCodexRun(state.activeCodexRunId);
-    } finally {
-      state.stopping = false;
-      updateComposerState();
-    }
-    return;
-  }
-
-  const requestId = String(state.activeLegacyRequestId || "").trim();
-  if (!requestId) {
+  const runId = String(state.activeRunId || "").trim();
+  if (!runId) {
     return;
   }
 
   state.stopping = true;
-  state.stoppedLegacyRequests.add(requestId);
-  if (state.activeLegacyPendingNode) {
-    updateMessage(state.activeLegacyPendingNode, "assistant", "Stopping...", true);
-  }
   updateComposerState();
 
   try {
-    const result = await sendRuntimeMessage({
-      type: "assistant.query.cancel",
-      sessionId: state.sessionId,
-      requestId
-    });
-    if (!result.ok) {
-      throw new Error(result.error || "Failed to stop request.");
-    }
+    await cancelRun(runId);
   } catch (error) {
-    state.stoppedLegacyRequests.delete(requestId);
     state.stopping = false;
-    if (state.activeLegacyPendingNode) {
-      updateMessage(state.activeLegacyPendingNode, "assistant", `Stop failed: ${String(error.message || error)}`);
-    } else {
-      appendMessage("system", `Stop failed: ${String(error.message || error)}`);
-    }
+    appendMessage("system", `Stop failed: ${String(error.message || error)}`);
     updateComposerState();
+    return;
   }
+  state.stopping = false;
+  updateComposerState();
 }
 
-async function submitCodexRun(message) {
+async function submitRun(message) {
   hideRiskConfirm();
 
   try {
@@ -3299,7 +3132,7 @@ async function submitCodexRun(message) {
       if (recovery.handled) {
         return;
       }
-      throw new Error(result.error || "Failed to start Codex run.");
+      throw new Error(result.error || "Failed to start run.");
     }
 
     if (result.requires_confirmation) {
@@ -3312,7 +3145,7 @@ async function submitCodexRun(message) {
 
     const runId = typeof result.run_id === "string" ? result.run_id : "";
     if (!runId) {
-      throw new Error("Broker did not return a Codex run id.");
+      throw new Error("Broker did not return a run id.");
     }
 
     state.pendingConfirmation = false;
@@ -3322,12 +3155,12 @@ async function submitCodexRun(message) {
       applyLocalRewritePreview(rewriteIndex, message.prompt);
       clearRewriteTarget();
     }
-    state.activeCodexRunId = runId;
+    state.activeRunId = runId;
     const runBackend = typeof result.backend === "string" ? result.backend : message.backend || "codex";
-    const runUi = ensureCodexRunUi(runId, state.sessionId, true, runBackend);
+    const runUi = ensureRunUi(runId, state.sessionId, true, runBackend);
     showRunWaitingIndicator(runUi);
     await refreshHistory(state.sessionId);
-    void pollCodexRun(runId, state.sessionId);
+    void pollRun(runId, state.sessionId);
   } catch (error) {
     appendMessage("assistant", `Error: ${String(error.message || error)}`);
   } finally {
@@ -3336,8 +3169,8 @@ async function submitCodexRun(message) {
   }
 }
 
-function ensureCodexRunUi(runId, conversationId, allowAssistantBubble, backend = null) {
-  let runUi = state.codexRunUi.get(runId);
+function ensureRunUi(runId, conversationId, allowAssistantBubble, backend = null) {
+  let runUi = state.runUi.get(runId);
   if (!runUi) {
     runUi = {
       runId,
@@ -3353,7 +3186,7 @@ function ensureCodexRunUi(runId, conversationId, allowAssistantBubble, backend =
       allowAssistantBubble,
       backend: typeof backend === "string" ? backend : "codex"
     };
-    state.codexRunUi.set(runId, runUi);
+    state.runUi.set(runId, runUi);
     return runUi;
   }
   runUi.conversationId = conversationId;
@@ -3364,33 +3197,33 @@ function ensureCodexRunUi(runId, conversationId, allowAssistantBubble, backend =
   return runUi;
 }
 
-async function pollCodexRun(runId, conversationId) {
-  if (state.codexPollingRuns.has(runId)) {
+async function pollRun(runId, conversationId) {
+  if (state.pollingRuns.has(runId)) {
     return;
   }
-  state.codexPollingRuns.add(runId);
+  state.pollingRuns.add(runId);
 
   try {
     while (state.sessionId === conversationId) {
-      const runUi = ensureCodexRunUi(runId, conversationId, true);
+      const runUi = ensureRunUi(runId, conversationId, true);
       const result = await sendRuntimeMessage({
-        type: "assistant.codex.run.events",
+        type: "assistant.run.events",
         runId,
         after: runUi.lastSeq,
         timeoutMs: 20_000
       });
       if (!result.ok) {
-        throw new Error(result.error || "Failed to poll Codex run events.");
+        throw new Error(result.error || "Failed to poll run events.");
       }
       if (state.sessionId !== conversationId) {
         break;
       }
 
-      renderCodexEvents(runId, Array.isArray(result.events) ? result.events : []);
+      renderRunEvents(runId, Array.isArray(result.events) ? result.events : []);
       runUi.lastSeq = getLastRenderedSeq(runUi);
 
       if (isTerminalRunStatus(result.status)) {
-        state.activeCodexRunId = "";
+        state.activeRunId = "";
         clearRewriteTarget();
         await refreshHistory(state.sessionId);
         await loadConversation(state.sessionId);
@@ -3398,21 +3231,21 @@ async function pollCodexRun(runId, conversationId) {
       }
     }
   } catch (error) {
-    const runUi = state.codexRunUi.get(runId);
+    const runUi = state.runUi.get(runId);
     if (runUi) {
       clearRunWaitingIndicator(runUi);
     }
-    appendMessage("system", `Codex event polling failed: ${String(error.message || error)}`);
-    state.activeCodexRunId = "";
+    appendMessage("system", `Run event polling failed: ${String(error.message || error)}`);
+    state.activeRunId = "";
   } finally {
-    state.codexPollingRuns.delete(runId);
+    state.pollingRuns.delete(runId);
     updateComposerState();
   }
 }
 
-function renderCodexEvents(runId, events) {
+function renderRunEvents(runId, events) {
   const runUi =
-    state.codexRunUi.get(runId) || ensureCodexRunUi(runId, state.sessionId, true);
+    state.runUi.get(runId) || ensureRunUi(runId, state.sessionId, true);
   for (const event of events) {
     const seq = Number(event?.seq || 0);
     if (!seq || runUi.renderedSeqs.has(seq)) {
@@ -3424,7 +3257,7 @@ function renderCodexEvents(runId, events) {
       clearRunWaitingIndicator(runUi);
       runUi.streamedAssistantText = String(event?.data?.text || "");
       if (runUi.allowAssistantBubble) {
-        upsertCodexAssistantBubble(
+        upsertRunAssistantBubble(
           runUi,
           runUi.streamedAssistantText,
           true,
@@ -3438,7 +3271,7 @@ function renderCodexEvents(runId, events) {
       clearRunWaitingIndicator(runUi);
       runUi.streamedReasoningText = String(event?.data?.text || "");
       if (runUi.allowAssistantBubble && (runUi.streamedReasoningText || runUi.assistantNode)) {
-        upsertCodexAssistantBubble(
+        upsertRunAssistantBubble(
           runUi,
           runUi.streamedAssistantText,
           true,
@@ -3450,13 +3283,13 @@ function renderCodexEvents(runId, events) {
 
     if (event.type === "waiting_approval") {
       renderApprovalCard(runUi, event?.data || {});
-      appendCodexStatusCard(describeCodexEvent(event));
+      appendRunStatusCard(describeRunEvent(event));
       continue;
     }
 
     if (event.type === "approval_decision" || event.type === "approval_granted") {
       updateApprovalCard(runUi, event?.data || {}, event.message || "");
-      appendCodexStatusCard(describeCodexEvent(event));
+      appendRunStatusCard(describeRunEvent(event));
       continue;
     }
 
@@ -3470,7 +3303,7 @@ function renderCodexEvents(runId, events) {
       runUi.streamedReasoningText = finalReasoningText;
       const finalReasoningBlocks = splitReasoningText(finalReasoningText);
       if (runUi.allowAssistantBubble && (finalAssistantText || runUi.assistantNode || finalReasoningBlocks.length)) {
-        upsertCodexAssistantBubble(
+        upsertRunAssistantBubble(
           runUi,
           finalAssistantText,
           false,
@@ -3482,13 +3315,13 @@ function renderCodexEvents(runId, events) {
       if (runUi.backend === "codex" && event.type === "completed" && !assistantText && !reasoningText) {
         continue;
       }
-      appendCodexStatusCard(describeCodexEvent(event));
+      appendRunStatusCard(describeRunEvent(event));
       continue;
     }
 
     if (event.type === "thinking") {
       if (runUi.allowAssistantBubble && (runUi.streamedAssistantText || runUi.streamedReasoningText || runUi.assistantNode)) {
-        upsertCodexAssistantBubble(
+        upsertRunAssistantBubble(
           runUi,
           runUi.streamedAssistantText,
           true,
@@ -3499,15 +3332,15 @@ function renderCodexEvents(runId, events) {
     }
 
     if (event.type === "tool_result" || event.type === "calling_tool" || event.type === "thinking" || event.type === "cancel_requested") {
-      appendCodexStatusCard(describeCodexEvent(event));
+      appendRunStatusCard(describeRunEvent(event));
       continue;
     }
 
-    appendCodexStatusCard(describeCodexEvent(event));
+    appendRunStatusCard(describeRunEvent(event));
   }
 }
 
-function describeCodexEvent(event) {
+function describeRunEvent(event) {
   const type = String(event?.type || "codex");
   const status = String(event?.status || type);
   const data = event?.data && typeof event.data === "object" ? event.data : {};
@@ -3521,7 +3354,7 @@ function describeCodexEvent(event) {
 
   switch (type) {
     case "thinking":
-      return { ...base, label: "Thinking", text: event.message || "Codex run started." };
+      return { ...base, label: "Thinking", text: event.message || "Run started." };
     case "calling_tool":
       return { ...base, label: "Browser Action", text: event.message || "Running a browser action." };
     case "tool_result":
@@ -3537,17 +3370,17 @@ function describeCodexEvent(event) {
     case "approval_granted":
       return { ...base, label: "Approval Granted", text: event.message || "Approval granted." };
     case "completed":
-      return { ...base, label: "Completed", text: event.message || "Codex run completed." };
+      return { ...base, label: "Completed", text: event.message || "Run completed." };
     case "failed":
-      return { ...base, label: "Failed", text: event.message || "Codex run failed." };
+      return { ...base, label: "Failed", text: event.message || "Run failed." };
     case "cancel_requested":
       return { ...base, label: "Cancel Requested", text: event.message || "Cancellation requested." };
     case "cancelled":
-      return { ...base, label: "Cancelled", text: event.message || "Codex run cancelled." };
+      return { ...base, label: "Cancelled", text: event.message || "Run cancelled." };
     case "blocked_for_review":
-      return { ...base, label: "Blocked", text: event.message || "Codex run blocked for review." };
+      return { ...base, label: "Blocked", text: event.message || "Run blocked for review." };
     default:
-      return { ...base, label: "Codex", text: event.message || type || "Codex event" };
+      return { ...base, label: "Run", text: event.message || type || "Run event" };
   }
 }
 
@@ -3621,7 +3454,7 @@ function renderApprovalCard(runUi, approval) {
   cancelRunBtn.className = "ghost";
   cancelRunBtn.textContent = "Cancel Run";
   cancelRunBtn.addEventListener("click", async () => {
-    await cancelCodexRun(runUi.runId, card);
+    await cancelRun(runUi.runId, card);
   });
 
   buttonRow.appendChild(approveBtn);
@@ -3665,7 +3498,7 @@ async function submitApprovalDecision(runUi, approvalId, decision, card) {
   try {
     setApprovalCardBusy(card, true, decision === "approve" ? "Submitting approval..." : "Submitting denial...");
     const result = await sendRuntimeMessage({
-      type: "assistant.codex.run.approval",
+      type: "assistant.run.approval",
       runId: runUi.runId,
       approvalId,
       decision
@@ -3679,19 +3512,19 @@ async function submitApprovalDecision(runUi, approvalId, decision, card) {
   }
 }
 
-async function cancelCodexRun(runId, card = null) {
+async function cancelRun(runId, card = null) {
   try {
     if (card) {
       setApprovalCardBusy(card, true, "Canceling run...");
     }
     const result = await sendRuntimeMessage({
-      type: "assistant.codex.run.cancel",
+      type: "assistant.run.cancel",
       runId
     });
     if (!result.ok) {
       throw new Error(result.error || "Run cancel failed.");
     }
-    state.activeCodexRunId = "";
+    state.activeRunId = "";
     if (card) {
       setApprovalCardBusy(card, true, "Run canceled.");
     }
@@ -3719,7 +3552,7 @@ function setApprovalCardBusy(card, disabled, statusText) {
   }
 }
 
-function upsertCodexAssistantBubble(runUi, text, pending = true, reasoningBlocks = null) {
+function upsertRunAssistantBubble(runUi, text, pending = true, reasoningBlocks = null) {
   const reasoningState = normalizeReasoningPayload(reasoningBlocks);
   if (!text && !reasoningState.text.trim() && !reasoningState.blocks.length) {
     return;
@@ -3821,7 +3654,7 @@ function normalizeReasoningPayload(reasoning) {
   };
 }
 
-function appendCodexStatusCard(eventSummary) {
+function appendRunStatusCard(eventSummary) {
   if (!eventSummary?.text) {
     return null;
   }
@@ -3836,7 +3669,7 @@ function appendCodexStatusCard(eventSummary) {
 
   const label = document.createElement("div");
   label.className = "codex-status-label";
-  label.textContent = eventSummary.label || "Codex";
+  label.textContent = eventSummary.label || "Run";
   head.appendChild(label);
 
   if (eventSummary.timestamp) {
@@ -3886,10 +3719,6 @@ function buildPendingReasoningPayload(text) {
   };
 }
 
-function usesCodexRunProtocol() {
-  return true;
-}
-
 function isTerminalRunStatus(status) {
   return ["completed", "failed", "cancelled", "blocked_for_review"].includes(String(status || ""));
 }
@@ -3900,10 +3729,9 @@ function setBusy(busy) {
 }
 
 function updateComposerState() {
-  const locked = state.busy || Boolean(state.activeCodexRunId);
-  const hasActiveCodex = Boolean(state.activeCodexRunId);
-  const hasActiveLegacy = Boolean(state.activeLegacyRequestId);
-  const showStop = hasActiveCodex || hasActiveLegacy;
+  const locked = state.busy || Boolean(state.activeRunId);
+  const hasActiveRun = Boolean(state.activeRunId);
+  const showStop = hasActiveRun;
   const browserActionSupported = ["codex", "llama", "mlx"].includes(String(backendEl.value || ""));
   const llamaSelected = isLlamaChatBackend();
   sendBtn.disabled = locked;
@@ -3930,11 +3758,11 @@ function updateComposerState() {
   syncReadAssistantQuickActionState();
   stopBtn.classList.toggle("hidden", !showStop);
   stopBtn.disabled = !showStop || state.stopping;
-  stopBtn.textContent = state.stopping ? "Stopping..." : hasActiveCodex ? "Stop Run" : "Stop";
+  stopBtn.textContent = state.stopping ? "Stopping..." : hasActiveRun ? "Stop Run" : "Stop";
   if (state.busy) {
     sendBtn.textContent = "Sending...";
-  } else if (state.activeCodexRunId) {
-    sendBtn.textContent = "Codex Running";
+  } else if (state.activeRunId) {
+    sendBtn.textContent = "Run Active";
   } else if (hasRewriteTarget()) {
     sendBtn.textContent = "Resend Edit";
   } else {
@@ -4015,8 +3843,8 @@ function startRewriteFromMessage(messageIndex, text) {
   if (!Number.isInteger(messageIndex) || messageIndex < 0) {
     return;
   }
-  if (state.busy || state.activeCodexRunId || state.activeLegacyRequestId) {
-    appendMessage("system", "Finish the active request before editing a prior prompt.");
+  if (state.busy || state.activeRunId) {
+    appendMessage("system", "Finish the active run before editing a prior prompt.");
     return;
   }
   state.pendingConfirmation = false;
@@ -4054,7 +3882,7 @@ function applyLocalRewritePreview(messageIndex, prompt) {
     clearMessages();
   }
 
-  state.codexRunUi = new Map();
+  state.runUi = new Map();
   appendMessage("user", prompt, false, "", messageIndex);
 }
 

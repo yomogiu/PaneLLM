@@ -20,23 +20,29 @@ Chrome side panel for the local broker.
 - High-risk prompts require confirmation before sending
 - Saved conversations are persisted by the broker, not the extension
 
-## Browser relay
+## Broker interaction
 
-The background worker registers with the broker and executes browser commands through:
+The background worker registers with the broker browser relay through:
 
 - `POST /extension/register`
 - `GET /extension/next`
 - `POST /extension/result`
 
-Host allowlists are enforced in the extension before navigation or interaction actions run.
+Interactive chat uses the broker run API:
 
-## Codex modes
+- `POST /runs`
+- `GET /runs/<run_id>/events`
+- `POST /runs/<run_id>/approval`
+- `POST /runs/<run_id>/cancel`
 
-The panel supports three Codex shapes:
+Rewrite uses the same `POST /runs` call with `rewrite_message_index`.
 
-- `Responses` mode: interactive run timeline, polling, approvals, cancel, and reload-safe run replay
-- `CLI` mode: multi-turn chat through the locally installed `codex` binary using its ChatGPT login
-- `Legacy` mode: falls back to the broker’s deprecated `/route` Codex request path
+## Codex backends
+
+The panel supports two Codex backends:
+
+- `Responses` mode: interactive run timeline, polling, approvals, cancel, and reload-safe replay
+- `CLI` mode: multi-turn chat through the local `codex` binary using its ChatGPT login
 
 The panel automatically uses:
 
@@ -45,18 +51,16 @@ The panel automatically uses:
 
 ## Runtime message types
 
-Background worker RPC now supports:
+Background worker RPC supports:
 
 - `assistant.health`
-- `assistant.query`
-- `assistant.codex.run.start`
-- `assistant.codex.run.events`
-- `assistant.codex.run.approval`
-- `assistant.codex.run.cancel`
+- `assistant.run.start`
+- `assistant.run.events`
+- `assistant.run.approval`
+- `assistant.run.cancel`
 - `assistant.history.list`
 - `assistant.history.get`
 - `assistant.history.delete`
-- `assistant.history.rewrite`
 - `assistant.models.get`
 - `assistant.mlx.status`
 - `assistant.mlx.config`

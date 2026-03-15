@@ -10,7 +10,7 @@ Add a local MLX backend that appears in the extension backend dropdown, with bro
 
 - [x] Extend backend routing from `{llama,codex}` to `{llama,codex,mlx}` across extension + broker contracts.
 - [x] Add broker-managed MLX worker lifecycle (`start`, `stop`, `restart`, `status`) with health/readiness checks.
-- [x] Keep `/route` as the primary inference path; support `backend=mlx`.
+- [x] Keep the unified `/runs` surface as the primary inference path; support `backend=mlx`.
 - [x] Add model discovery/state endpoint so extension can populate backend/model selectors.
 
 ### 2) Extension Models tab
@@ -73,7 +73,7 @@ Add a local MLX backend that appears in the extension backend dropdown, with bro
 
 ## Goal
 
-Expose browser tools to Codex when the extension uses broker `/route` + Codex CLI fallback, without global `codex mcp add` registration.
+Expose browser tools to Codex when the extension uses broker `/runs` + Codex CLI fallback, without global `codex mcp add` registration.
 
 ## Architecture Design
 
@@ -81,8 +81,8 @@ Expose browser tools to Codex when the extension uses broker `/route` + Codex CL
 
 Request flow:
 
-1. Sidepanel sends `assistant.query` (`backend=codex`) to extension background.
-2. Background sends `/route` to broker with `allowed_hosts`.
+1. Sidepanel sends `assistant.run.start` (`backend=codex`) to extension background.
+2. Background sends `POST /runs` to broker with `allowed_hosts`.
 3. Broker enters Codex CLI path and launches:
    - `codex exec ...` (new conversation), or
    - `codex exec resume <session_id> ...` (continuation)
@@ -133,7 +133,7 @@ Behavior requirements:
 - Add helper builders for TOML-safe `-c` values.
 - Inject per-run MCP overrides in both `codex exec` and `codex exec resume`.
 - Pass extension allowlist into MCP env (`MCP_BROWSER_USE_ALLOWED_HOSTS`).
-- Keep change local to broker CLI path (`/route` codex fallback).
+- Keep change local to broker CLI-backed run path.
 
 ### Phase B (next)
 
@@ -170,4 +170,4 @@ Behavior requirements:
 5. Broker still works in:
    - Responses mode
    - CLI mode without MCP server path
-   - Legacy command mode
+   - CLI mode without browser MCP injection

@@ -1,110 +1,106 @@
-# Local Broker Setup
+# Local Broker
 
-This broker keeps model routing local, keeps extension storage stateless, and now supports three Codex modes:
+The broker is the local control plane for chat routing, run state, browser automation, MLX runtime management, experiments, training, and conversation persistence.
 
-- `Responses` mode: broker-managed interactive runs over the OpenAI Responses API.
-- `CLI` mode: one-shot calls through the locally installed `codex` binary authenticated with ChatGPT.
-- `Legacy command` mode: deprecated one-shot `CODEX_COMMAND` subprocess execution.
-
-## 1) Start the broker
+## Start
 
 ```bash
 python3 broker/local_broker.py
 ```
 
-Optional environment variables:
+## Core environment
 
-- `BROKER_HOST` (default `127.0.0.1`)
-- `BROKER_PORT` (default `7777`)
-- `BROKER_DATA_DIR` (default `broker/.data`)
-- `LLAMA_URL` (default `http://127.0.0.1:18000/v1/chat/completions`)
-- `LLAMA_MODEL` (optional override; broker auto-detects from `LLAMA_URL` `/v1/models` when available and falls back to `glm-4.7-flash-llamacpp`)
-- `LLAMA_API_KEY` (optional)
-- `OPENAI_API_KEY` (enables Codex Responses mode)
-- `OPENAI_BASE_URL` (default `https://api.openai.com/v1`)
-- `OPENAI_CODEX_MODEL` (default `gpt-5.3-codex`)
-- `OPENAI_CODEX_REASONING_EFFORT` (default `medium`)
-- `OPENAI_CODEX_MAX_OUTPUT_TOKENS` (default `1800`)
-- `CODEX_COMMAND` (optional legacy fallback command)
-- `CODEX_TIMEOUT_SEC` (default `480`)
-- `BROKER_CODEX_CLI_ENABLE_BROWSER_MCP` (default `true`)
-- `BROKER_CODEX_CLI_BROWSER_MCP_NAME` (default `browser_use`)
-- `BROKER_CODEX_CLI_BROWSER_MCP_PYTHON` (default `python3`)
-- `BROKER_CODEX_CLI_BROWSER_MCP_SERVER_PATH` (default `tools/mcp-servers/browser-use/server.py`)
-- `BROKER_CODEX_CLI_BROWSER_MCP_BROKER_URL` (default `http://<broker-host>:<broker-port>`, with loopback fallback)
-- `BROKER_CODEX_CLI_BROWSER_MCP_APPROVAL_MODE` (default `auto-approve`)
-- `BROKER_CODEX_RUN_TIMEOUT_SEC` (default `180`)
-- `BROKER_CODEX_EVENT_POLL_TIMEOUT_MS` (default `20000`)
-- `BROKER_CODEX_ENABLE_BACKGROUND` (reserved, default `false`)
-- `BROKER_MAX_CONTEXT_MESSAGES` (default `32`)
-- `BROKER_MAX_CONTEXT_CHARS` (default `24000`)
-- `BROKER_MAX_SUMMARY_CHARS` (default `5000`)
-- `BROKER_BROWSER_COMMAND_TIMEOUT_SEC` (default `25`)
-- `BROKER_EXTENSION_CLIENT_STALE_SEC` (default `90`)
-- `BROKER_DEFAULT_DOMAIN_ALLOWLIST` (default `127.0.0.1,localhost`)
-- `BROKER_MLX_MODEL_PATH` (required to enable MLX backend)
-- `BROKER_MLX_WORKER_PYTHON` (default `python3`)
-- `BROKER_MLX_WORKER_PATH` (default `broker/mlx_worker.py`)
-- `BROKER_MLX_START_TIMEOUT_SEC` (default `60`)
-- `BROKER_MLX_STOP_TIMEOUT_SEC` (default `8`)
-- `BROKER_MLX_GENERATION_TIMEOUT_SEC` (default `180`)
-- `BROKER_MLX_MAX_CONTEXT_CHARS` (default `56000`, capped at `56000`)
-- `BROKER_MLX_DEFAULT_TEMPERATURE` (default `0.2`)
-- `BROKER_MLX_DEFAULT_TOP_P` (default `0.95`)
-- `BROKER_MLX_DEFAULT_TOP_K` (default `50`)
-- `BROKER_MLX_DEFAULT_MAX_TOKENS` (default `512`)
-- `BROKER_MLX_DEFAULT_REPETITION_PENALTY` (default `1.0`)
-- `BROKER_MLX_DEFAULT_SEED` (optional)
-- `BROKER_MLX_DEFAULT_ENABLE_THINKING` (default `false`)
-- `BROKER_MLX_DEFAULT_SYSTEM_PROMPT` (optional)
-- `BROKER_EXPERIMENT_WORKER_PYTHON` (default `python3`)
-- `BROKER_EXPERIMENT_WORKER_PATH` (default `broker/experiment_worker.py`)
-- `BROKER_EXPERIMENT_JOB_TIMEOUT_SEC` (default `900`)
+- `BROKER_HOST` default `127.0.0.1`
+- `BROKER_PORT` default `7777`
+- `BROKER_DATA_DIR` default `broker/.data`
+- `LLAMA_URL` default `http://127.0.0.1:18000/v1/chat/completions`
+- `LLAMA_MODEL` optional override
+- `LLAMA_API_KEY` optional
+- `OPENAI_API_KEY` enables Codex Responses mode
+- `OPENAI_BASE_URL` default `https://api.openai.com/v1`
+- `OPENAI_CODEX_MODEL` default `gpt-5.3-codex`
+- `OPENAI_CODEX_REASONING_EFFORT` default `medium`
+- `OPENAI_CODEX_MAX_OUTPUT_TOKENS` default `1800`
+- `CODEX_TIMEOUT_SEC` default `480`
+- `BROKER_CODEX_CLI_ENABLE_BROWSER_MCP` default `true`
+- `BROKER_CODEX_CLI_BROWSER_MCP_NAME` default `browser_use`
+- `BROKER_CODEX_CLI_BROWSER_MCP_PYTHON` default `python3`
+- `BROKER_CODEX_CLI_BROWSER_MCP_SERVER_PATH` default `tools/mcp-servers/browser-use/server.py`
+- `BROKER_CODEX_CLI_BROWSER_MCP_BROKER_URL` default `http://<broker-host>:<broker-port>` with loopback fallback
+- `BROKER_CODEX_CLI_BROWSER_MCP_APPROVAL_MODE` default `auto-approve`
+- `BROKER_CODEX_RUN_TIMEOUT_SEC` default `180`
+- `BROKER_CODEX_EVENT_POLL_TIMEOUT_MS` default `20000`
+- `BROKER_CODEX_ENABLE_BACKGROUND` reserved, default `false`
+- `BROKER_MAX_CONTEXT_MESSAGES` default `32`
+- `BROKER_MAX_CONTEXT_CHARS` default `24000`
+- `BROKER_MAX_SUMMARY_CHARS` default `5000`
+- `BROKER_BROWSER_COMMAND_TIMEOUT_SEC` default `25`
+- `BROKER_EXTENSION_CLIENT_STALE_SEC` default `90`
+- `BROKER_DEFAULT_DOMAIN_ALLOWLIST` default `127.0.0.1,localhost`
+- `BROKER_MLX_MODEL_PATH` required to enable MLX
+- `BROKER_MLX_WORKER_PYTHON` default `python3`
+- `BROKER_MLX_WORKER_PATH` default `broker/mlx_worker.py`
+- `BROKER_MLX_START_TIMEOUT_SEC` default `60`
+- `BROKER_MLX_STOP_TIMEOUT_SEC` default `8`
+- `BROKER_MLX_GENERATION_TIMEOUT_SEC` default `180`
+- `BROKER_MLX_MAX_CONTEXT_CHARS` default `56000`, capped at `56000`
+- `BROKER_MLX_DEFAULT_TEMPERATURE` default `0.2`
+- `BROKER_MLX_DEFAULT_TOP_P` default `0.95`
+- `BROKER_MLX_DEFAULT_TOP_K` default `50`
+- `BROKER_MLX_DEFAULT_MAX_TOKENS` default `512`
+- `BROKER_MLX_DEFAULT_REPETITION_PENALTY` default `1.0`
+- `BROKER_MLX_DEFAULT_SEED` optional
+- `BROKER_MLX_DEFAULT_ENABLE_THINKING` default `false`
+- `BROKER_MLX_DEFAULT_SYSTEM_PROMPT` optional
+- `BROKER_EXPERIMENT_WORKER_PYTHON` default `python3`
+- `BROKER_EXPERIMENT_WORKER_PATH` default `broker/experiment_worker.py`
+- `BROKER_EXPERIMENT_JOB_TIMEOUT_SEC` default `900`
+- `BROKER_TRAINING_WORKER_PYTHON` default `python3`
+- `BROKER_TRAINING_WORKER_PATH` default `broker/training_worker.py`
+- `BROKER_TRAINING_JOB_TIMEOUT_SEC` default `7200`
 
-## `/health`
+## Health
 
-`GET /health` returns broker readiness plus Codex mode:
+`GET /health` reports broker readiness:
 
 ```json
 {
   "ok": true,
   "codex_configured": true,
-  "codex_backend": "responses_ready | cli_ready | legacy_command | disabled",
+  "codex_backend": "responses_ready | cli_ready | disabled",
   "codex_responses_ready": true,
   "codex_cli_ready": false,
-  "codex_legacy_command": false,
-  "mlx": {
-    "available": true,
-    "status": "running",
-    "worker_pid": 12345,
-    "last_error": ""
-  }
+  "extension_relay": {},
+  "browser_automation": {},
+  "codex_runs": {},
+  "llama": {},
+  "mlx": {},
+  "experiments": {},
+  "training": {}
 }
 ```
 
-If the official `codex` CLI is installed and `codex login status` reports a ChatGPT login, broker health will report `codex_backend: cli_ready` without requiring `OPENAI_API_KEY`.
+`codex_backend` is:
 
-## Codex Responses run API
+- `responses_ready` when `OPENAI_API_KEY` is set
+- `cli_ready` when the local `codex` CLI is installed and logged in
+- `disabled` when neither Codex path is available
 
-The side panel uses these broker endpoints when `OPENAI_API_KEY` is set:
+## Run API
 
-- `POST /codex/runs`
-- `GET /codex/runs/<run_id>/events?after=<seq>&timeout_ms=<n>`
-- `POST /codex/runs/<run_id>/approval`
-- `POST /codex/runs/<run_id>/cancel`
-
-Unified run API (all backends, same underlying manager):
+Interactive chat for `codex`, `llama`, and `mlx` uses one run surface:
 
 - `POST /runs`
 - `GET /runs/<run_id>/events?after=<seq>&timeout_ms=<n>`
 - `POST /runs/<run_id>/approval`
 - `POST /runs/<run_id>/cancel`
 
-`POST /codex/runs` request shape:
+`POST /runs` request shape:
 
 ```json
 {
   "session_id": "string",
+  "backend": "codex | llama | mlx",
   "prompt": "string",
   "rewrite_message_index": 2,
   "chat_template_kwargs": "{\"enable_thinking\":true,\"clear_thinking\":false}",
@@ -122,6 +118,13 @@ Unified run API (all backends, same underlying manager):
 }
 ```
 
+Notes:
+
+- `rewrite_message_index` rewrites a prior user turn and truncates later turns before the new run starts.
+- `chat_template_kwargs` and `reasoning_budget` are forwarded to llama.cpp when `backend` is `llama`.
+- `force_browser_action` requires an active extension relay client and at least one allowlisted host.
+- High-risk prompts return `requires_confirmation: true` until the caller confirms.
+
 Response shape:
 
 ```json
@@ -130,133 +133,63 @@ Response shape:
   "run_id": "run_...",
   "status": "thinking",
   "conversation_id": "string",
+  "backend": "codex",
   "backend_metadata": {
-    "mode": "responses",
+    "mode": "responses | cli | llama | mlx",
     "model": "gpt-5.3-codex",
-    "browser_tools_enabled": true
+    "browser_tools_enabled": true,
+    "browser_action_forced": false,
+    "llama_request_options": {}
   }
 }
 ```
 
 Event feed notes:
 
-- Events are persisted under `broker/.data/codex_runs/<run_id>.json`.
-- Conversation files keep `messages` as user/assistant only.
-- Codex metadata is stored separately on the conversation under `conversation.codex`.
+- Run files are persisted under `broker/.data/codex_runs/<run_id>.json`.
+- Conversation files keep user and assistant messages only.
+- Codex-specific replay state lives under `conversation.codex`.
 
-Approval policy in v1:
+## Browser automation
 
-- Auto-approve: `browser.get_tabs`, `browser.describe_session_tabs`, `browser.get_content`, `browser.find_one`, `browser.find_elements`, `browser.wait_for`, `browser.get_element_state`, `browser.scroll`, `browser.highlight`, `browser.switch_tab`, `browser.focus_tab`
-- Manual approval: `browser.navigate`, `browser.open_tab`, `browser.click`, `browser.type`, `browser.press_key`, `browser.close_tab`, `browser.group_tabs`, `browser.select_option`
-- Non-allowlisted hosts are denied before the extension executes anything
+The broker owns browser tool schemas and policy. The canonical tool catalog lives in `broker/browser_tools.py` and is shared by broker-native and MCP surfaces.
 
-## Codex CLI fallback
+Broker endpoints:
 
-When `OPENAI_API_KEY` is not set but the local `codex` CLI is installed and logged in, `/route` can use the local CLI automatically.
+- `GET /browser/config`
+- `POST /browser/config`
+- `POST /browser/tools/call`
+- `GET /browser/health`
 
-Current broker behavior in CLI mode:
+`POST /browser/tools/call` accepts:
+
+```json
+{
+  "name": "browser.navigate",
+  "arguments": {}
+}
+```
+
+Important tool behavior:
+
+- `browser.get_content` defaults to a compact navigation digest.
+- Pass `{"mode":"raw_html"}` only when raw HTML is explicitly required.
+- Auto-approve tools and manual-approval tools are derived from the shared catalog, not hand-maintained separately per surface.
+
+## Codex CLI behavior
+
+When `OPENAI_API_KEY` is not set but the local `codex` CLI is installed and logged in, the broker uses CLI-backed runs.
+
+Current behavior:
 
 - Runs `codex exec` non-interactively for the first turn
-- Persists the local Codex CLI session id per broker conversation
-- Uses `codex exec resume <session_id>` on later turns for multi-turn chat continuity
+- Persists the local Codex CLI session id per conversation
+- Uses `codex exec resume <session_id>` on later turns
 - Uses local ChatGPT-authenticated credentials from the official CLI
-- Uses a read-only sandbox on the initial CLI turn
-- Injects a session-scoped MCP server override (`mcp_servers.browser_use`) per invocation when the extension relay is connected
-- Passes broker URL and allowlisted hosts to that MCP server via per-run `-c` config overrides (no global `codex mcp add` required)
+- Injects a session-scoped browser MCP override when the extension relay is connected
+- Passes broker URL and allowlisted hosts to that MCP server via per-run config overrides
 
-This mode gives you subscription-backed Codex chat without an API key, but it does not power the interactive `/codex/runs` event/approval flow.
-
-## Legacy Codex command
-
-If `CODEX_COMMAND` is set, `/route` still supports the deprecated one-shot Codex path.
-
-The broker writes JSON to stdin:
-
-```json
-{
-  "session_id": "string",
-  "prompt": "string",
-  "messages": [{"role": "user|assistant", "content": "string"}]
-}
-```
-
-The command may return:
-
-- Plain text on stdout, or
-- JSON with an `answer` field, for example `{"answer":"..."}`.
-
-## `/route` browser behavior
-
-- `POST /route` now accepts an optional `request_id` (`[A-Za-z0-9._-]{1,128}`) so the extension can cancel in-flight requests.
-- `POST /route` also accepts optional `rewrite_message_index` to rewrite a prior user turn and truncate later turns before re-running.
-- `POST /route/cancel` accepts `{ "session_id": "...", "request_id": "..." }` and marks that route request as cancelled.
-- Cancel is best-effort for remote HTTP model calls and immediate for local subprocess-backed Codex CLI/legacy calls.
-- The extension sends its normalized host allowlist with `/route`.
-- `POST /route` accepts optional `force_browser_action` (boolean) for `llama`, `codex`, and `mlx` requests.
-- For `llama` and `mlx` requests, this enables a browser tool loop through the extension relay when a client is connected.
-- Broker-side browser policy falls back to `BROKER_DEFAULT_DOMAIN_ALLOWLIST` only when the request does not provide `allowed_hosts`.
-- For `codex` CLI requests over `/route`, broker can inject the local `browser-use` MCP bridge on that run only, using the same allowlist.
-- When `force_browser_action` is true, broker requires extension relay availability and at least one allowlisted host.
-- For `codex` requests, broker adds a strict browser-action system instruction.
-- `codex` requests through `/route` use, in order: local Codex Responses runs only when the extension selects `/codex/runs`, then local `codex` CLI when available, then `CODEX_COMMAND` if configured.
-
-`POST /route` request shape (new fields emphasized):
-
-```json
-{
-  "session_id": "string",
-  "request_id": "req_abc123",
-  "backend": "llama | codex | mlx",
-  "prompt": "string",
-  "rewrite_message_index": 2,
-  "chat_template_kwargs": "{\"enable_thinking\":true,\"clear_thinking\":false}",
-  "reasoning_budget": -1,
-  "page_context": {
-    "title": "string",
-    "url": "string",
-    "selection": "string",
-    "text_excerpt": "string"
-  },
-  "allowed_hosts": ["localhost"],
-  "force_browser_action": false,
-  "confirmed": false,
-  "risk_signals": ["high_risk_prompt"]
-}
-```
-
-For `backend: "llama"`, `chat_template_kwargs` and `reasoning_budget`
-are passed through to the upstream llama.cpp chat-completions request when provided.
-`chat_template_kwargs` may be sent to the broker as either an object or a JSON string;
-the broker normalizes it to an object on the outgoing llama.cpp request.
-
-`POST /route` response includes:
-
-```json
-{
-  "requires_confirmation": false,
-  "request_id": "req_abc123",
-  "cancelled": false,
-  "answer": "...",
-  "context_usage": {
-    "backend": "mlx",
-    "used_chars": 1120,
-    "limit_chars": 24000,
-    "messages_used": 12,
-    "max_messages": 32,
-    "truncated": false,
-    "summary_included": false,
-    "summary_chars": 0,
-    "truncated_dropped_messages": 0
-  },
-  "reasoning_hidden": true,
-  "reasoning_hidden_chars": 812,
-  "reasoning_blocks": ["reasoning text block 1", "reasoning text block 2"]
-}
-```
-
-## MLX API and contract
-
-Broker endpoints for MLX runtime control:
+## MLX endpoints
 
 - `GET /models`
 - `GET /mlx/status`
@@ -268,181 +201,17 @@ Broker endpoints for MLX runtime control:
 - `POST /mlx/adapters/load`
 - `POST /mlx/adapters/unload`
 
-`POST /mlx/config` updates MLX generation parameters and optional persistent system prompt:
+MLX contract highlights:
 
-```json
-{
-  "generation": {
-    "temperature": 0.2,
-    "top_p": 0.95,
-    "top_k": 50,
-    "max_tokens": 512,
-    "repetition_penalty": 1.0,
-    "seed": null,
-    "enable_thinking": false
-  },
-  "system_prompt": "You are a helpful local assistant."
-}
-```
+- Versioned schema: `mlx_chat_v1`
+- OpenAI-style message format
+- No tool calls in v1
+- Tail truncation by char budget
+- Runtime generation config is persisted under `broker/.data/mlx_config.json`
 
-`GET /models` response includes backend availability and MLX status:
+## Experiments and training
 
-```json
-{
-  "backends": [
-    { "id": "codex", "label": "Codex", "available": true },
-    { "id": "llama", "label": "llama.cpp", "available": true },
-    { "id": "mlx", "label": "MLX Local", "available": true }
-  ],
-  "mlx": {
-    "status": "running",
-    "model_path": "/models/my-mlx-model",
-    "generation_config": {
-      "temperature": 0.2,
-      "top_p": 0.95,
-      "top_k": 50,
-      "max_tokens": 512,
-      "repetition_penalty": 1.0,
-      "seed": null,
-      "enable_thinking": false
-    },
-    "system_prompt": "You are a helpful local assistant.",
-    "contract": {
-      "schema_version": "mlx_chat_v1",
-      "message_format": "openai_chat_messages_v1",
-      "tool_call_format": "none_v1",
-      "chat_template_assumption": "qwen_jinja_default_or_plaintext_fallback_v1",
-      "tokenizer_template_mode": "apply_chat_template_default_v1",
-      "max_context_behavior": "tail_truncate_chars_v1",
-      "max_context_chars": 56000
-    }
-  }
-}
-```
-
-MLX worker contract is explicit and versioned so future training pipelines can target it safely:
-
-- Message format: OpenAI-style chat messages with `role` in `{system,user,assistant}` and string `content`.
-- Tool-call format: none in v1 (`tool_call_format: none_v1`).
-- Chat template assumption: broker/worker prefers tokenizer-default Qwen-style Jinja templating first, with a plaintext role-header fallback when unavailable:
-  - `ROLE:\n<content>` joined by blank lines.
-- Thinking output is controlled by `generation.enable_thinking` (runtime + persisted config). Default is disabled unless explicitly enabled.
-- When MLX system prompt is configured, broker prepends it as a leading `system` message before worker generation.
-- Tokenizer template assumption: enabled by default in v1 (`tokenizer_template_mode: apply_chat_template_default_v1`) with fallback below.
-- Max-context behavior: char-tail truncation (`max_context_behavior: tail_truncate_chars_v1`).
-- Llama/Codex use `BROKER_MAX_CONTEXT_CHARS` with a minimum effective value of `2000`.
-- MLX uses `BROKER_MLX_MAX_CONTEXT_CHARS`, capped at `56000`, with a minimum effective value of `2000`.
-
-`generate` broker->worker payload (internal contract):
-
-```json
-{
-  "request_id": "mlx_...",
-  "op": "generate",
-  "schema_version": "mlx_chat_v1",
-  "contract": {
-    "schema_version": "mlx_chat_v1",
-    "message_format": "openai_chat_messages_v1",
-    "tool_call_format": "none_v1",
-      "chat_template_assumption": "qwen_jinja_default_or_plaintext_fallback_v1",
-      "tokenizer_template_mode": "apply_chat_template_default_v1",
-    "max_context_behavior": "tail_truncate_chars_v1",
-    "max_context_chars": 56000
-  },
-  "messages": [
-    { "role": "system", "content": "You are a helpful local assistant." },
-    { "role": "user", "content": "Hi" }
-  ],
-  "params": {
-    "temperature": 0.2,
-    "top_p": 0.95,
-    "top_k": 50,
-    "max_tokens": 512,
-    "repetition_penalty": 1.0,
-    "seed": null,
-    "enable_thinking": false
-  }
-}
-```
-
-## Browser automation API
-
-The broker exposes browser-agent config plus the manual test endpoint:
-
-- `GET /browser/config`
-- `POST /browser/config`
-
-- `POST /browser/tools/call`
-
-`/browser/config` response shape:
-
-```json
-{
-  "ok": true,
-  "browser": {
-    "agent_max_steps": 20,
-    "limits": {
-      "agent_max_steps": {
-        "min": 1,
-        "max": 40
-      }
-    }
-  }
-}
-```
-
-`POST /browser/config` request shape:
-
-```json
-{
-  "agent_max_steps": 20
-}
-```
-
-Request shape:
-
-```json
-{
-  "name": "browser.session_create | browser.run_start | browser.run_cancel | browser.approvals_list | browser.events_replay | browser.approve | browser.navigate | browser.get_content | browser.get_tabs | browser.open_tab | browser.switch_tab | browser.close_tab | browser.focus_tab | browser.group_tabs | browser.describe_session_tabs | browser.click | browser.type | browser.press_key | browser.scroll | browser.highlight | browser.find_one | browser.find_elements | browser.wait_for | browser.get_element_state | browser.select_option",
-  "arguments": {}
-}
-```
-
-Notes:
-
-- `browser.get_content` now defaults to a compact navigation digest.
-- Pass `{"mode":"raw_html"}` in `arguments` only when raw HTML is explicitly required.
-
-Response shape:
-
-```json
-{
-  "content": [{"type": "text", "text": "..."}],
-  "structured_content": {},
-  "is_error": false
-}
-```
-
-
-## Read Assistant
-
-The read assistant is a chat-first page-reading flow. It reuses the broker's existing chat routing,
-page-context attachment, and browser tool surface instead of persisting paper artifacts or running a
-paper job pipeline.
-
-Current behavior:
-
-- Works on allowlisted HTML pages, with ArXiv HTML as the best-supported shape.
-- Expands `page_context` with title, selection, heading path, local selection context, and a bounded page excerpt.
-- Uses `browser.highlight` for temporary highlight-and-scroll guidance when the model needs to point to a section.
-- Keeps reading continuity in the existing chat conversation. There is no read-session database or paper store.
-
-There are no dedicated `/papers*` broker endpoints in the active chat-first read flow.
-
-## Experiment API
-
-
-MLX experiments are broker-managed async jobs backed by a separate experiment worker.
+Experiment endpoints:
 
 - `POST /experiments/jobs`
 - `GET /experiments/jobs/<job_id>`
@@ -452,110 +221,39 @@ MLX experiments are broker-managed async jobs backed by a separate experiment wo
 - `GET /jobs?kind=experiment|training&status=...`
 - `POST /jobs/<job_id>/cancel`
 
-`POST /experiments/jobs` request shape:
+Training endpoints:
 
-```json
-{
-  "kind": "prompt_eval | adapter_eval",
-  "model_path": "/models/my-mlx-model",
-  "adapter_path": "/path/to/adapter",
-  "prompt_set": [
-    { "id": "prompt_01", "prompt": "Say hello", "reference": "Hello" }
-  ],
-  "generation": {
-    "temperature": 0.2,
-    "top_p": 0.95,
-    "top_k": 50,
-    "max_tokens": 512,
-    "repetition_penalty": 1.0,
-    "seed": null,
-    "enable_thinking": false
-  },
-  "system_prompt": "optional"
-}
-```
+- `POST /mlx/training/datasets/import`
+- `GET /mlx/training/datasets`
+- `GET /mlx/training/datasets/<dataset_id>`
+- `DELETE /mlx/training/datasets/<dataset_id>`
+- `POST /mlx/training/jobs`
+- `GET /mlx/training/jobs/<job_id>`
+- `GET /mlx/training/runs`
+- `GET /mlx/training/runs/<run_id>`
+- `POST /mlx/training/checkpoints/promote`
 
-Notes:
+## Extension relay and conversations
 
-- Experiment jobs currently target `mlx` only.
-- Batch experiments use a separate worker process so adapter evaluation does not mutate the shared interactive MLX runtime.
-- Experiment comparison now reports latency deltas plus exact-match and contains-reference deltas when reference labels are available.
-- If local MLX startup fails, the job records the worker failure reason in `job.error.message`. On this runtime class of failure, the surfaced message may explicitly identify Metal/device initialization crashes rather than only reporting a closed stdout stream.
-
-## Extension command relay API
-
-The extension background worker long-polls broker commands and posts results:
+Extension relay endpoints:
 
 - `POST /extension/register`
 - `GET /extension/next?client_id=<id>&timeout_ms=25000`
 - `POST /extension/result`
 
-## Conversation history API
-
-The broker persists conversations on disk and exposes:
+Conversation endpoints:
 
 - `GET /conversations`
 - `GET /conversations/<id>`
 - `DELETE /conversations/<id>`
-- `POST /conversations/<id>/rewrite`
 
-Conversations are saved whenever user/assistant turns are added.
+Conversation rewrite happens through `POST /runs` with `rewrite_message_index`, not through a separate conversation rewrite endpoint.
 
-Assistant messages may include optional `reasoning_blocks` for debug visibility when the model emitted
-`<think>` or `<thinking>` content.
+## Security properties
 
-`POST /conversations/<id>/rewrite` request shape:
-
-```json
-{
-  "backend": "llama | codex | mlx",
-  "prompt": "string",
-  "request_id": "req_abc123",
-  "rewrite_message_index": 2,
-  "page_context": {
-    "title": "string",
-    "url": "string",
-    "selection": "string",
-    "text_excerpt": "string"
-  },
-  "allowed_hosts": ["localhost"],
-  "confirmed": false,
-  "risk_signals": ["high_risk_prompt"]
-}
-```
-
-Behavior:
-
-- `rewrite_message_index` must target an existing user message.
-- The broker truncates from that message onward, replaces that user prompt, and regenerates from that point.
-
-## 2) Load extension in Chrome
-
-1. Open `chrome://extensions`
-2. Enable **Developer mode**
-3. Click **Load unpacked**
-4. Select `chrome_secure_panel/`
-
-## 3) Security properties
-
-- Side panel data stays in extension runtime memory.
-- No extension `localStorage` usage.
 - Broker accepts loopback clients only.
 - Broker requires `X-Assistant-Client: chrome-sidepanel-v1`.
-- Broker only allows `chrome-extension://...` origins when `Origin` is set.
+- Broker only accepts `chrome-extension://...` origins when `Origin` is present.
 - OpenAI credentials remain broker-side.
-- Codex page context and browser tool output are treated as untrusted input.
-- Suspicious instruction-like page/tool content blocks the run for review.
-
-## 4) Domain allowlist
-
-Use the side panel **Tools** tab to manage runtime allow/disallow hosts.
-
-For source-controlled defaults, edit `DEFAULT_ALLOWED_PAGE_HOSTS` in `chrome_secure_panel/background.js`.
-The default list remains intentionally tight to local domains plus the small demo allowlist in the extension.
-## Service boundaries
-
-- `broker/local_broker.py` remains the public broker control plane for HTTP transport, auth, route matching, singleton ownership, and browser-tool orchestration.
-- `broker/services/mlx_runtime.py` owns MLX runtime/session/adapter orchestration plus broker-side MLX execution helpers.
-- `broker/services/read_assistant.py` owns page-context normalization and read-context rendering for chat.
-- `broker/mlx_worker.py` remains the internal JSON-over-stdio MLX sidecar entrypoint used by the broker-owned MLX runtime service.
+- Page context and browser tool output are treated as untrusted input.
+- Suspicious instruction-like page or tool content can block a run for review.

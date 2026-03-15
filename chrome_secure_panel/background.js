@@ -5,7 +5,6 @@ const RELAY_INITIAL_BACKOFF_MS = 1_000;
 const RELAY_MAX_BACKOFF_MS = 15_000;
 const RELAY_COMMAND_LOOP_VERSION = "0.2.0";
 const PAGE_CONTEXT_TEXT_CHARS = 5_000;
-const FORCED_BROWSER_ACTION_ROUTE_TIMEOUT_MS = 300_000;
 const HOST_POLICY_STORAGE_KEY = "assistant.pageHostPolicy.v1";
 const MAX_POLICY_HOSTS = 256;
 
@@ -24,7 +23,6 @@ const HIGH_RISK_PATTERN =
 let relayLoopStarted = false;
 let relayBackoffMs = RELAY_INITIAL_BACKOFF_MS;
 const relayClientId = `ext_${crypto.randomUUID()}`;
-const inflightRouteQueries = new Map();
 const hostPolicy = {
   allowedHosts: []
 };
@@ -74,23 +72,17 @@ async function handleMessage(message) {
   if (message.type === "assistant.health") {
     return { health: await checkBrokerHealth() };
   }
-  if (message.type === "assistant.query") {
-    return await routeAssistantQuery(message);
+  if (message.type === "assistant.run.start") {
+    return await startAssistantRun(message);
   }
-  if (message.type === "assistant.query.cancel") {
-    return await cancelAssistantQuery(message);
+  if (message.type === "assistant.run.events") {
+    return await pollAssistantRunEvents(message);
   }
-  if (message.type === "assistant.codex.run.start") {
-    return await startCodexRun(message);
+  if (message.type === "assistant.run.approval") {
+    return await submitAssistantRunApproval(message);
   }
-  if (message.type === "assistant.codex.run.events") {
-    return await pollCodexRunEvents(message);
-  }
-  if (message.type === "assistant.codex.run.approval") {
-    return await submitCodexRunApproval(message);
-  }
-  if (message.type === "assistant.codex.run.cancel") {
-    return await cancelCodexRun(message);
+  if (message.type === "assistant.run.cancel") {
+    return await cancelAssistantRun(message);
   }
   if (message.type === "assistant.history.list") {
     return await listConversations();
@@ -100,9 +92,6 @@ async function handleMessage(message) {
   }
   if (message.type === "assistant.history.delete") {
     return await deleteConversation(message);
-  }
-  if (message.type === "assistant.history.rewrite") {
-    return await rewriteConversation(message);
   }
   if (message.type === "assistant.models.get") {
     return await getModels();
@@ -332,73 +321,8 @@ async function buildAssistantBrokerPayload(message) {
   return payload;
 }
 
-async function routeAssistantQuery(message) {
-  validateQueryMessage(message);
-  const requestId = normalizeRequestId(message.requestId);
-  const brokerPayload = await buildAssistantBrokerPayload(message);
-  brokerPayload.backend = message.backend;
-  brokerPayload.request_id = requestId;
-
-  const controller = new AbortController();
-  const timeoutMs = message.forceBrowserAction === true
-    ? FORCED_BROWSER_ACTION_ROUTE_TIMEOUT_MS
-    : 0;
-  let timedOut = false;
-  let timeoutHandle = null;
-  if (timeoutMs > 0) {
-    timeoutHandle = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, timeoutMs);
-  }
-  inflightRouteQueries.set(requestId, controller);
-  try {
-    return await brokerRequest("POST", "/route", brokerPayload, { signal: controller.signal });
-  } catch (error) {
-    if (error?.name === "AbortError") {
-      if (timedOut) {
-        try {
-          await brokerRequest("POST", "/route/cancel", {
-            session_id: message.sessionId,
-            request_id: requestId
-          });
-        } catch {
-          // Best effort cancel after timeout.
-        }
-        throw new Error("Browser action timed out waiting for a final response. Request cancelled.");
-      }
-      return {
-        cancelled: true,
-        request_id: requestId,
-        session_id: message.sessionId,
-        answer: null
-      };
-    }
-    throw error;
-  } finally {
-    if (timeoutHandle) {
-      clearTimeout(timeoutHandle);
-    }
-    inflightRouteQueries.delete(requestId);
-  }
-}
-
-async function cancelAssistantQuery(message) {
-  if (!message?.sessionId || typeof message.sessionId !== "string") {
-    throw new Error("sessionId is required.");
-  }
-  const requestId = normalizeRequestId(message.requestId);
-  const controller = inflightRouteQueries.get(requestId);
-  if (controller) {
-    controller.abort();
-  }
-  return await brokerRequest("POST", "/route/cancel", {
-    session_id: message.sessionId,
-    request_id: requestId
-  });
-}
-
-async function startCodexRun(message) {
+async function startAssistantRun(message) {
+  validateRunStartMessage(message);
   const brokerPayload = await buildAssistantBrokerPayload(message);
   brokerPayload.backend = message.backend;
   if (message.rewriteMessageIndex !== undefined) {
@@ -407,7 +331,7 @@ async function startCodexRun(message) {
   return await brokerRequest("POST", "/runs", brokerPayload);
 }
 
-async function pollCodexRunEvents(message) {
+async function pollAssistantRunEvents(message) {
   if (!message?.runId || typeof message.runId !== "string") {
     throw new Error("runId is required.");
   }
@@ -417,7 +341,7 @@ async function pollCodexRunEvents(message) {
   return await brokerRequest("GET", path);
 }
 
-async function submitCodexRunApproval(message) {
+async function submitAssistantRunApproval(message) {
   if (!message?.runId || typeof message.runId !== "string") {
     throw new Error("runId is required.");
   }
@@ -434,7 +358,7 @@ async function submitCodexRunApproval(message) {
   });
 }
 
-async function cancelCodexRun(message) {
+async function cancelAssistantRun(message) {
   if (!message?.runId || typeof message.runId !== "string") {
     throw new Error("runId is required.");
   }
@@ -460,34 +384,6 @@ async function deleteConversation(message) {
   }
   const path = `/conversations/${encodeURIComponent(message.sessionId)}`;
   return await brokerRequest("DELETE", path);
-}
-
-async function rewriteConversation(message) {
-  validateRewriteMessage(message);
-  const requestId = normalizeRequestId(message.requestId);
-  const brokerPayload = await buildAssistantBrokerPayload(message);
-  brokerPayload.backend = message.backend;
-  brokerPayload.request_id = requestId;
-  brokerPayload.rewrite_message_index = normalizeRewriteMessageIndex(message.messageIndex);
-
-  const controller = new AbortController();
-  inflightRouteQueries.set(requestId, controller);
-  try {
-    const path = `/conversations/${encodeURIComponent(message.sessionId)}/rewrite`;
-    return await brokerRequest("POST", path, brokerPayload, { signal: controller.signal });
-  } catch (error) {
-    if (error?.name === "AbortError") {
-      return {
-        cancelled: true,
-        request_id: requestId,
-        session_id: message.sessionId,
-        answer: null
-      };
-    }
-    throw error;
-  } finally {
-    inflightRouteQueries.delete(requestId);
-  }
 }
 
 async function getModels() {
@@ -784,20 +680,15 @@ async function brokerRequest(method, path, body = null, options = {}) {
   return parsed || {};
 }
 
-function validateQueryMessage(message) {
+function validateRunStartMessage(message) {
   validatePromptMessage(message);
   const backend = String(message.backend || "codex").trim();
   if (backend !== "llama" && backend !== "codex" && backend !== "mlx") {
     throw new Error("backend must be 'llama', 'codex', or 'mlx'.");
   }
-  if (message.requestId !== undefined && typeof message.requestId !== "string") {
-    throw new Error("requestId must be a string when provided.");
+  if (message.rewriteMessageIndex !== undefined) {
+    normalizeRewriteMessageIndex(message.rewriteMessageIndex);
   }
-}
-
-function validateRewriteMessage(message) {
-  validateQueryMessage(message);
-  normalizeRewriteMessageIndex(message.messageIndex);
 }
 
 function validatePromptMessage(message) {
@@ -817,17 +708,6 @@ function detectRiskSignals(prompt) {
     return ["high_risk_prompt"];
   }
   return [];
-}
-
-function normalizeRequestId(value) {
-  const requestId = String(value || "").trim();
-  if (!requestId) {
-    throw new Error("requestId is required.");
-  }
-  if (!/^[A-Za-z0-9._-]{1,128}$/.test(requestId)) {
-    throw new Error("requestId is invalid.");
-  }
-  return requestId;
 }
 
 function normalizeRewriteMessageIndex(value) {
