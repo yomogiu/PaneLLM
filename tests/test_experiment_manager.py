@@ -39,8 +39,6 @@ class ExperimentManagerTest(unittest.TestCase):
         self.model_path.write_text("stub", encoding="utf-8")
         self.mlx_worker_path = self.data_dir / "mlx_worker.py"
         self.mlx_worker_path.write_text("# stub\n", encoding="utf-8")
-        self.paper_worker_path = self.data_dir / "paper_worker.py"
-        self.paper_worker_path.write_text("# stub\n", encoding="utf-8")
         self.experiment_worker_path = self.data_dir / "experiment_worker.py"
         self.experiment_worker_path.write_text("# stub\n", encoding="utf-8")
         codex_home = self.data_dir / "codex_home"
@@ -50,7 +48,6 @@ class ExperimentManagerTest(unittest.TestCase):
             data_dir=self.data_dir,
             mlx_model_path=str(self.model_path),
             mlx_worker_path=self.mlx_worker_path,
-            paper_worker_path=self.paper_worker_path,
             experiment_worker_path=self.experiment_worker_path,
             codex_home=codex_home,
             codex_session_index_path=self.data_dir / "codex_sessions.json",

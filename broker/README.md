@@ -57,9 +57,6 @@ Optional environment variables:
 - `BROKER_MLX_DEFAULT_SEED` (optional)
 - `BROKER_MLX_DEFAULT_ENABLE_THINKING` (default `false`)
 - `BROKER_MLX_DEFAULT_SYSTEM_PROMPT` (optional)
-- `BROKER_PAPER_WORKER_PYTHON` (default `python3`)
-- `BROKER_PAPER_WORKER_PATH` (default `broker/paper_worker.py`)
-- `BROKER_PAPER_JOB_TIMEOUT_SEC` (default `180`)
 - `BROKER_EXPERIMENT_WORKER_PYTHON` (default `python3`)
 - `BROKER_EXPERIMENT_WORKER_PATH` (default `broker/experiment_worker.py`)
 - `BROKER_EXPERIMENT_JOB_TIMEOUT_SEC` (default `900`)
@@ -440,26 +437,7 @@ Current behavior:
 - Uses `browser.highlight` for temporary highlight-and-scroll guidance when the model needs to point to a section.
 - Keeps reading continuity in the existing chat conversation. There is no read-session database or paper store.
 
-Deprecated paper endpoints:
-
-- `POST /papers/inspect`
-- `POST /papers/jobs`
-- `GET /papers/jobs/<job_id>`
-- `GET /papers`
-- `GET /papers/<paper_id>`
-- `GET /papers/<paper_id>/sections/<section_id>`
-
-Deprecated responses now return `410 Gone` with:
-
-```json
-{
-  "ok": false,
-  "error": {
-    "code": "deprecated_feature",
-    "message": "Paper analysis has been replaced by the read assistant. Use chat with page context enabled."
-  }
-}
-```
+There are no dedicated `/papers*` broker endpoints in the active chat-first read flow.
 
 ## Experiment API
 
@@ -471,7 +449,7 @@ MLX experiments are broker-managed async jobs backed by a separate experiment wo
 - `GET /experiments`
 - `GET /experiments/<experiment_id>`
 - `GET /experiments/<experiment_id>/compare/<other_experiment_id>`
-- `GET /jobs?kind=paper|experiment&status=...`
+- `GET /jobs?kind=experiment|training&status=...`
 - `POST /jobs/<job_id>/cancel`
 
 `POST /experiments/jobs` request shape:
@@ -579,6 +557,5 @@ The default list remains intentionally tight to local domains plus the small dem
 
 - `broker/local_broker.py` remains the public broker control plane for HTTP transport, auth, route matching, singleton ownership, and browser-tool orchestration.
 - `broker/services/mlx_runtime.py` owns MLX runtime/session/adapter orchestration plus broker-side MLX execution helpers.
-- `broker/services/read_assistant.py` owns paper inspection, digest orchestration, and the `/papers*` handler boundary.
+- `broker/services/read_assistant.py` owns page-context normalization and read-context rendering for chat.
 - `broker/mlx_worker.py` remains the internal JSON-over-stdio MLX sidecar entrypoint used by the broker-owned MLX runtime service.
-

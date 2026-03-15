@@ -62,7 +62,6 @@ CODEX_EVENT_POLL_MAX_TIMEOUT_MS = 30000
 MLX_MAX_CONTEXT_CHARS_CAP = 56000
 LLAMA_HEALTHCHECK_TIMEOUT_SEC = 0.35
 from broker.services import mlx_runtime as mlx_runtime_service
-from broker.services import papers as papers_service
 from broker.services import read_assistant as read_assistant_service
 
 DEFAULT_LLAMA_MODEL = "glm-4.7-flash-llamacpp"
@@ -731,9 +730,6 @@ class BrokerConfig:
     mlx_default_seed: int | None
     mlx_default_enable_thinking: bool
     mlx_default_system_prompt: str
-    paper_worker_python: str
-    paper_worker_path: Path
-    paper_job_timeout_sec: int
     experiment_worker_python: str
     experiment_worker_path: Path
     experiment_job_timeout_sec: int
@@ -821,7 +817,6 @@ def load_config() -> BrokerConfig:
     )
     browser_default_domain_allowlist = normalize_domain_allowlist(default_allowlist_raw)
     default_mlx_worker_path = repo_root / "broker" / "mlx_worker.py"
-    default_paper_worker_path = repo_root / "broker" / "paper_worker.py"
     default_experiment_worker_path = repo_root / "broker" / "experiment_worker.py"
     mlx_model_path = os.environ.get("BROKER_MLX_MODEL_PATH", "").strip()
     mlx_worker_python = (
@@ -856,14 +851,6 @@ def load_config() -> BrokerConfig:
         except ValueError:
             mlx_default_seed = None
     mlx_default_system_prompt = os.environ.get("BROKER_MLX_DEFAULT_SYSTEM_PROMPT", "").strip()
-    paper_worker_python = (
-        os.environ.get("BROKER_PAPER_WORKER_PYTHON", "python3").strip()
-        or "python3"
-    )
-    paper_worker_path = Path(
-        os.environ.get("BROKER_PAPER_WORKER_PATH", str(default_paper_worker_path))
-    ).expanduser()
-    paper_job_timeout_sec = int(os.environ.get("BROKER_PAPER_JOB_TIMEOUT_SEC", "180"))
     experiment_worker_python = (
         os.environ.get("BROKER_EXPERIMENT_WORKER_PYTHON", "python3").strip()
         or "python3"
@@ -929,9 +916,6 @@ def load_config() -> BrokerConfig:
         mlx_default_seed=mlx_default_seed,
         mlx_default_enable_thinking=mlx_default_enable_thinking,
         mlx_default_system_prompt=mlx_default_system_prompt,
-        paper_worker_python=paper_worker_python,
-        paper_worker_path=paper_worker_path,
-        paper_job_timeout_sec=paper_job_timeout_sec,
         experiment_worker_python=experiment_worker_python,
         experiment_worker_path=experiment_worker_path,
         experiment_job_timeout_sec=experiment_job_timeout_sec,
@@ -1811,114 +1795,6 @@ class AsyncJobStore:
         }
 
 
-class PaperStore:
-    def __init__(self, data_dir: Path) -> None:
-        self._lock = threading.RLock()
-        self._root = data_dir / "papers"
-        self._records = self._root / "records"
-        self._records.mkdir(parents=True, exist_ok=True)
-
-    def _path(self, paper_id: str) -> Path:
-        if not CONVERSATION_ID_RE.match(paper_id):
-            raise ValueError("Invalid paper id.")
-        return self._records / f"{paper_id}.json"
-
-    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
-        tmp.replace(path)
-
-    def _read_json(self, path: Path) -> dict[str, Any]:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(parsed, dict):
-            raise ValueError("Persisted paper payload is invalid.")
-        return parsed
-
-    def _summary(self, payload: dict[str, Any]) -> dict[str, Any]:
-        latest_digest = payload.get("latest_digest") if isinstance(payload.get("latest_digest"), dict) else None
-        return {
-            "paper_id": str(payload.get("paper_id", "")),
-            "title": str(payload.get("title", "")),
-            "authors": payload.get("authors") if isinstance(payload.get("authors"), list) else [],
-            "abstract": str(payload.get("abstract", "")),
-            "source_type": str(payload.get("source_type", "")),
-            "source_format": str(payload.get("source_format", "")),
-            "url": str(payload.get("url", "")),
-            "local_path": str(payload.get("local_path", "")),
-            "section_count": int(payload.get("section_count", 0) or 0),
-            "char_count": int(payload.get("char_count", 0) or 0),
-            "updated_at": str(payload.get("updated_at", "")),
-            "latest_digest_excerpt": truncate_text((latest_digest or {}).get("text", ""), 320),
-        }
-
-    def find_by_source_key(self, source_key: str) -> dict[str, Any] | None:
-        normalized = str(source_key or "").strip()
-        if not normalized:
-            return None
-        with self._lock:
-            for path in self._records.glob("*.json"):
-                try:
-                    payload = self._read_json(path)
-                except Exception:
-                    continue
-                if str(payload.get("source_key", "")) == normalized:
-                    return payload
-        return None
-
-    def upsert_extracted(self, payload: dict[str, Any]) -> dict[str, Any]:
-        paper_id = str(payload.get("paper_id", "") or "")
-        if not paper_id:
-            raise ValueError("paper_id is required.")
-        path = self._path(paper_id)
-        with self._lock:
-            existing = self._read_json(path) if path.exists() else {}
-            stamp = now_iso()
-            merged = {
-                **payload,
-                "created_at": str(existing.get("created_at", "")) or stamp,
-                "updated_at": stamp,
-                "digests": existing.get("digests") if isinstance(existing.get("digests"), list) else [],
-                "latest_digest": existing.get("latest_digest") if isinstance(existing.get("latest_digest"), dict) else None,
-            }
-            self._write_json(path, merged)
-            return merged
-
-    def append_digest(self, paper_id: str, digest: dict[str, Any]) -> dict[str, Any]:
-        path = self._path(paper_id)
-        with self._lock:
-            payload = self._read_json(path)
-            digests = payload.get("digests") if isinstance(payload.get("digests"), list) else []
-            digests.append(digest)
-            payload["digests"] = digests[-8:]
-            payload["latest_digest"] = digest
-            payload["updated_at"] = now_iso()
-            self._write_json(path, payload)
-            return payload
-
-    def list_metadata(self, *, limit: int = 20) -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
-        with self._lock:
-            for path in self._records.glob("*.json"):
-                try:
-                    items.append(self._summary(self._read_json(path)))
-                except Exception:
-                    continue
-        items.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
-        return items[:limit]
-
-    def get(self, paper_id: str) -> dict[str, Any]:
-        with self._lock:
-            return self._read_json(self._path(paper_id))
-
-    def get_section(self, paper_id: str, section_id: str) -> dict[str, Any]:
-        payload = self.get(paper_id)
-        for section in payload.get("sections", []):
-            if str(section.get("section_id", "")) == section_id:
-                return section
-        raise FileNotFoundError("Section not found.")
-
-
 class ExperimentStore:
     def __init__(self, data_dir: Path) -> None:
         self._lock = threading.RLock()
@@ -1978,9 +1854,6 @@ class ExperimentStore:
     def get(self, experiment_id: str) -> dict[str, Any]:
         with self._lock:
             return self._read_json(self._path(experiment_id))
-
-
-PaperManager = papers_service.PaperManager
 
 
 class ExperimentManager:
@@ -4793,7 +4666,6 @@ EXTENSION_RELAY = ExtensionCommandRelay(CONFIG.extension_client_stale_sec)
 BROWSER_AUTOMATION = BrowserAutomationManager(CONFIG.browser_default_domain_allowlist)
 CODEX_RUNS = CodexRunManager(CONFIG.data_dir)
 MLX_RUNTIME = MlxRuntimeManager(CONFIG)
-PAPERS = PaperManager(CONFIG)
 EXPERIMENTS = ExperimentManager(CONFIG)
 TRAININGS = TrainingManager(CONFIG)
 ROUTE_REQUESTS = RouteRequestRegistry()
@@ -5303,8 +5175,6 @@ def run_subprocess_with_cancel(
 summarize_mlx_worker_failure = mlx_runtime_service.summarize_mlx_worker_failure
 read_mlx_worker_response = mlx_runtime_service.read_mlx_worker_response
 run_ephemeral_mlx_completion = mlx_runtime_service.run_ephemeral_mlx_completion
-select_paper_analysis_context = papers_service.select_paper_analysis_context
-generate_paper_digest = papers_service.generate_paper_digest
 
 
 def build_codex_cli_prompt(
@@ -6654,8 +6524,6 @@ def handle_route_cancel(data: dict[str, Any]) -> dict[str, Any]:
 def handle_jobs_list(status_filter: str = "", kind: str = "") -> dict[str, Any]:
     normalized_kind = str(kind or "").strip().lower()
     jobs: list[dict[str, Any]] = []
-    if not normalized_kind or normalized_kind == "paper":
-        jobs.extend(PAPERS.list_jobs(status_filter=status_filter))
     if not normalized_kind or normalized_kind == "experiment":
         jobs.extend(EXPERIMENTS.list_jobs(status_filter=status_filter))
     if not normalized_kind or normalized_kind == "training":
@@ -6666,32 +6534,11 @@ def handle_jobs_list(status_filter: str = "", kind: str = "") -> dict[str, Any]:
 
 def handle_job_cancel(job_id: str) -> dict[str, Any]:
     normalized = str(job_id or "").strip()
-    if normalized.startswith("paper_job_"):
-        return PAPERS.cancel_job(normalized)
     if normalized.startswith("experiment_job_"):
         return EXPERIMENTS.cancel_job(normalized)
     if normalized.startswith("training_job_"):
         return TRAININGS.cancel_job(normalized)
     raise ValueError("Unsupported job id.")
-
-
-def handle_paper_inspect(data: dict[str, Any]) -> dict[str, Any]:
-    return read_assistant_service.deprecated_papers_payload()
-
-def handle_paper_job_start(data: dict[str, Any]) -> dict[str, Any]:
-    return read_assistant_service.deprecated_papers_payload()
-
-def handle_paper_job_get(job_id: str) -> dict[str, Any]:
-    return read_assistant_service.deprecated_papers_payload()
-
-def handle_papers_list() -> dict[str, Any]:
-    return read_assistant_service.deprecated_papers_payload()
-
-def handle_paper_get(paper_id: str) -> dict[str, Any]:
-    return read_assistant_service.deprecated_papers_payload()
-
-def handle_paper_section_get(paper_id: str, section_id: str) -> dict[str, Any]:
-    return read_assistant_service.deprecated_papers_payload()
 
 def handle_experiment_job_start(data: dict[str, Any]) -> dict[str, Any]:
     return EXPERIMENTS.start_job(data)
@@ -6852,7 +6699,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     "route_requests": ROUTE_REQUESTS.health(),
                     "llama": llama_backend_health(CONFIG),
                     "mlx": MLX_RUNTIME.health(),
-                    "papers": PAPERS.health(),
                     "experiments": EXPERIMENTS.health(),
                     "training": TRAININGS.health(),
                 },
@@ -6879,10 +6725,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if path == "/mlx/training/runs":
             self._send_json(HTTPStatus.OK, handle_training_runs_list())
             return
-        paper_job_id = self._paper_job_id_from_path(path)
-        if paper_job_id:
-            self._send_json(HTTPStatus.GONE, handle_paper_job_get(paper_job_id))
-            return
         experiment_job_id = self._experiment_job_id_from_path(path)
         if experiment_job_id:
             self._send_json(HTTPStatus.OK, handle_experiment_job_get(experiment_job_id))
@@ -6891,22 +6733,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if training_job_id:
             self._send_json(HTTPStatus.OK, handle_training_job_get(training_job_id))
             return
-        paper_section = self._paper_section_ids_from_path(path)
-        if paper_section:
-            paper_id, section_id = paper_section
-            self._send_json(HTTPStatus.GONE, handle_paper_section_get(paper_id, section_id))
-            return
         experiment_compare = self._experiment_compare_ids_from_path(path)
         if experiment_compare:
             experiment_id, other_id = experiment_compare
             self._send_json(HTTPStatus.OK, handle_experiment_compare(experiment_id, other_id))
-            return
-        if path == "/papers":
-            self._send_json(HTTPStatus.GONE, handle_papers_list())
-            return
-        paper_id = self._paper_id_from_path(path)
-        if paper_id:
-            self._send_json(HTTPStatus.GONE, handle_paper_get(paper_id))
             return
         if path == "/experiments":
             self._send_json(HTTPStatus.OK, handle_experiments_list())
@@ -7004,14 +6834,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 result = route_request(data)
             elif path == "/route/cancel":
                 result = handle_route_cancel(data)
-            elif path == "/papers/inspect":
-                result = handle_paper_inspect(data)
-                self._send_json(HTTPStatus.GONE, result)
-                return
-            elif path == "/papers/jobs":
-                result = handle_paper_job_start(data)
-                self._send_json(HTTPStatus.GONE, result)
-                return
             elif path == "/experiments/jobs":
                 result = handle_experiment_job_start(data)
             elif path == "/mlx/training/datasets/import":
@@ -7108,24 +6930,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
         parts = [unquote(part) for part in path.split("/") if part]
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "cancel":
             return parts[1]
-        return None
-
-    def _paper_job_id_from_path(self, path: str) -> str | None:
-        parts = [unquote(part) for part in path.split("/") if part]
-        if len(parts) == 3 and parts[0] == "papers" and parts[1] == "jobs":
-            return parts[2]
-        return None
-
-    def _paper_id_from_path(self, path: str) -> str | None:
-        parts = [unquote(part) for part in path.split("/") if part]
-        if len(parts) == 2 and parts[0] == "papers":
-            return parts[1]
-        return None
-
-    def _paper_section_ids_from_path(self, path: str) -> tuple[str, str] | None:
-        parts = [unquote(part) for part in path.split("/") if part]
-        if len(parts) == 4 and parts[0] == "papers" and parts[2] == "sections":
-            return parts[1], parts[3]
         return None
 
     def _experiment_job_id_from_path(self, path: str) -> str | None:
