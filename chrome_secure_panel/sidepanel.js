@@ -3,6 +3,9 @@ const SAFE_LINK_PROTOCOLS = new Set(["http:", "https:"]);
 const ACTIVE_JOB_STATUSES = new Set(["queued", "running"]);
 const JOB_POLL_INTERVAL_MS = 4_000;
 const DETAIL_ITEM_LIMIT = 3;
+const EXPLAIN_SELECTION_DEFAULT_PROMPT = "Explain the selected passage in plain language.";
+const SHOW_ME_WHERE_FOLLOWUP =
+  "After answering, use browser tools to scroll to and temporarily highlight the section of the current page that best answers the request above.";
 const TRAINING_BALANCED_PROFILE = Object.freeze({
   rank: 8,
   scale: 20,
@@ -39,15 +42,15 @@ const state = {
   codexRunUi: new Map(),
   codexPollingRuns: new Set(),
   rewriteTargetIndex: null,
+  composerExplainSelection: "",
+  composerShowMeWhere: false,
   activeMainTab: "chat",
   modelsBusy: false,
   toolsBusy: false,
   toolsPolicy: null,
   toolsActiveTab: null,
   toolsBrowserConfig: null,
-  paperJobs: [],
-  papers: [],
-  paperInspect: null,
+  readContext: null,
   experimentJobs: [],
   experiments: [],
   experimentDetail: null,
@@ -175,15 +178,332 @@ const toolsAllowActiveBtn = $("tools-allow-active-btn");
 const toolsAgentMaxStepsEl = $("tools-agent-max-steps");
 const toolsBrowserApplyBtn = $("tools-browser-apply-btn");
 const toolsAllowedListEl = $("tools-allowed-list");
-const papersStatusEl = $("papers-status");
-const paperSourceInputEl = $("paper-source-input");
-const paperUseActiveBtn = $("paper-use-active-btn");
-const paperInspectBtn = $("paper-inspect-btn");
-const paperAnalyzeBtn = $("paper-analyze-btn");
-const paperInspectOutputEl = $("paper-inspect-output");
-const paperJobListEl = $("paper-job-list");
-const paperListEl = $("paper-list");
+const papersStatusEl = $("read-assistant-status");
+const paperSourceInputEl = null;
+const paperUseActiveBtn = $("read-context-refresh-btn");
+const paperInspectBtn = $("read-explain-btn");
+const paperAnalyzeBtn = $("read-guide-btn");
+const readShowWhereBtn = $("read-show-btn");
+const paperInspectOutputEl = $("read-assistant-preview");
+const paperJobListEl = null;
+const paperListEl = null;
 
+function renderReadAssistantPreview(context) {
+  if (!paperInspectOutputEl) {
+    return;
+  }
+  if (!context || typeof context !== "object") {
+    paperInspectOutputEl.textContent = "No active page context.";
+    return;
+  }
+  const lines = [];
+  if (context.title) {
+    lines.push(`Title: ${String(context.title)}`);
+  }
+  if (context.url) {
+    lines.push(`URL: ${String(context.url)}`);
+  }
+  if (Array.isArray(context.heading_path) && context.heading_path.length) {
+    lines.push(`Section: ${context.heading_path.join(" > ")}`);
+  }
+  if (context.selection) {
+    lines.push(`Selection:\n${String(context.selection)}`);
+  }
+  const local = context.selection_context && typeof context.selection_context === "object"
+    ? context.selection_context
+    : null;
+  if (local?.focus) {
+    const parts = [local.before, local.focus, local.after].filter(Boolean);
+    lines.push(`Local context:\n${parts.join("\n")}`);
+  } else if (context.text_excerpt) {
+    lines.push(`Page excerpt:\n${truncatePreview(String(context.text_excerpt), 360)}`);
+  }
+  paperInspectOutputEl.textContent = lines.join("\n\n") || "No active page context.";
+}
+
+function setReadAssistantExplainEnabled() {
+  if (paperInspectBtn) {
+    paperInspectBtn.disabled = state.toolsBusy;
+  }
+  const composerExplainBtn = $("composer-read-explain-btn");
+  if (composerExplainBtn) {
+    composerExplainBtn.disabled = state.busy || state.toolsBusy;
+  }
+}
+
+function getComposerExplainSelectionBlock(selection = state.composerExplainSelection) {
+  const raw = String(selection || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const quoted = raw
+    .split("\n")
+    .map((line) => `> ${line}`.trimEnd())
+    .join("\n");
+  return `Selected passage:\n${quoted}`;
+}
+
+function syncReadAssistantQuickActionState() {
+  const explainBtn = $("composer-read-explain-btn");
+  const showBtn = $("composer-read-show-btn");
+  explainBtn?.classList.toggle("active", Boolean(state.composerExplainSelection));
+  explainBtn?.setAttribute("aria-pressed", String(Boolean(state.composerExplainSelection)));
+  showBtn?.classList.toggle("active", state.composerShowMeWhere);
+  showBtn?.setAttribute("aria-pressed", String(state.composerShowMeWhere));
+}
+
+function clearComposerExplainSelection() {
+  state.composerExplainSelection = "";
+}
+
+function clearComposerShowMeWhere() {
+  state.composerShowMeWhere = false;
+}
+
+function resetComposerReadAssistantModes() {
+  clearComposerExplainSelection();
+  clearComposerShowMeWhere();
+  syncReadAssistantQuickActionState();
+}
+
+function focusComposerToEnd() {
+  if (!promptEl) {
+    return;
+  }
+  promptEl.focus({ preventScroll: true });
+  promptEl.setSelectionRange(promptEl.value.length, promptEl.value.length);
+}
+
+function armComposerExplainSelection(selection) {
+  const cleanedSelection = String(selection || "").trim();
+  if (!cleanedSelection) {
+    return;
+  }
+  state.composerExplainSelection = cleanedSelection;
+  includePageContextEl.checked = true;
+  syncReadAssistantQuickActionState();
+  focusComposerToEnd();
+}
+
+async function toggleComposerExplainSelectionMode() {
+  if (state.composerExplainSelection) {
+    clearComposerExplainSelection();
+    syncReadAssistantQuickActionState();
+    updatePapersStatus("Selection will no longer be included with your next message.");
+    updateComposerState();
+    focusComposerToEnd();
+    return;
+  }
+  setToolsBusy(true);
+  try {
+    const context = await captureReadAssistantContext(false);
+    if (!context?.selection) {
+      updatePapersStatus("Select text on the current page first.");
+      return;
+    }
+    armComposerExplainSelection(context.selection);
+    updatePapersStatus("Selection will be included with your next message.");
+    updateComposerState();
+  } catch (error) {
+    updatePapersStatus(`Read assistant error: ${String(error.message || error)}`);
+  } finally {
+    setToolsBusy(false);
+  }
+}
+
+function toggleComposerShowMeWhereMode() {
+  state.composerShowMeWhere = !state.composerShowMeWhere;
+  if (state.composerShowMeWhere) {
+    includePageContextEl.checked = true;
+    updatePapersStatus("Show Me Where is armed. Send a prompt to answer it and navigate to the best section.");
+    focusComposerToEnd();
+  } else {
+    updatePapersStatus("Show Me Where disabled.");
+  }
+  syncReadAssistantQuickActionState();
+  updateComposerState();
+}
+
+function buildComposerPromptForSubmit(rawPrompt) {
+  let prompt = String(rawPrompt || "").trim();
+  if (!prompt && state.composerExplainSelection) {
+    prompt = EXPLAIN_SELECTION_DEFAULT_PROMPT;
+  }
+  if (!prompt) {
+    return "";
+  }
+  return prompt;
+}
+
+function buildComposerPromptSuffix() {
+  const parts = [];
+  if (state.composerExplainSelection) {
+    parts.push(getComposerExplainSelectionBlock());
+  }
+  if (state.composerShowMeWhere) {
+    parts.push(SHOW_ME_WHERE_FOLLOWUP);
+  }
+  return parts.join("\n\n").trim();
+}
+
+function buildReadAssistantPrompt(kind, context) {
+  const draft = String(promptEl?.value || "").trim();
+  const selection = String(context?.selection || "").trim();
+  const selectionSuffix = selection
+    ? `\n\nSelected passage:\n${selection}`
+    : "";
+  if (kind === "explain_selection") {
+    return [
+      "Explain the selected passage from the current page in plain language.",
+      "Use the surrounding section context to resolve symbols or references.",
+      "Be precise, concise, and grounded in the page only.",
+      'Finish with: "Why it matters: ..."',
+      selectionSuffix
+    ].join("\n").trim();
+  }
+  if (kind === "show_me_where") {
+    const question = draft
+      || (selection
+        ? `Show me where the current page addresses this selected passage:\n${selection}`
+        : "Show me where the current page explains the main claim.");
+    return [
+      question,
+      "",
+      SHOW_ME_WHERE_FOLLOWUP
+    ].join("\n").trim();
+  }
+  return [
+    "Act as a reading guide for the current page.",
+    "Give me:",
+    "1. what this page is about,",
+    "2. what section to read next,",
+    "3. one thing that is easy to misunderstand,",
+    "4. one useful follow-up question to ask.",
+    draft ? `\n\nFocus request:\n${draft}` : ""
+  ].join("\n").trim();
+}
+
+function updateReadAssistantStatus() {
+  if (!state.toolsActiveTab?.host) {
+    updatePapersStatus("Allowlist loaded. Active tab unavailable.");
+    return;
+  }
+  if (!state.toolsActiveTab.allowed) {
+    updatePapersStatus("Allow the current host to use the read assistant.");
+    return;
+  }
+  if (!state.readContext) {
+    updatePapersStatus(`Read assistant ready for ${state.toolsActiveTab.host}.`);
+    return;
+  }
+  if (!state.readContext.selection) {
+    updatePapersStatus(`Read assistant ready for ${state.toolsActiveTab.host}. No active text selection.`);
+    return;
+  }
+  updatePapersStatus(`Read assistant ready for ${state.toolsActiveTab.host}. Selection captured.`);
+}
+
+async function captureReadAssistantContext(showErrors = true) {
+  try {
+    const result = await sendRuntimeMessage({ type: "assistant.read.context.capture" });
+    state.readContext = result.ok ? result.context || null : null;
+    if (result.active_tab && typeof result.active_tab === "object") {
+      state.toolsActiveTab = result.active_tab;
+    }
+    renderReadAssistantPreview(state.readContext);
+    setReadAssistantExplainEnabled();
+    updateReadAssistantStatus();
+    if (!result.ok) {
+      throw new Error(
+        typeof result.error === "string"
+          ? result.error
+          : result.error?.message || "Unable to capture the current page context."
+      );
+    }
+    return state.readContext;
+  } catch (error) {
+    state.readContext = null;
+    renderReadAssistantPreview(null);
+    setReadAssistantExplainEnabled();
+    if (showErrors) {
+      updatePapersStatus(`Read assistant error: ${String(error.message || error)}`);
+    }
+    throw error;
+  }
+}
+
+async function submitReadAssistantAction(kind) {
+  setToolsBusy(true);
+  try {
+    const context = await captureReadAssistantContext(false);
+    if (kind === "explain_selection" && !context?.selection) {
+      updatePapersStatus("Select text on the current page first.");
+      return;
+    }
+    if (!promptEl || !sendBtn) {
+      throw new Error("Chat composer is unavailable.");
+    }
+    includePageContextEl.checked = true;
+    forceBrowserActionEl.checked = kind === "show_me_where";
+    promptEl.value = buildReadAssistantPrompt(kind, context);
+    updateComposerState();
+    sendBtn.click();
+  } catch (error) {
+    updatePapersStatus(`Read assistant error: ${String(error.message || error)}`);
+  } finally {
+    setToolsBusy(false);
+  }
+}
+
+async function showReadAssistantTarget() {
+  await submitReadAssistantAction("show_me_where");
+}
+
+function installReadAssistantQuickActions() {
+  if (!promptEl || document.getElementById("read-assistant-quick-actions")) {
+    return;
+  }
+  const row = document.createElement("div");
+  row.id = "read-assistant-quick-actions";
+  row.className = "button-row";
+
+  const explainBtn = document.createElement("button");
+  explainBtn.id = "composer-read-explain-btn";
+  explainBtn.type = "button";
+  explainBtn.className = "ghost composer-quick-action";
+  explainBtn.textContent = "Explain Selection";
+  explainBtn.setAttribute("aria-pressed", "false");
+  explainBtn.addEventListener("click", async () => {
+    await toggleComposerExplainSelectionMode();
+  });
+
+  const guideBtn = document.createElement("button");
+  guideBtn.id = "composer-read-guide-btn";
+  guideBtn.type = "button";
+  guideBtn.className = "ghost composer-quick-action";
+  guideBtn.textContent = "Guide This Page";
+  guideBtn.addEventListener("click", async () => {
+    await submitReadAssistantAction("guide_page");
+  });
+
+  const showBtn = document.createElement("button");
+  showBtn.id = "composer-read-show-btn";
+  showBtn.type = "button";
+  showBtn.className = "ghost composer-quick-action";
+  showBtn.textContent = "Show Me Where";
+  showBtn.setAttribute("aria-pressed", "false");
+  showBtn.addEventListener("click", () => {
+    toggleComposerShowMeWhereMode();
+  });
+
+  row.appendChild(explainBtn);
+  row.appendChild(guideBtn);
+  row.appendChild(showBtn);
+  promptEl.insertAdjacentElement("afterend", row);
+  syncReadAssistantQuickActionState();
+}
+
+installReadAssistantQuickActions();
 void initializeApp();
 
 function truncatePreview(value, maxChars = 240) {
@@ -650,6 +970,10 @@ paperInspectBtn?.addEventListener("click", async () => {
 
 paperAnalyzeBtn?.addEventListener("click", async () => {
   await analyzePaperFromInputs();
+});
+
+readShowWhereBtn?.addEventListener("click", async () => {
+  await showReadAssistantTarget();
 });
 
 toolsHostInputEl?.addEventListener("keydown", async (event) => {
@@ -2442,6 +2766,7 @@ function renderBrowserConfig(config) {
   }
 }
 
+
 function setToolsBusy(busy) {
   state.toolsBusy = busy;
   const controls = [
@@ -2451,10 +2776,13 @@ function setToolsBusy(busy) {
     toolsAllowActiveBtn,
     toolsAgentMaxStepsEl,
     toolsBrowserApplyBtn,
-    paperSourceInputEl,
     paperUseActiveBtn,
     paperInspectBtn,
-    paperAnalyzeBtn
+    paperAnalyzeBtn,
+    readShowWhereBtn,
+    $("composer-read-explain-btn"),
+    $("composer-read-guide-btn"),
+    $("composer-read-show-btn")
   ];
   for (const control of controls) {
     if (control) {
@@ -2464,12 +2792,7 @@ function setToolsBusy(busy) {
   for (const button of toolsAllowedListEl?.querySelectorAll("button") || []) {
     button.disabled = busy;
   }
-  for (const button of paperJobListEl?.querySelectorAll("button") || []) {
-    button.disabled = busy;
-  }
-  for (const button of paperListEl?.querySelectorAll("button") || []) {
-    button.disabled = busy;
-  }
+  setReadAssistantExplainEnabled();
 }
 
 function updateToolsStatus(text) {
@@ -2555,15 +2878,22 @@ function renderToolsPolicy(policy) {
   setToolsBusy(state.toolsBusy);
 }
 
-async function refreshToolsState(showErrors = true) {
+
+async function refreshToolsState(showErrors = true, options = {}) {
+  const captureReadContext = options.captureReadContext === true || state.activeMainTab === "tools";
   setToolsBusy(true);
   try {
-    const [policyState, activeState, browserConfigState, jobsState, papersState] = await Promise.allSettled([
+    const [policyState, activeState, browserConfigState, readContextState] = await Promise.allSettled([
       sendRuntimeMessage({ type: "assistant.tools.page_hosts.get" }),
       sendRuntimeMessage({ type: "assistant.tools.page_hosts.active_tab" }),
       sendRuntimeMessage({ type: "assistant.tools.browser_config.get" }),
-      sendRuntimeMessage({ type: "assistant.jobs.list", kind: "paper" }),
-      sendRuntimeMessage({ type: "assistant.papers.list" })
+      captureReadContext
+        ? sendRuntimeMessage({ type: "assistant.read.context.capture" })
+        : Promise.resolve({
+            ok: true,
+            context: state.readContext,
+            active_tab: state.toolsActiveTab
+          })
     ]);
 
     if (policyState.status === "rejected") {
@@ -2612,6 +2942,31 @@ async function refreshToolsState(showErrors = true) {
       );
     }
 
+    if (readContextState.status === "fulfilled") {
+      if (readContextState.value?.active_tab && typeof readContextState.value.active_tab === "object") {
+        state.toolsActiveTab = readContextState.value.active_tab;
+      }
+      state.readContext = readContextState.value?.ok ? readContextState.value.context || null : null;
+      if (!readContextState.value?.ok && readContextState.value?.error) {
+        console.warn(
+          "[secure-panel] read assistant context unavailable:",
+          typeof readContextState.value.error === "string"
+            ? readContextState.value.error
+            : readContextState.value.error?.message || "unknown_error"
+        );
+      }
+    } else {
+      state.readContext = null;
+      console.warn(
+        "[secure-panel] read assistant context refresh failed:",
+        String(readContextState.reason?.message || readContextState.reason)
+      );
+    }
+
+    renderReadAssistantPreview(state.readContext);
+    setReadAssistantExplainEnabled();
+    updateReadAssistantStatus();
+
     const statusParts = [];
     if (state.toolsActiveTab?.host) {
       const marker = state.toolsActiveTab.allowed ? "allowed" : "not allowed";
@@ -2626,35 +2981,13 @@ async function refreshToolsState(showErrors = true) {
       statusParts.push("Browser settings unavailable.");
     }
     updateToolsStatus(statusParts.join(" "));
-
-    state.paperJobs =
-      jobsState.status === "fulfilled" && jobsState.value?.ok && Array.isArray(jobsState.value.jobs)
-        ? jobsState.value.jobs
-        : [];
-    state.papers =
-      papersState.status === "fulfilled" && papersState.value?.ok && Array.isArray(papersState.value.papers)
-        ? papersState.value.papers
-        : [];
-    renderPaperJobs(state.paperJobs);
-    renderPaperLibrary(state.papers);
-    if (state.paperInspect?.paper) {
-      renderPaperDetail(state.paperInspect.paper);
-    } else {
-      summarizePaperInspect(state.paperInspect?.inspect, state.paperInspect?.cached_paper);
-    }
-    const runningJobs = state.paperJobs.filter((job) => ACTIVE_JOB_STATUSES.has(String(job?.status || ""))).length;
-    updatePapersStatus(
-      runningJobs > 0
-        ? `${runningJobs} paper job${runningJobs === 1 ? "" : "s"} running. Auto-refreshing every ${Math.round(JOB_POLL_INTERVAL_MS / 1000)}s.`
-        : `${state.papers.length} saved paper artifact${state.papers.length === 1 ? "" : "s"}.`
-    );
-    scheduleAutoRefresh("papers", hasActiveJobs(state.paperJobs));
+    scheduleAutoRefresh("papers", false);
   } catch (error) {
     scheduleAutoRefresh("papers", false);
     console.warn("[secure-panel] tools refresh failed:", String(error?.message || error));
     if (showErrors) {
       updateToolsStatus(`Tools error: ${String(error.message || error)}`);
-      updatePapersStatus(`Paper error: ${String(error.message || error)}`);
+      updatePapersStatus(`Read assistant error: ${String(error.message || error)}`);
     }
   } finally {
     setToolsBusy(false);
@@ -2787,83 +3120,26 @@ function buildPaperSourceMessage(rawValue) {
   return { textPath: source };
 }
 
+
 async function useActiveTabForPaperSource() {
+  setToolsBusy(true);
   try {
-    const result = await sendRuntimeMessage({ type: "assistant.tools.page_hosts.active_tab" });
-    if (!result.ok) {
-      throw new Error(result.error || "Unable to read active tab.");
-    }
-    const url = String(result.active_tab?.url || "").trim();
-    if (!url) {
-      throw new Error("Active tab URL is unavailable.");
-    }
-    if (paperSourceInputEl) {
-      paperSourceInputEl.value = url;
-    }
-    updatePapersStatus("Active tab URL copied into the paper source field.");
-  } catch (error) {
-    updatePapersStatus(`Paper error: ${String(error.message || error)}`);
+    await captureReadAssistantContext(true);
+  } catch {
+    // Status messaging already happens inside captureReadAssistantContext.
+  } finally {
+    setToolsBusy(false);
   }
 }
+
 
 async function inspectPaperFromInputs() {
-  const sourceBody = buildPaperSourceMessage(paperSourceInputEl?.value);
-  if (!sourceBody) {
-    updatePapersStatus("Enter a paper URL or local path first.");
-    return;
-  }
-  setToolsBusy(true);
-  try {
-    const result = await sendRuntimeMessage({
-      type: "assistant.papers.inspect",
-      ...sourceBody
-    });
-    if (!result.ok) {
-      throw new Error(result.error || "Paper inspect failed.");
-    }
-    state.paperInspect = result;
-    summarizePaperInspect(result.inspect, result.cached_paper);
-    updatePapersStatus("Paper inspect completed.");
-    await refreshToolsState(false);
-  } catch (error) {
-    updatePapersStatus(`Paper error: ${String(error.message || error)}`);
-  } finally {
-    setToolsBusy(false);
-  }
+  await submitReadAssistantAction("explain_selection");
 }
 
+
 async function analyzePaperFromInputs() {
-  const sourceBody = buildPaperSourceMessage(paperSourceInputEl?.value);
-  if (!sourceBody) {
-    updatePapersStatus("Enter a paper URL or local path first.");
-    return;
-  }
-  const analysisBackend = getPaperAnalysisBackend();
-  const mlxPaperAvailability = describeMlxBackendAvailability(state.mlxRuntime, "MLX paper analysis");
-  if (analysisBackend === "mlx" && mlxPaperAvailability) {
-    updatePapersStatus(
-      `${mlxPaperAvailability} Switch the backend selector to llama if you want paper digests without MLX.`
-    );
-    return;
-  }
-  setToolsBusy(true);
-  try {
-    const result = await sendRuntimeMessage({
-      type: "assistant.papers.job.start",
-      ...sourceBody,
-      analysisMode: "digest",
-      backend: analysisBackend
-    });
-    if (!result.ok) {
-      throw new Error(result.error || "Failed to start paper job.");
-    }
-    updatePapersStatus(`Started paper analysis job ${String(result.job?.job_id || "")} using ${analysisBackend}.`);
-    await refreshToolsState(false);
-  } catch (error) {
-    updatePapersStatus(`Paper error: ${String(error.message || error)}`);
-  } finally {
-    setToolsBusy(false);
-  }
+  await submitReadAssistantAction("guide_page");
 }
 
 async function viewPaperArtifact(paperId) {
@@ -2964,6 +3240,7 @@ async function loadConversation(sessionId) {
     state.stoppedLegacyRequests = new Set();
     state.codexRunUi = new Map();
     state.rewriteTargetIndex = null;
+    resetComposerReadAssistantModes();
     hideRiskConfirm();
     renderConversationMessages(conversation.messages);
 
@@ -3022,6 +3299,7 @@ function startNewSession(message = "Started a new chat.") {
   state.stoppedLegacyRequests = new Set();
   state.codexRunUi = new Map();
   state.rewriteTargetIndex = null;
+  resetComposerReadAssistantModes();
   hideRiskConfirm();
   clearContextUsageDisplay();
   clearMessages();
@@ -3146,18 +3424,20 @@ async function submitPrompt(confirmed) {
     }
     backend = request.backend || "codex";
   } else {
-    const prompt = promptEl.value.trim();
+    const prompt = buildComposerPromptForSubmit(promptEl.value);
+    const requestPromptSuffix = buildComposerPromptSuffix();
     if (!prompt) {
       appendMessage("system", "Enter a prompt first.");
       return;
     }
     const rewriteIndex = hasRewriteTarget() ? Number(state.rewriteTargetIndex) : null;
     const isRewrite = Number.isInteger(rewriteIndex);
-    const forceBrowserAction = forceBrowserActionEl?.checked === true;
+    const forceBrowserAction = forceBrowserActionEl?.checked === true || state.composerShowMeWhere;
     if (!isRewrite) {
       appendMessage("user", prompt);
     }
     promptEl.value = "";
+    resetComposerReadAssistantModes();
 
     if (usesCodexRunProtocol()) {
       request = {
@@ -3165,6 +3445,7 @@ async function submitPrompt(confirmed) {
         backend,
         sessionId: state.sessionId,
         prompt,
+        requestPromptSuffix,
         includePageContext: includePageContextEl.checked,
         forceBrowserAction,
         confirmed: false
@@ -3180,6 +3461,7 @@ async function submitPrompt(confirmed) {
         requestId: crypto.randomUUID(),
         messageIndex: rewriteIndex,
         prompt,
+        requestPromptSuffix,
         includePageContext: includePageContextEl.checked,
         forceBrowserAction,
         confirmed: false
@@ -3191,6 +3473,7 @@ async function submitPrompt(confirmed) {
         sessionId: state.sessionId,
         requestId: crypto.randomUUID(),
         prompt,
+        requestPromptSuffix,
         includePageContext: includePageContextEl.checked,
         forceBrowserAction,
         confirmed: false
@@ -4049,7 +4332,16 @@ function updateComposerState() {
   if (llamaEnableThinkingEl) {
     llamaEnableThinkingEl.disabled = locked || !llamaSelected;
   }
+  const composerGuideBtn = $("composer-read-guide-btn");
+  if (composerGuideBtn) {
+    composerGuideBtn.disabled = locked || state.toolsBusy;
+  }
+  const composerShowBtn = $("composer-read-show-btn");
+  if (composerShowBtn) {
+    composerShowBtn.disabled = locked || state.toolsBusy;
+  }
   updateLlamaThinkingComposer();
+  syncReadAssistantQuickActionState();
   stopBtn.classList.toggle("hidden", !showStop);
   stopBtn.disabled = !showStop || state.stopping;
   stopBtn.textContent = state.stopping ? "Stopping..." : hasActiveCodex ? "Stop Run" : "Stop";
@@ -4144,6 +4436,7 @@ function startRewriteFromMessage(messageIndex, text) {
   state.pendingConfirmation = false;
   state.pendingRequest = null;
   hideRiskConfirm();
+  resetComposerReadAssistantModes();
   state.rewriteTargetIndex = messageIndex;
   promptEl.value = String(text || "");
   promptEl.focus({ preventScroll: true });

@@ -149,7 +149,7 @@ Event feed notes:
 
 Approval policy in v1:
 
-- Auto-approve: `browser.get_tabs`, `browser.describe_session_tabs`, `browser.get_content`, `browser.find_one`, `browser.find_elements`, `browser.wait_for`, `browser.get_element_state`, `browser.scroll`, `browser.switch_tab`, `browser.focus_tab`
+- Auto-approve: `browser.get_tabs`, `browser.describe_session_tabs`, `browser.get_content`, `browser.find_one`, `browser.find_elements`, `browser.wait_for`, `browser.get_element_state`, `browser.scroll`, `browser.highlight`, `browser.switch_tab`, `browser.focus_tab`
 - Manual approval: `browser.navigate`, `browser.open_tab`, `browser.click`, `browser.type`, `browser.press_key`, `browser.close_tab`, `browser.group_tabs`, `browser.select_option`
 - Non-allowlisted hosts are denied before the extension executes anything
 
@@ -406,7 +406,7 @@ Request shape:
 
 ```json
 {
-  "name": "browser.session_create | browser.run_start | browser.run_cancel | browser.approvals_list | browser.events_replay | browser.approve | browser.navigate | browser.get_content | browser.get_tabs | browser.open_tab | browser.switch_tab | browser.close_tab | browser.focus_tab | browser.group_tabs | browser.describe_session_tabs | browser.click | browser.type | browser.press_key | browser.scroll | browser.find_one | browser.find_elements | browser.wait_for | browser.get_element_state | browser.select_option",
+  "name": "browser.session_create | browser.run_start | browser.run_cancel | browser.approvals_list | browser.events_replay | browser.approve | browser.navigate | browser.get_content | browser.get_tabs | browser.open_tab | browser.switch_tab | browser.close_tab | browser.focus_tab | browser.group_tabs | browser.describe_session_tabs | browser.click | browser.type | browser.press_key | browser.scroll | browser.highlight | browser.find_one | browser.find_elements | browser.wait_for | browser.get_element_state | browser.select_option",
   "arguments": {}
 }
 ```
@@ -426,9 +426,21 @@ Response shape:
 }
 ```
 
-## Paper analysis API
 
-Paper analysis is broker-managed and worker-executed. The broker stores normalized paper artifacts under `broker/.data/papers/`.
+## Read Assistant
+
+The read assistant is a chat-first page-reading flow. It reuses the broker's existing chat routing,
+page-context attachment, and browser tool surface instead of persisting paper artifacts or running a
+paper job pipeline.
+
+Current behavior:
+
+- Works on allowlisted HTML pages, with ArXiv HTML as the best-supported shape.
+- Expands `page_context` with title, selection, heading path, local selection context, and a bounded page excerpt.
+- Uses `browser.highlight` for temporary highlight-and-scroll guidance when the model needs to point to a section.
+- Keeps reading continuity in the existing chat conversation. There is no read-session database or paper store.
+
+Deprecated paper endpoints:
 
 - `POST /papers/inspect`
 - `POST /papers/jobs`
@@ -437,35 +449,20 @@ Paper analysis is broker-managed and worker-executed. The broker stores normaliz
 - `GET /papers/<paper_id>`
 - `GET /papers/<paper_id>/sections/<section_id>`
 
-`POST /papers/inspect` accepts one of:
+Deprecated responses now return `410 Gone` with:
 
 ```json
 {
-  "url": "https://arxiv.org/abs/...",
-  "pdf_path": "/path/to/paper.pdf",
-  "html_path": "/path/to/paper.html",
-  "text_path": "/path/to/paper.txt"
+  "ok": false,
+  "error": {
+    "code": "deprecated_feature",
+    "message": "Paper analysis has been replaced by the read assistant. Use chat with page context enabled."
+  }
 }
 ```
-
-`POST /papers/jobs` accepts the same source inputs plus:
-
-```json
-{
-  "analysis_mode": "extract | digest",
-  "backend": "mlx | llama"
-}
-```
-
-Notes:
-
-- `inspect` is synchronous and intended for metadata/abstract lookup.
-- `jobs` are asynchronous and persist extraction + optional digest artifacts.
-- HTML extraction now focuses on `<body>` content, preserves heading-bearing `<header>` blocks, and merges short preambles into the first strong heading when that removes redundant top-level `Document` sections.
-- PDF extraction failures return structured worker errors. If no extractor is installed the broker reports `pdf_extractor_unavailable` with suggested fixes; if installed extractors fail it reports `pdf_extract_failed`.
-- Full paper text is stored broker-side; models should consume targeted sections or digest output rather than the entire artifact by default.
 
 ## Experiment API
+
 
 MLX experiments are broker-managed async jobs backed by a separate experiment worker.
 
@@ -578,3 +575,10 @@ Use the side panel **Tools** tab to manage runtime allow/disallow hosts.
 
 For source-controlled defaults, edit `DEFAULT_ALLOWED_PAGE_HOSTS` in `chrome_secure_panel/background.js`.
 The default list remains intentionally tight to local domains plus the small demo allowlist in the extension.
+## Service boundaries
+
+- `broker/local_broker.py` remains the public broker control plane for HTTP transport, auth, route matching, singleton ownership, and browser-tool orchestration.
+- `broker/services/mlx_runtime.py` owns MLX runtime/session/adapter orchestration plus broker-side MLX execution helpers.
+- `broker/services/read_assistant.py` owns paper inspection, digest orchestration, and the `/papers*` handler boundary.
+- `broker/mlx_worker.py` remains the internal JSON-over-stdio MLX sidecar entrypoint used by the broker-owned MLX runtime service.
+

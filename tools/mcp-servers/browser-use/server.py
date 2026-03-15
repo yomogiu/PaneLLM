@@ -195,8 +195,25 @@ PROXIED_TOOL_DEFINITIONS = [
             "additionalProperties": False,
         },
     },
-    {
-        "name": "browser.scroll",
+
+{
+    "name": "browser.highlight",
+    "description": "Temporarily highlight a relevant section on the page and optionally scroll it into view.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "tabId": {"type": "integer"},
+            "locator": BROWSER_LOCATOR_SCHEMA,
+            "text": {"type": "string"},
+            "scroll": {"type": "boolean"},
+            "durationMs": {"type": "integer"},
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+},
+{
+    "name": "browser.scroll",
         "description": "Scroll the page or an element in the target tab.",
         "inputSchema": {
             "type": "object",

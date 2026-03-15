@@ -322,6 +322,30 @@ class ThinkingParsingTest(unittest.TestCase):
         )
         self.assertEqual(0, mock_call.call_args.kwargs["reasoning_budget"])
 
+    def test_route_request_keeps_hidden_prompt_suffix_out_of_conversation(self) -> None:
+        session_id = "route_llama_hidden_suffix"
+        prompt = "Where is the main claim?"
+        suffix = "Selected passage:\n> The paper introduces a new method."
+        with patch.object(local_broker, "call_llama", return_value=("Final answer.", "")) as mock_call:
+            result = local_broker.route_request(
+                {
+                    "session_id": session_id,
+                    "request_id": "req_llama_hidden_suffix",
+                    "backend": "llama",
+                    "prompt": prompt,
+                    "request_prompt_suffix": suffix,
+                }
+            )
+
+        self.assertEqual("Final answer.", result["answer"])
+        conversation = local_broker.CONVERSATIONS.get(session_id)
+        self.assertEqual(prompt, conversation["messages"][-2]["content"])
+        self.assertEqual("Final answer.", conversation["messages"][-1]["content"])
+        self.assertEqual(
+            f"{prompt}\n\n{suffix}",
+            mock_call.call_args.args[0][-1]["content"],
+        )
+
     def test_start_run_persists_llama_reasoning_controls(self) -> None:
         manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
 
@@ -360,6 +384,99 @@ class ThinkingParsingTest(unittest.TestCase):
 
 
 class CodexRunPersistenceTest(unittest.TestCase):
+    def test_run_llama_loop_uses_hidden_prompt_suffix_without_mutating_conversation(self) -> None:
+        manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
+        session_id = "conv_llama_hidden_suffix"
+        prompt = "Where is the main claim?"
+        suffix = "Selected passage:\n> The paper introduces a new method."
+        conversation = local_broker.CONVERSATIONS.get_or_create(session_id)
+        conversation["messages"] = [{"role": "user", "content": prompt}]
+        stamp = local_broker.now_iso()
+        run = {
+            "run_id": "run_llama_hidden_suffix",
+            "conversation_id": session_id,
+            "backend": "llama",
+            "status": "thinking",
+            "created_at": stamp,
+            "updated_at": stamp,
+            "completed_at": None,
+            "assistant_text": "",
+            "reasoning_text": "",
+            "risk_flags": [],
+            "backend_metadata": {},
+            "pending_approval": None,
+            "events": [],
+            "next_seq": 1,
+            "last_error": None,
+            "cancel_requested": False,
+            "_approval_decision": None,
+            "_prompt": prompt,
+            "_request_prompt_suffix": suffix,
+            "_page_context": None,
+            "_force_browser_action": False,
+            "_allowed_hosts": [],
+            "_llama_request_options": {},
+        }
+
+        with manager._condition:
+            manager._runs[run["run_id"]] = run
+
+        with patch.object(local_broker, "call_llama_stream", return_value=("Final answer.", "")) as mock_call:
+            answer, reasoning = manager._run_llama_loop(run["run_id"])
+
+        self.assertEqual("Final answer.", answer)
+        self.assertEqual("", reasoning)
+        self.assertEqual(prompt, conversation["messages"][-1]["content"])
+        self.assertEqual(
+            f"{prompt}\n\n{suffix}",
+            mock_call.call_args.args[0][-1]["content"],
+        )
+
+    def test_run_llama_loop_wraps_browser_agent_result(self) -> None:
+        manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
+        conversation = local_broker.CONVERSATIONS.get_or_create("conv_llama_browser_action")
+        conversation["messages"] = [{"role": "user", "content": "show me where the page explains the claim"}]
+        stamp = local_broker.now_iso()
+        run = {
+            "run_id": "run_llama_browser_action",
+            "conversation_id": "conv_llama_browser_action",
+            "backend": "llama",
+            "status": "thinking",
+            "created_at": stamp,
+            "updated_at": stamp,
+            "completed_at": None,
+            "assistant_text": "",
+            "reasoning_text": "",
+            "risk_flags": [],
+            "backend_metadata": {},
+            "pending_approval": None,
+            "events": [],
+            "next_seq": 1,
+            "last_error": None,
+            "cancel_requested": False,
+            "_approval_decision": None,
+            "_prompt": "show me where the page explains the claim",
+            "_page_context": None,
+            "_force_browser_action": True,
+            "_allowed_hosts": ["example.com"],
+            "_llama_request_options": {},
+        }
+
+        with manager._condition:
+            manager._runs[run["run_id"]] = run
+
+        with patch.object(local_broker.EXTENSION_RELAY, "health", return_value={"connected_clients": 1}):
+            with patch.object(
+                local_broker,
+                "run_llama_browser_agent",
+                return_value="Highlighted the relevant section.",
+            ) as mock_agent:
+                answer, reasoning = manager._run_llama_loop(run["run_id"])
+
+        self.assertEqual("Highlighted the relevant section.", answer)
+        self.assertEqual("", reasoning)
+        self.assertEqual("conv_llama_browser_action", mock_agent.call_args.args[0])
+
     def test_finish_run_persists_reasoning_only_assistant_message(self) -> None:
         manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
         stamp = local_broker.now_iso()
