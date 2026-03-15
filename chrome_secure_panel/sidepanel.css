@@ -1204,6 +1204,17 @@ button.ghost {
   background: #24182f;
 }
 
+button.composer-quick-action.active {
+  border-color: rgba(117, 240, 188, 0.48);
+  background:
+    linear-gradient(145deg, rgba(25, 60, 58, 0.96), rgba(17, 36, 45, 0.9)),
+    rgba(255, 255, 255, 0.03);
+  box-shadow:
+    0 0 0 1px rgba(117, 240, 188, 0.16),
+    0 10px 22px rgba(7, 21, 30, 0.24);
+  color: #e7fff5;
+}
+
 button.danger-tone {
   color: #ffb5cb;
 }

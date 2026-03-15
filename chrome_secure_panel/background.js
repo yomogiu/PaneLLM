@@ -164,6 +164,12 @@ async function handleMessage(message) {
   if (message.type === "assistant.jobs.cancel") {
     return await cancelJob(message);
   }
+  if (typeof message.type === "string" && message.type.startsWith("assistant.papers.")) {
+    return deprecatedPapersResponse();
+  }
+  if (message.type === "assistant.read.context.capture") {
+    return await captureReadAssistantContext(message);
+  }
   if (message.type === "assistant.papers.inspect") {
     return await inspectPaper(message);
   }
@@ -254,6 +260,56 @@ async function checkBrokerHealth() {
   return await brokerRequest("GET", "/health");
 }
 
+
+function deprecatedPapersResponse() {
+  return {
+    ok: false,
+    error: {
+      code: "deprecated_feature",
+      message: "Paper analysis has been replaced by the read assistant. Use chat with page context enabled."
+    }
+  };
+}
+
+async function captureReadAssistantContext(_message) {
+  const activeTab = await getActiveTab();
+  if (!activeTab?.url || typeof activeTab.id !== "number") {
+    return {
+      ok: false,
+      error: "Unable to resolve the active tab.",
+      context: null,
+      active_tab: null
+    };
+  }
+  const host = extractUrlHost(activeTab.url);
+  if (!host) {
+    return {
+      ok: false,
+      error: "Active tab host is invalid.",
+      context: null,
+      active_tab: null
+    };
+  }
+  const snapshot = getHostPolicySnapshot();
+  const activeInfo = {
+    host,
+    url: String(activeTab.url),
+    allowed: isHostAllowed(activeTab.url, snapshot.effective_allowed_hosts)
+  };
+  if (!activeInfo.allowed) {
+    return {
+      ok: false,
+      error: "Active tab is not in the extension allowlist.",
+      context: null,
+      active_tab: activeInfo
+    };
+  }
+  return {
+    context: await capturePageContext(activeTab),
+    active_tab: activeInfo
+  };
+}
+
 async function buildAssistantBrokerPayload(message) {
   await hostPolicyReady;
   validatePromptMessage(message);
@@ -290,6 +346,7 @@ async function buildAssistantBrokerPayload(message) {
   const payload = {
     session_id: message.sessionId,
     prompt: message.prompt,
+    request_prompt_suffix: String(message.requestPromptSuffix || "").trim(),
     page_context: pageContext,
     // Keep broker-side browser policy aligned with the extension runtime allowlist.
     allowed_hosts: normalizeAllowedHosts(),
@@ -1294,10 +1351,16 @@ async function waitForTabLoad(tabId, timeoutMs) {
   });
 }
 
+
 async function capturePageContext(tab) {
   const fallback = {
+    title: "",
     url: typeof tab?.url === "string" ? tab.url : "",
-    text_excerpt: ""
+    content_kind: "unknown",
+    selection: "",
+    text_excerpt: "",
+    heading_path: [],
+    selection_context: null
   };
 
   try {
@@ -1305,61 +1368,29 @@ async function capturePageContext(tab) {
     const tabId = parseTabId(tab?.id);
     const [injected] = await chrome.scripting.executeScript({
       target: { tabId },
-      func: (textLimit) => {
-        const BLOCK_TAGS = new Set([
-          "address",
+      func: (textLimit, selectionLimit, contextLimit, headingDepth) => {
+        const ROOT_SELECTOR = "article, main, [role='main']";
+        const BLOCK_SELECTOR = [
           "article",
-          "blockquote",
-          "dd",
+          "section",
+          "main",
           "div",
-          "dl",
-          "dt",
-          "figcaption",
+          "p",
+          "li",
+          "blockquote",
+          "pre",
           "figure",
+          "figcaption",
           "h1",
           "h2",
           "h3",
           "h4",
           "h5",
-          "h6",
-          "li",
-          "main",
-          "ol",
-          "p",
-          "pre",
-          "section",
-          "table",
-          "tbody",
-          "td",
-          "th",
-          "thead",
-          "tr",
-          "ul"
-        ]);
-        const SKIP_TAGS = new Set([
-          "aside",
-          "button",
-          "canvas",
-          "dialog",
-          "footer",
-          "form",
-          "header",
-          "iframe",
-          "input",
-          "nav",
-          "noscript",
-          "script",
-          "select",
-          "style",
-          "svg",
-          "textarea"
-        ]);
-        const BOILERPLATE_PATTERN =
-          /\b(ad|ads|advert|advertisement|sponsor|sponsored|promo|promoted|cookie|consent|newsletter|subscribe|signup|sign-up|related|recommend(?:ed|ation)?s?|social|share|sidebar|rail|banner|popup|modal|dialog|toolbar|breadcrumb|outbrain|taboola)\b/i;
-
-        const normalizeInline = (value) => String(value || "").replace(/\s+/g, " ").trim();
-        const clipText = (value, limit) => String(value || "").slice(0, limit);
-
+          "h6"
+        ].join(", ");
+        const HEADING_SELECTOR = "h1, h2, h3, h4, h5, h6";
+        const normalizeSpace = (value) => String(value || "").replace(/\s+/g, " ").trim();
+        const clip = (value, limit) => normalizeSpace(value).slice(0, limit);
         const isVisible = (element) => {
           if (!(element instanceof Element)) {
             return false;
@@ -1368,172 +1399,126 @@ async function capturePageContext(tab) {
           if (!style || style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
             return false;
           }
-          if (element.hasAttribute("hidden") || element.getAttribute("aria-hidden") === "true") {
-            return false;
-          }
           const rect = element.getBoundingClientRect();
           return rect.width > 0 && rect.height > 0;
         };
-
-        const markerText = (element) =>
-          normalizeInline([
-            element.id,
-            typeof element.className === "string" ? element.className : "",
-            element.getAttribute("role"),
-            element.getAttribute("aria-label"),
-            element.getAttribute("data-testid"),
-            element.getAttribute("data-test"),
-            element.getAttribute("name")
-          ].join(" "));
-
-        const shouldSkipElement = (element) => {
-          if (!(element instanceof Element)) {
-            return false;
+        const getText = (element) => clip(element?.innerText || element?.textContent || "", textLimit);
+        const closestElement = (node) => {
+          if (!node) {
+            return null;
           }
-          const tagName = String(element.tagName || "").toLowerCase();
-          if (tagName === "body" || tagName === "html") {
-            return false;
+          if (node instanceof Element) {
+            return node;
           }
-          if (SKIP_TAGS.has(tagName)) {
-            return true;
-          }
-          if (!isVisible(element)) {
-            return true;
-          }
-          const role = normalizeInline(element.getAttribute("role")).toLowerCase();
-          if (role === "navigation" || role === "banner" || role === "contentinfo" || role === "complementary") {
-            return true;
-          }
-          const marker = markerText(element);
-          return Boolean(marker && BOILERPLATE_PATTERN.test(marker));
+          return node.parentElement || null;
         };
-
-        const appendBoundary = (parts) => {
-          if (!parts.length) {
-            return;
+        const pickRoot = () => {
+          const candidates = Array.from(document.querySelectorAll(ROOT_SELECTOR)).filter(isVisible);
+          let best = null;
+          let bestLength = 0;
+          for (const candidate of candidates) {
+            const length = getText(candidate).length;
+            if (length > bestLength) {
+              best = candidate;
+              bestLength = length;
+            }
           }
-          const last = parts[parts.length - 1];
-          if (last !== "\n\n") {
-            parts.push("\n\n");
-          }
+          return best || document.body || document.documentElement || null;
         };
-
-        const appendText = (parts, value) => {
-          const text = normalizeInline(value);
-          if (!text) {
-            return;
+        const root = pickRoot();
+        const selectionObject = typeof window.getSelection === "function" ? window.getSelection() : null;
+        const selection = clip(selectionObject?.toString() || "", selectionLimit);
+        const range = selectionObject && selectionObject.rangeCount > 0 ? selectionObject.getRangeAt(0) : null;
+        const selectedElement = closestElement(range?.commonAncestorContainer) || root;
+        const nearestBlock = (element) => {
+          let current = element instanceof Element ? element : null;
+          while (current && current !== root && !current.matches?.(BLOCK_SELECTOR)) {
+            current = current.parentElement;
           }
-          const last = parts[parts.length - 1] || "";
-          if (last && last !== "\n" && last !== "\n\n" && !last.endsWith(" ")) {
-            parts.push(" ");
-          }
-          parts.push(text);
+          return current || root;
         };
-
-        const extractText = (root) => {
-          const parts = [];
-
-          const walk = (node) => {
-            if (!node) {
-              return;
-            }
-            if (node.nodeType === Node.TEXT_NODE) {
-              appendText(parts, node.textContent || "");
-              return;
-            }
-            if (!(node instanceof Element)) {
-              return;
-            }
-            const tagName = String(node.tagName || "").toLowerCase();
-            if (tagName === "br") {
-              if (parts.length && parts[parts.length - 1] !== "\n") {
-                parts.push("\n");
-              }
-              return;
-            }
-            if (shouldSkipElement(node)) {
-              return;
-            }
-            const isBlock = BLOCK_TAGS.has(tagName);
-            if (isBlock) {
-              appendBoundary(parts);
-            }
-            for (const child of Array.from(node.childNodes)) {
-              walk(child);
-            }
-            if (isBlock) {
-              appendBoundary(parts);
-            }
-          };
-
-          walk(root);
-
-          return parts
-            .join("")
-            .replace(/[ \t]+\n/g, "\n")
-            .replace(/\n[ \t]+/g, "\n")
-            .replace(/[ \t]{2,}/g, " ")
-            .replace(/\n{3,}/g, "\n\n")
-            .trim();
-        };
-
-        const rootCandidates = [
-          ...Array.from(document.querySelectorAll("article")),
-          ...Array.from(document.querySelectorAll("main")),
-          ...Array.from(document.querySelectorAll("[role='main']"))
-        ].filter((element, index, items) => items.indexOf(element) === index);
-
-        let bestRoot = null;
-        let bestLength = 0;
-        for (const candidate of rootCandidates) {
-          if (!(candidate instanceof Element) || shouldSkipElement(candidate)) {
-            continue;
-          }
-          const candidateText = extractText(candidate);
-          if (candidateText.length > bestLength) {
-            bestRoot = candidate;
-            bestLength = candidateText.length;
+        const focusBlock = nearestBlock(selectedElement);
+        const focusText = clip(getText(focusBlock), contextLimit * 3);
+        let selectionContext = null;
+        if (selection) {
+          const focusLower = focusText.toLowerCase();
+          const selectionLower = selection.toLowerCase();
+          const probe = selectionLower.slice(0, Math.min(selectionLower.length, 180));
+          const index = probe ? focusLower.indexOf(probe) : -1;
+          if (index >= 0) {
+            const before = focusText.slice(Math.max(0, index - contextLimit), index).trim();
+            const afterStart = Math.min(focusText.length, index + selection.length);
+            const after = focusText.slice(afterStart, afterStart + contextLimit).trim();
+            selectionContext = {
+              before: before.slice(0, contextLimit),
+              focus: selection.slice(0, contextLimit),
+              after: after.slice(0, contextLimit)
+            };
+          } else {
+            selectionContext = {
+              before: "",
+              focus: selection.slice(0, contextLimit),
+              after: focusText.slice(0, contextLimit)
+            };
           }
         }
-
-        const fallbackRoot =
-          document.body instanceof Element
-            ? document.body
-            : document.documentElement instanceof Element
-              ? document.documentElement
-              : null;
-        const chosenRoot = bestRoot || fallbackRoot;
-        let textExcerpt = chosenRoot ? extractText(chosenRoot) : "";
-        if (!textExcerpt) {
-          const bodyText =
-            typeof document.body?.innerText === "string"
-              ? document.body.innerText
-              : typeof document.documentElement?.innerText === "string"
-                ? document.documentElement.innerText
-                : typeof document.body?.textContent === "string"
-                  ? document.body.textContent
-                  : typeof document.documentElement?.textContent === "string"
-                    ? document.documentElement.textContent
-                    : "";
-          textExcerpt = normalizeInline(bodyText);
+        const headingPath = [];
+        const seen = new Set();
+        let probe = focusBlock instanceof Element ? focusBlock : root;
+        while (probe && headingPath.length < headingDepth) {
+          let current = probe;
+          let found = null;
+          while (current && !found) {
+            if (current.matches?.(HEADING_SELECTOR) && isVisible(current)) {
+              found = current;
+              break;
+            }
+            const nested = current.querySelector?.(HEADING_SELECTOR);
+            if (nested && isVisible(nested)) {
+              found = nested;
+              break;
+            }
+            current = current.previousElementSibling;
+          }
+          const headingText = clip(found?.innerText || found?.textContent || "", 160);
+          if (headingText && !seen.has(headingText)) {
+            seen.add(headingText);
+            headingPath.unshift(headingText);
+          }
+          probe = probe?.parentElement || null;
         }
-
+        const textExcerpt = getText(root);
         return {
-          url: clipText(location?.href || "", 2000),
-          text_excerpt: clipText(textExcerpt, textLimit)
+          title: clip(document.title || "", 240),
+          url: clip(location?.href || "", 2000),
+          content_kind: textExcerpt ? "html" : "unknown",
+          selection,
+          text_excerpt: textExcerpt,
+          heading_path: headingPath,
+          selection_context: selectionContext
         };
       },
-      args: [PAGE_CONTEXT_TEXT_CHARS]
+      args: [PAGE_CONTEXT_TEXT_CHARS, 1200, 500, 4]
     });
-
     const result = injected?.result;
     if (!result || typeof result !== "object") {
       return fallback;
     }
-
     return {
+      title: typeof result.title === "string" ? result.title : fallback.title,
       url: typeof result.url === "string" && result.url ? result.url : fallback.url,
-      text_excerpt: typeof result.text_excerpt === "string" ? result.text_excerpt : ""
+      content_kind: result.content_kind === "html" ? "html" : "unknown",
+      selection: typeof result.selection === "string" ? result.selection : "",
+      text_excerpt: typeof result.text_excerpt === "string" ? result.text_excerpt : "",
+      heading_path: Array.isArray(result.heading_path) ? result.heading_path.filter((item) => typeof item === "string") : [],
+      selection_context:
+        result.selection_context && typeof result.selection_context === "object"
+          ? {
+              before: typeof result.selection_context.before === "string" ? result.selection_context.before : "",
+              focus: typeof result.selection_context.focus === "string" ? result.selection_context.focus : "",
+              after: typeof result.selection_context.after === "string" ? result.selection_context.after : ""
+            }
+          : null
     };
   } catch (error) {
     console.warn("[secure-panel] page context capture fallback:", String(error?.message || error));
@@ -1931,6 +1916,8 @@ async function executeBrokerCommand(method, args) {
       return await commandPressKey(args, allowedHosts);
     case "scroll":
       return await commandScroll(args, allowedHosts);
+    case "highlight":
+      return await commandHighlight(args, allowedHosts);
     case "get_content":
       return await commandGetContent(args, allowedHosts);
     case "find_one":
@@ -2788,6 +2775,159 @@ function runGetContentTaskInPage(task) {
       interactive: interactiveItems.length > interactive.length,
       forms: visibleForms.length > forms.length
     }
+  };
+}
+
+
+function runHighlightTaskInPage(task) {
+  const CLEANUP_KEY = "__assistReadAssistantHighlightCleanup";
+  const BLOCK_SELECTOR = "article, main, section, p, li, blockquote, pre, div, h1, h2, h3, h4, h5, h6";
+  const normalizeText = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const preview = (value, limit = 200) => normalizeText(value).slice(0, limit);
+  const isVisible = (element) => {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+    const style = window.getComputedStyle(element);
+    if (!style || style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+      return false;
+    }
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const getText = (element) => preview(element?.innerText || element?.textContent || "", 5000);
+  const getRole = (element) => normalizeText(element.getAttribute?.("role")).toLowerCase();
+  const getLabel = (element) => normalizeText([
+    element.getAttribute?.("aria-label"),
+    element.getAttribute?.("name"),
+    element.getAttribute?.("placeholder")
+  ].join(" "));
+  const clearExisting = () => {
+    const cleanup = window[CLEANUP_KEY];
+    if (typeof cleanup === "function") {
+      cleanup();
+    }
+  };
+  const selectByText = (query) => {
+    const needle = normalizeText(query).toLowerCase();
+    if (!needle) {
+      return null;
+    }
+    const root = document.querySelector("article, main, [role='main']") || document.body || document.documentElement;
+    const candidates = Array.from(root.querySelectorAll(BLOCK_SELECTOR)).filter(isVisible);
+    return candidates.find((element) => getText(element).toLowerCase().includes(needle)) || null;
+  };
+  const selectByLocator = (locator) => {
+    if (!locator || typeof locator !== "object") {
+      return null;
+    }
+    if (typeof locator.selector === "string" && locator.selector.trim()) {
+      try {
+        const selectorMatch = Array.from(document.querySelectorAll(locator.selector.trim())).find((element) => {
+          if (!isVisible(element)) {
+            return false;
+          }
+          if (locator.text && !getText(element).toLowerCase().includes(normalizeText(locator.text).toLowerCase())) {
+            return false;
+          }
+          return true;
+        });
+        if (selectorMatch) {
+          return selectorMatch;
+        }
+      } catch {
+        // Ignore invalid selectors from model input.
+      }
+    }
+    const all = Array.from(document.querySelectorAll("*")).filter(isVisible);
+    return all.find((element) => {
+      if (locator.text && !getText(element).toLowerCase().includes(normalizeText(locator.text).toLowerCase())) {
+        return false;
+      }
+      if (locator.label && !getLabel(element).toLowerCase().includes(normalizeText(locator.label).toLowerCase())) {
+        return false;
+      }
+      if (locator.role && getRole(element) !== normalizeText(locator.role).toLowerCase()) {
+        return false;
+      }
+      if (locator.name && !normalizeText(element.getAttribute?.("name")).toLowerCase().includes(normalizeText(locator.name).toLowerCase())) {
+        return false;
+      }
+      if (locator.placeholder && !normalizeText(element.getAttribute?.("placeholder")).toLowerCase().includes(normalizeText(locator.placeholder).toLowerCase())) {
+        return false;
+      }
+      return Boolean(locator.text || locator.label || locator.role || locator.name || locator.placeholder);
+    }) || null;
+  };
+
+  const durationMs = Number.isInteger(task?.durationMs) ? Math.max(500, Math.min(task.durationMs, 20000)) : 6000;
+  const strategy = task?.locator ? "locator" : "text";
+  const target = selectByLocator(task?.locator) || selectByText(task?.text || "");
+  clearExisting();
+  if (!target) {
+    return {
+      ok: true,
+      highlighted: false,
+      strategy,
+      preview_text: "",
+      duration_ms: durationMs
+    };
+  }
+  if (task?.scroll !== false) {
+    target.scrollIntoView({ behavior: "instant", block: "center", inline: "nearest" });
+  }
+  const previous = {
+    outline: target.style.outline,
+    outlineOffset: target.style.outlineOffset,
+    boxShadow: target.style.boxShadow,
+    transition: target.style.transition
+  };
+  target.setAttribute("data-assist-read-highlight", "true");
+  target.style.outline = "3px solid #ffb300";
+  target.style.outlineOffset = "4px";
+  target.style.boxShadow = "0 0 0 8px rgba(255, 179, 0, 0.22)";
+  target.style.transition = "outline-color 120ms ease, box-shadow 120ms ease";
+  window[CLEANUP_KEY] = () => {
+    target.style.outline = previous.outline || "";
+    target.style.outlineOffset = previous.outlineOffset || "";
+    target.style.boxShadow = previous.boxShadow || "";
+    target.style.transition = previous.transition || "";
+    target.removeAttribute("data-assist-read-highlight");
+    window[CLEANUP_KEY] = null;
+  };
+  window.setTimeout(() => {
+    if (typeof window[CLEANUP_KEY] === "function") {
+      window[CLEANUP_KEY]();
+    }
+  }, durationMs);
+  return {
+    ok: true,
+    highlighted: true,
+    strategy,
+    preview_text: preview(getText(target), 200),
+    duration_ms: durationMs
+  };
+}
+
+async function commandHighlight(args, allowedHosts) {
+  const tabId = await resolveTabId(args.tabId);
+  await getAllowedTab(tabId, allowedHosts);
+  const locator = args.locator && typeof args.locator === "object"
+    ? normalizeLocator(args.locator, { defaultVisible: true })
+    : null;
+  const result = await runInTab(tabId, runHighlightTaskInPage, [{
+    locator,
+    text: typeof args.text === "string" ? args.text : "",
+    scroll: args.scroll !== false,
+    durationMs: Number.isInteger(args.durationMs) ? args.durationMs : 6000
+  }]);
+  return {
+    ok: Boolean(result?.ok),
+    tabId,
+    highlighted: Boolean(result?.highlighted),
+    strategy: result?.strategy || (locator ? "locator" : "text"),
+    preview_text: typeof result?.preview_text === "string" ? result.preview_text : "",
+    duration_ms: Number.isInteger(result?.duration_ms) ? result.duration_ms : 6000
   };
 }
 

@@ -27,6 +27,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlparse, urlsplit
 from urllib.request import Request, urlopen
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 
 HIGH_RISK_PATTERN = re.compile(
     r"\b(delete|transfer|wire|bank|purchase|buy|checkout|submit|password|token|credential|2fa|otp|security code)\b",
@@ -42,8 +46,13 @@ REQUIRED_CLIENT_VALUE = "chrome-sidepanel-v1"
 CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 PAGE_CONTEXT_FIELD_LIMITS = {
+    "title": 240,
     "url": 2000,
+    "content_kind": 32,
+    "selection": 1200,
     "text_excerpt": 5000,
+    "heading_path": 160,
+    "selection_context": 700,
 }
 PAGE_CONTEXT_PROMPT_CHAR_BUDGET = 7200
 CODEX_TOOL_OUTPUT_CHAR_BUDGET = 12000
@@ -52,6 +61,10 @@ CODEX_EVENT_POLL_MIN_TIMEOUT_MS = 0
 CODEX_EVENT_POLL_MAX_TIMEOUT_MS = 30000
 MLX_MAX_CONTEXT_CHARS_CAP = 56000
 LLAMA_HEALTHCHECK_TIMEOUT_SEC = 0.35
+from broker.services import mlx_runtime as mlx_runtime_service
+from broker.services import papers as papers_service
+from broker.services import read_assistant as read_assistant_service
+
 DEFAULT_LLAMA_MODEL = "glm-4.7-flash-llamacpp"
 BROWSER_AGENT_MAX_STEPS_DEFAULT = 20
 BROWSER_AGENT_MAX_STEPS_MIN = 1
@@ -80,6 +93,7 @@ CODEX_AUTO_APPROVE_TOOLS = {
     "browser.wait_for",
     "browser.get_element_state",
     "browser.scroll",
+    "browser.highlight",
     "browser.switch_tab",
     "browser.focus_tab",
 }
@@ -195,6 +209,7 @@ BROWSER_TOOL_NAMES = {
     "browser.wait_for",
     "browser.get_element_state",
     "browser.select_option",
+    "browser.highlight",
 }
 BROWSER_COMMAND_METHODS = {
     "browser.navigate": "navigate",
@@ -210,6 +225,7 @@ BROWSER_COMMAND_METHODS = {
     "browser.type": "type",
     "browser.press_key": "press_key",
     "browser.scroll": "scroll",
+    "browser.highlight": "highlight",
     "browser.find_one": "find_one",
     "browser.find_elements": "find_elements",
     "browser.wait_for": "wait_for",
@@ -248,7 +264,7 @@ MLX_BROWSER_AGENT_SYSTEM_PROMPT = (
     "Canonical tool names are: "
     "`browser.navigate`, `browser.open_tab`, `browser.get_tabs`, `browser.switch_tab`, "
     "`browser.close_tab`, `browser.focus_tab`, `browser.group_tabs`, `browser.describe_session_tabs`, "
-    "`browser.click`, `browser.type`, `browser.press_key`, `browser.scroll`, `browser.get_content`, "
+    "`browser.click`, `browser.type`, `browser.press_key`, `browser.scroll`, `browser.highlight`, `browser.get_content`, "
     "`browser.find_one`, `browser.find_elements`, `browser.wait_for`, `browser.get_element_state`, "
     "`browser.select_option`. "
     "Tool JSON must be one of these shapes: "
@@ -474,6 +490,25 @@ LLAMA_BROWSER_TOOLS = [
                     "selector": {"type": "string"},
                     "deltaX": {"type": "number"},
                     "deltaY": {"type": "number"},
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser.highlight",
+            "description": "Temporarily highlight a relevant section on the page and optionally scroll it into view.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tabId": {"type": "integer"},
+                    "locator": BROWSER_LOCATOR_SCHEMA,
+                    "text": {"type": "string"},
+                    "scroll": {"type": "boolean"},
+                    "durationMs": {"type": "integer"},
                 },
                 "required": [],
                 "additionalProperties": False,
@@ -1675,780 +1710,7 @@ class BrowserConfigManager:
             return self._config_payload_locked()
 
 
-class MlxRuntimeManager:
-    def __init__(self, config: BrokerConfig) -> None:
-        self._config = config
-        self._lock = threading.Lock()
-        self._process: subprocess.Popen[str] | None = None
-        self._status = "disabled" if not config.mlx_model_path else "stopped"
-        self._last_error = ""
-        self._started_at = ""
-        self._restart_success_count = 0
-        self._restart_failure_count = 0
-        self._telemetry: deque[dict[str, Any]] = deque(maxlen=120)
-
-        self._model_path = str(Path(config.mlx_model_path).expanduser()) if config.mlx_model_path else ""
-        self._worker_path = config.mlx_worker_path.expanduser()
-        self._worker_python = str(config.mlx_worker_python or "python3")
-
-        self._config_path = config.data_dir / "mlx_config.json"
-        self._adapters_path = config.data_dir / "mlx_adapters.json"
-        self._adapters: list[dict[str, Any]] = []
-        self._active_adapter_id = ""
-
-        self._generation_config = {
-            "temperature": float(config.mlx_default_temperature),
-            "top_p": float(config.mlx_default_top_p),
-            "top_k": int(config.mlx_default_top_k),
-            "max_tokens": int(config.mlx_default_max_tokens),
-            "repetition_penalty": float(config.mlx_default_repetition_penalty),
-            "seed": config.mlx_default_seed,
-            "enable_thinking": bool(config.mlx_default_enable_thinking),
-        }
-        self._system_prompt = str(config.mlx_default_system_prompt or "").strip()
-        self._load_persisted_config()
-        self._load_adapters()
-
-    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
-        tmp.replace(path)
-
-    def _load_json(self, path: Path) -> dict[str, Any]:
-        if not path.exists():
-            return {}
-        try:
-            parsed = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-
-    def _normalize_generation_config(self, value: Any) -> dict[str, Any]:
-        raw = value if isinstance(value, dict) else {}
-        seed_value = raw.get("seed")
-        seed: int | None
-        if seed_value in {"", None}:
-            seed = None
-        else:
-            try:
-                seed = int(seed_value)
-            except (TypeError, ValueError):
-                seed = None
-        raw_enable_thinking = raw.get(
-            "enable_thinking",
-            raw.get("enableThinking", self._generation_config["enable_thinking"]),
-        )
-        if isinstance(raw_enable_thinking, bool):
-            enable_thinking = raw_enable_thinking
-        elif isinstance(raw_enable_thinking, (int, float)):
-            enable_thinking = bool(raw_enable_thinking)
-        else:
-            enable_thinking = str(raw_enable_thinking).strip().lower() in {"1", "true", "yes", "on"}
-        return {
-            "temperature": float(raw.get("temperature", self._generation_config["temperature"])),
-            "top_p": float(raw.get("top_p", self._generation_config["top_p"])),
-            "top_k": int(raw.get("top_k", self._generation_config["top_k"])),
-            "max_tokens": int(raw.get("max_tokens", self._generation_config["max_tokens"])),
-            "repetition_penalty": float(
-                raw.get("repetition_penalty", self._generation_config["repetition_penalty"])
-            ),
-            "seed": seed,
-            "enable_thinking": enable_thinking,
-        }
-
-    def _normalize_system_prompt(self, value: Any) -> str:
-        if value is None:
-            return ""
-        return str(value).strip()
-
-    def _load_persisted_config(self) -> None:
-        payload = self._load_json(self._config_path)
-        normalized = self._normalize_generation_config(payload.get("generation", {}))
-        self._generation_config.update(normalized)
-        if "system_prompt" in payload or "systemPrompt" in payload:
-            raw_prompt = payload.get("system_prompt", payload.get("systemPrompt", ""))
-            self._system_prompt = self._normalize_system_prompt(raw_prompt)
-
-    def _save_persisted_config(self) -> None:
-        self._write_json(
-            self._config_path,
-            {
-                "generation": self._generation_config,
-                "system_prompt": self._system_prompt,
-            },
-        )
-
-    def _normalize_adapter(self, value: Any) -> dict[str, Any] | None:
-        if not isinstance(value, dict):
-            return None
-        adapter_id = str(value.get("id", "")).strip()
-        adapter_path = str(value.get("path", "")).strip()
-        if not adapter_id or not adapter_path:
-            return None
-        name = str(value.get("name", "")).strip() or Path(adapter_path).name
-        created_at = str(value.get("created_at", "")).strip() or now_iso()
-        return {
-            "id": adapter_id,
-            "name": name,
-            "path": str(Path(adapter_path).expanduser()),
-            "created_at": created_at,
-            "source_type": str(value.get("source_type", "")).strip(),
-            "run_id": str(value.get("run_id", "")).strip(),
-            "checkpoint_kind": str(value.get("checkpoint_kind", "")).strip(),
-            "step": int(value.get("step", 0) or 0),
-            "validation_loss": _coerce_optional_float(value.get("validation_loss")),
-            "dataset_id": str(value.get("dataset_id", "")).strip(),
-            "promoted": bool(value.get("promoted", False)),
-        }
-
-    def _load_adapters(self) -> None:
-        payload = self._load_json(self._adapters_path)
-        loaded: list[dict[str, Any]] = []
-        for entry in payload.get("adapters", []):
-            normalized = self._normalize_adapter(entry)
-            if normalized:
-                loaded.append(normalized)
-        self._adapters = loaded
-        active_id = str(payload.get("active_adapter_id", "")).strip()
-        if active_id and any(item["id"] == active_id for item in loaded):
-            self._active_adapter_id = active_id
-        else:
-            self._active_adapter_id = ""
-
-    def _save_adapters(self) -> None:
-        self._write_json(
-            self._adapters_path,
-            {
-                "adapters": self._adapters,
-                "active_adapter_id": self._active_adapter_id,
-            },
-        )
-
-    def is_available(self) -> bool:
-        return bool(self._model_path)
-
-    def _active_adapter_locked(self) -> dict[str, Any] | None:
-        if not self._active_adapter_id:
-            return None
-        for adapter in self._adapters:
-            if adapter["id"] == self._active_adapter_id:
-                return dict(adapter)
-        return None
-
-    def _effective_max_context_chars_locked(self) -> int:
-        return min(
-            MLX_MAX_CONTEXT_CHARS_CAP,
-            max(2000, int(self._config.mlx_max_context_chars)),
-        )
-
-    def effective_max_context_chars(self) -> int:
-        with self._lock:
-            return self._effective_max_context_chars_locked()
-
-    def _contract_locked(self) -> dict[str, Any]:
-        return {
-            **MLX_CHAT_CONTRACT_BASE,
-            "max_context_chars": self._effective_max_context_chars_locked(),
-        }
-
-    def _assert_worker_contract_locked(self, contract: Any) -> None:
-        if not isinstance(contract, dict):
-            raise RuntimeError("MLX worker contract is missing or invalid.")
-        expected = self._contract_locked()
-        for key, expected_value in expected.items():
-            actual_value = contract.get(key)
-            if actual_value != expected_value:
-                raise RuntimeError(
-                    f"MLX worker contract mismatch for '{key}': expected '{expected_value}', got '{actual_value}'."
-                )
-
-    def _status_payload_locked(self) -> dict[str, Any]:
-        process = self._process
-        running = bool(process and process.poll() is None)
-        if self._status == "running" and not running:
-            self._status = "failed"
-            if not self._last_error:
-                self._last_error = "MLX worker exited unexpectedly."
-        active_adapter = self._active_adapter_locked()
-        latency_points = [int(item.get("latency_ms", 0)) for item in list(self._telemetry)[-30:]]
-        tps_points = [float(item.get("tokens_per_sec", 0.0)) for item in list(self._telemetry)[-30:]]
-        return {
-            "available": self.is_available(),
-            "status": self._status,
-            "model_path": self._model_path,
-            "worker_path": str(self._worker_path),
-            "worker_pid": process.pid if running else None,
-            "started_at": self._started_at,
-            "last_error": self._last_error,
-            "generation_config": dict(self._generation_config),
-            "system_prompt": self._system_prompt,
-            "active_adapter": active_adapter,
-            "contract": self._contract_locked(),
-            "metrics": {
-                "latency_ms": latency_points,
-                "tokens_per_sec": tps_points,
-                "restart_success_count": self._restart_success_count,
-                "restart_failure_count": self._restart_failure_count,
-            },
-        }
-
-    def status(self) -> dict[str, Any]:
-        with self._lock:
-            return self._status_payload_locked()
-
-    def models_payload(self) -> dict[str, Any]:
-        with self._lock:
-            llama = llama_backend_health(self._config)
-            return {
-                "backends": [
-                    {"id": "codex", "label": "Codex", "available": codex_backend_mode() != "disabled"},
-                    {"id": "llama", "label": "llama.cpp", "available": bool(llama["available"])},
-                    {"id": "mlx", "label": "MLX Local", "available": self.is_available()},
-                ],
-                "llama": llama,
-                "mlx": self._status_payload_locked(),
-            }
-
-    def _set_status_locked(self, status: str, error: str = "") -> None:
-        self._status = status
-        self._last_error = error
-        if status == "running":
-            self._started_at = now_iso()
-        elif status in {"stopped", "failed", "disabled"}:
-            self._started_at = ""
-
-    def _stderr_excerpt_locked(self, process: subprocess.Popen[str]) -> str:
-        try:
-            if not process.stderr:
-                return ""
-            return summarize_mlx_worker_failure(process.stderr.read() or "")
-        except Exception:
-            return ""
-
-    def _readline_with_timeout(
-        self,
-        process: subprocess.Popen[str],
-        stream: Any,
-        timeout_sec: float,
-    ) -> str:
-        if timeout_sec <= 0:
-            timeout_sec = 0.1
-        fd = stream.fileno()
-        end_at = time.monotonic() + timeout_sec
-        while True:
-            remaining = end_at - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Timed out waiting for MLX worker response.")
-            ready, _, _ = select.select([fd], [], [], remaining)
-            if not ready:
-                if process.poll() is not None:
-                    detail = self._stderr_excerpt_locked(process)
-                    if detail:
-                        raise RuntimeError(f"MLX worker exited before responding: {detail}")
-                    raise RuntimeError("MLX worker exited before responding.")
-                continue
-            line = stream.readline()
-            if line == "":
-                detail = self._stderr_excerpt_locked(process)
-                if detail:
-                    raise RuntimeError(f"MLX worker closed its stdout stream: {detail}")
-                raise RuntimeError("MLX worker closed its stdout stream.")
-            return line.strip()
-
-    def _read_response_locked(
-        self,
-        process: subprocess.Popen[str],
-        expected_request_id: str,
-        timeout_sec: float,
-    ) -> dict[str, Any]:
-        end_at = time.monotonic() + max(0.1, timeout_sec)
-        while True:
-            line = self._readline_with_timeout(process, process.stdout, max(0.1, end_at - time.monotonic()))
-            if not line:
-                continue
-            try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(parsed, dict):
-                continue
-            request_id = str(parsed.get("request_id", ""))
-            if request_id != expected_request_id:
-                continue
-            return parsed
-
-    def _read_stream_response_locked(
-        self,
-        process: subprocess.Popen[str],
-        expected_request_id: str,
-        timeout_sec: float,
-        on_event: Any = None,
-        cancel_check: Any = None,
-    ) -> dict[str, Any]:
-        end_at = time.monotonic() + max(0.1, timeout_sec)
-        while True:
-            if cancel_check and cancel_check():
-                raise RouteRequestCancelledError("Request cancelled by user.")
-            line = self._readline_with_timeout(process, process.stdout, max(0.1, end_at - time.monotonic()))
-            if not line:
-                continue
-            try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(parsed, dict):
-                continue
-            request_id = str(parsed.get("request_id", ""))
-            if request_id != expected_request_id:
-                continue
-            event_type = str(parsed.get("event", "")).strip().lower()
-            if event_type and event_type != "completed":
-                if on_event:
-                    on_event(parsed)
-                continue
-            return parsed
-
-    def _rpc_locked(
-        self,
-        op: str,
-        payload: dict[str, Any],
-        *,
-        timeout_sec: float,
-    ) -> dict[str, Any]:
-        process = self._process
-        if not process or process.poll() is not None:
-            self._set_status_locked("failed", "MLX worker process is not running.")
-            raise RuntimeError("MLX worker process is not running.")
-        request_id = f"mlx_{uuid.uuid4().hex[:12]}"
-        request_payload = {"request_id": request_id, "op": op, **payload}
-        process.stdin.write(json.dumps(request_payload, ensure_ascii=True) + "\n")
-        process.stdin.flush()
-        response = self._read_response_locked(process, request_id, timeout_sec)
-        if not bool(response.get("ok")):
-            error = response.get("error") if isinstance(response.get("error"), dict) else {}
-            message = str(error.get("message", "")).strip() or "Unknown MLX worker error."
-            raise RuntimeError(message)
-        data = response.get("data")
-        return data if isinstance(data, dict) else {}
-
-    def start(self) -> dict[str, Any]:
-        with self._lock:
-            if not self.is_available():
-                self._set_status_locked("disabled", "BROKER_MLX_MODEL_PATH is not configured.")
-                raise RuntimeError("MLX is not configured. Set BROKER_MLX_MODEL_PATH first.")
-            if self._status == "running" and self._process and self._process.poll() is None:
-                return self._status_payload_locked()
-            if not self._worker_path.exists():
-                self._set_status_locked("failed", f"MLX worker script not found: {self._worker_path}")
-                raise RuntimeError(f"MLX worker script not found: {self._worker_path}")
-
-            self._set_status_locked("starting", "")
-            command = [
-                self._worker_python,
-                str(self._worker_path),
-                "--model-path",
-                self._model_path,
-                "--max-context-chars",
-                str(self._effective_max_context_chars_locked()),
-            ]
-            try:
-                process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,
-                )
-            except Exception as error:
-                self._set_status_locked("failed", f"Failed to launch MLX worker: {error}")
-                raise RuntimeError(f"Failed to launch MLX worker: {error}") from error
-
-            self._process = process
-            try:
-                startup = self._read_response_locked(
-                    process,
-                    "startup",
-                    float(self._config.mlx_start_timeout_sec),
-                )
-            except Exception as error:
-                terminate_subprocess(process, timeout_sec=float(self._config.mlx_stop_timeout_sec))
-                self._process = None
-                self._set_status_locked("failed", str(error))
-                raise RuntimeError(f"MLX startup failed: {error}") from error
-
-            if not bool(startup.get("ok")):
-                error_obj = startup.get("error") if isinstance(startup.get("error"), dict) else {}
-                message = str(error_obj.get("message", "MLX startup failed."))
-                terminate_subprocess(process, timeout_sec=float(self._config.mlx_stop_timeout_sec))
-                self._process = None
-                self._set_status_locked("failed", message)
-                raise RuntimeError(message)
-
-            startup_data = startup.get("data") if isinstance(startup.get("data"), dict) else {}
-            try:
-                self._assert_worker_contract_locked(startup_data.get("contract"))
-            except Exception as error:
-                terminate_subprocess(process, timeout_sec=float(self._config.mlx_stop_timeout_sec))
-                self._process = None
-                self._set_status_locked("failed", str(error))
-                raise RuntimeError(str(error)) from error
-            self._set_status_locked("running", "")
-            active_adapter = self._active_adapter_locked()
-            try:
-                if active_adapter:
-                    self._rpc_locked(
-                        "adapter_load",
-                        {"adapter_path": str(active_adapter["path"])},
-                        timeout_sec=float(self._config.mlx_start_timeout_sec),
-                    )
-            except Exception as error:
-                terminate_subprocess(process, timeout_sec=float(self._config.mlx_stop_timeout_sec))
-                self._process = None
-                self._set_status_locked("failed", f"MLX adapter restore failed: {error}")
-                raise RuntimeError(f"MLX adapter restore failed: {error}") from error
-            return self._status_payload_locked()
-
-    def stop(self) -> dict[str, Any]:
-        with self._lock:
-            process = self._process
-            if not process:
-                self._set_status_locked("stopped", "")
-                return self._status_payload_locked()
-            if process.poll() is None:
-                try:
-                    self._rpc_locked(
-                        "shutdown",
-                        {},
-                        timeout_sec=min(3.0, float(self._config.mlx_stop_timeout_sec)),
-                    )
-                except Exception:
-                    pass
-            terminate_subprocess(process, timeout_sec=float(self._config.mlx_stop_timeout_sec))
-            self._process = None
-            self._set_status_locked("stopped", "")
-            return self._status_payload_locked()
-
-    def restart(self) -> dict[str, Any]:
-        try:
-            self.stop()
-            payload = self.start()
-            with self._lock:
-                self._restart_success_count += 1
-                payload = self._status_payload_locked()
-            return payload
-        except Exception:
-            with self._lock:
-                self._restart_failure_count += 1
-            raise
-
-    def update_generation_config(self, updates: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(updates, dict):
-            raise ValueError("config must be an object.")
-        with self._lock:
-            current = dict(self._generation_config)
-            system_prompt = self._system_prompt
-            if "temperature" in updates:
-                current["temperature"] = float(updates["temperature"])
-            if "top_p" in updates:
-                current["top_p"] = float(updates["top_p"])
-            if "top_k" in updates:
-                current["top_k"] = int(updates["top_k"])
-            if "max_tokens" in updates:
-                current["max_tokens"] = int(updates["max_tokens"])
-            if "repetition_penalty" in updates:
-                current["repetition_penalty"] = float(updates["repetition_penalty"])
-            if "seed" in updates:
-                seed_value = updates["seed"]
-                if seed_value in {"", None}:
-                    current["seed"] = None
-                else:
-                    current["seed"] = int(seed_value)
-            if "enable_thinking" in updates:
-                current["enable_thinking"] = ensure_boolean_flag(updates["enable_thinking"], "enable_thinking")
-            elif "enableThinking" in updates:
-                current["enable_thinking"] = ensure_boolean_flag(updates["enableThinking"], "enableThinking")
-            if "system_prompt" in updates:
-                system_prompt = self._normalize_system_prompt(updates["system_prompt"])
-            elif "systemPrompt" in updates:
-                system_prompt = self._normalize_system_prompt(updates["systemPrompt"])
-            if current["top_p"] <= 0 or current["top_p"] > 1:
-                raise ValueError("top_p must be > 0 and <= 1.")
-            if current["top_k"] < 1:
-                raise ValueError("top_k must be >= 1.")
-            if current["max_tokens"] < 16:
-                raise ValueError("max_tokens must be >= 16.")
-            if current["temperature"] < 0:
-                raise ValueError("temperature must be >= 0.")
-            if current["repetition_penalty"] <= 0:
-                raise ValueError("repetition_penalty must be > 0.")
-            self._generation_config = current
-            self._system_prompt = system_prompt
-            self._save_persisted_config()
-            return self._status_payload_locked()
-
-    def _messages_with_system_prompt_locked(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
-        output = list(messages)
-        system_parts: list[str] = []
-        if self._system_prompt:
-            system_parts.append(self._system_prompt)
-        if bool(self._generation_config.get("enable_thinking")):
-            system_parts.append(MLX_THINKING_INSTRUCTIONS)
-        if system_parts:
-            output = [{"role": "system", "content": "\n\n".join(system_parts)}, *output]
-        return output
-
-    def list_adapters(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "adapters": [dict(item) for item in self._adapters],
-                "active_adapter": self._active_adapter_locked(),
-            }
-
-    def register_adapter(
-        self,
-        *,
-        path: str,
-        name: str = "",
-        adapter_id: str = "",
-        metadata: dict[str, Any] | None = None,
-        activate: bool = False,
-    ) -> dict[str, Any]:
-        with self._lock:
-            adapter_path = str(Path(path).expanduser()) if path else ""
-            if not adapter_path:
-                raise ValueError("path is required.")
-            if not Path(adapter_path).exists():
-                raise ValueError(f"Adapter path does not exist: {adapter_path}")
-            selected: dict[str, Any] | None = None
-            if adapter_id:
-                for item in self._adapters:
-                    if item["id"] == adapter_id:
-                        selected = item
-                        break
-            if not selected:
-                for item in self._adapters:
-                    if item["path"] == adapter_path:
-                        selected = item
-                        break
-            if not selected:
-                selected = {
-                    "id": adapter_id.strip() or f"adp_{uuid.uuid4().hex[:10]}",
-                    "name": name.strip() or Path(adapter_path).name,
-                    "path": adapter_path,
-                    "created_at": now_iso(),
-                }
-                self._adapters.append(selected)
-            else:
-                selected["path"] = adapter_path
-                if name.strip():
-                    selected["name"] = name.strip()
-            for key, value in (metadata or {}).items():
-                selected[key] = value
-            normalized = self._normalize_adapter(selected)
-            if not normalized:
-                raise ValueError("Adapter metadata is invalid.")
-            for index, item in enumerate(self._adapters):
-                if item["id"] == normalized["id"]:
-                    self._adapters[index] = normalized
-                    break
-            if activate:
-                self._active_adapter_id = str(normalized["id"])
-                if self._status == "running" and self._process and self._process.poll() is None:
-                    self._rpc_locked(
-                        "adapter_load",
-                        {"adapter_path": str(normalized["path"])},
-                        timeout_sec=float(self._config.mlx_generation_timeout_sec),
-                    )
-            self._save_adapters()
-            return {
-                "adapters": [dict(item) for item in self._adapters],
-                "active_adapter": self._active_adapter_locked(),
-                "adapter": dict(normalized),
-            }
-
-    def load_adapter(self, *, adapter_id: str = "", path: str = "", name: str = "") -> dict[str, Any]:
-        with self._lock:
-            selected: dict[str, Any] | None = None
-            if adapter_id:
-                for item in self._adapters:
-                    if item["id"] == adapter_id:
-                        selected = item
-                        break
-                if not selected:
-                    raise ValueError("adapter_id was not found.")
-            else:
-                adapter_path = str(Path(path).expanduser()) if path else ""
-                if not adapter_path:
-                    raise ValueError("path is required when adapter_id is not provided.")
-                if not Path(adapter_path).exists():
-                    raise ValueError(f"Adapter path does not exist: {adapter_path}")
-                for item in self._adapters:
-                    if item["path"] == adapter_path:
-                        selected = item
-                        break
-            if selected:
-                self._active_adapter_id = str(selected["id"])
-                if self._status == "running" and self._process and self._process.poll() is None:
-                    self._rpc_locked(
-                        "adapter_load",
-                        {"adapter_path": str(selected["path"])},
-                        timeout_sec=float(self._config.mlx_generation_timeout_sec),
-                    )
-                self._save_adapters()
-                return {
-                    "adapters": [dict(item) for item in self._adapters],
-                    "active_adapter": dict(selected),
-                }
-        payload = self.register_adapter(path=path, name=name, activate=True)
-        return {
-            "adapters": payload.get("adapters", []),
-            "active_adapter": payload.get("active_adapter"),
-        }
-
-    def unload_adapter(self) -> dict[str, Any]:
-        with self._lock:
-            self._active_adapter_id = ""
-            if self._status == "running" and self._process and self._process.poll() is None:
-                self._rpc_locked(
-                    "adapter_unload",
-                    {},
-                    timeout_sec=float(self._config.mlx_generation_timeout_sec),
-                )
-            self._save_adapters()
-            return {
-                "adapters": [dict(item) for item in self._adapters],
-                "active_adapter": None,
-            }
-
-    def generate(
-        self,
-        messages: list[dict[str, str]],
-        *,
-        cancel_check: Any = None,
-    ) -> str:
-        if cancel_check and cancel_check():
-            raise RouteRequestCancelledError("Request cancelled by user.")
-        with self._lock:
-            if self._status != "running" or not self._process or self._process.poll() is not None:
-                raise RuntimeError("MLX session is not running. Start MLX from the Models tab.")
-            contract = self._contract_locked()
-            worker_messages = self._messages_with_system_prompt_locked(messages)
-            data = self._rpc_locked(
-                "generate",
-                {
-                    "schema_version": contract["schema_version"],
-                    "contract": contract,
-                    "messages": worker_messages,
-                    "params": self._generation_config,
-                },
-                timeout_sec=float(self._config.mlx_generation_timeout_sec),
-            )
-            self._assert_worker_contract_locked(data.get("contract"))
-            text = str(data.get("text", "")).strip()
-            token_count = int(data.get("token_count", 0) or 0)
-            latency_ms = int(data.get("latency_ms", 0) or 0)
-            tokens_per_sec = 0.0
-            if latency_ms > 0 and token_count > 0:
-                tokens_per_sec = token_count / (latency_ms / 1000.0)
-            self._telemetry.append(
-                {
-                    "created_at": now_iso(),
-                    "latency_ms": latency_ms,
-                    "token_count": token_count,
-                    "tokens_per_sec": tokens_per_sec,
-                }
-            )
-        if cancel_check and cancel_check():
-            raise RouteRequestCancelledError("Request cancelled by user.")
-        return text
-
-    def generate_stream(
-        self,
-        messages: list[dict[str, str]],
-        *,
-        cancel_check: Any = None,
-        on_text_delta: Any = None,
-    ) -> str:
-        if cancel_check and cancel_check():
-            raise RouteRequestCancelledError("Request cancelled by user.")
-        with self._lock:
-            if self._status != "running" or not self._process or self._process.poll() is not None:
-                raise RuntimeError("MLX session is not running. Start MLX from the Models tab.")
-            contract = self._contract_locked()
-            worker_messages = self._messages_with_system_prompt_locked(messages)
-            process = self._process
-            request_id = f"mlx_{uuid.uuid4().hex[:12]}"
-            request_payload = {
-                "request_id": request_id,
-                "op": "generate_stream",
-                "schema_version": contract["schema_version"],
-                "contract": contract,
-                "messages": worker_messages,
-                "params": self._generation_config,
-            }
-            process.stdin.write(json.dumps(request_payload, ensure_ascii=True) + "\n")
-            process.stdin.flush()
-
-            accumulated_text = ""
-
-            def _on_stream_event(event: dict[str, Any]) -> None:
-                nonlocal accumulated_text
-                if cancel_check and cancel_check():
-                    raise RouteRequestCancelledError("Request cancelled by user.")
-                if str(event.get("event", "")).strip().lower() != "delta":
-                    return
-                data = event.get("data") if isinstance(event.get("data"), dict) else {}
-                delta = str(data.get("delta", "") or "")
-                text = str(data.get("text", "") or "")
-                if text:
-                    accumulated_text = text
-                elif delta:
-                    accumulated_text += delta
-                if delta and on_text_delta:
-                    on_text_delta(delta, accumulated_text)
-
-            data = self._read_stream_response_locked(
-                process,
-                request_id,
-                timeout_sec=float(self._config.mlx_generation_timeout_sec),
-                on_event=_on_stream_event,
-                cancel_check=cancel_check,
-            )
-            if not bool(data.get("ok")):
-                error = data.get("error") if isinstance(data.get("error"), dict) else {}
-                message = str(error.get("message", "")).strip() or "Unknown MLX worker error."
-                raise RuntimeError(message)
-            payload = data.get("data") if isinstance(data.get("data"), dict) else {}
-            self._assert_worker_contract_locked(payload.get("contract"))
-            text = str(payload.get("text", "")).strip() or accumulated_text.strip()
-            token_count = int(payload.get("token_count", 0) or 0)
-            latency_ms = int(payload.get("latency_ms", 0) or 0)
-            tokens_per_sec = 0.0
-            if latency_ms > 0 and token_count > 0:
-                tokens_per_sec = token_count / (latency_ms / 1000.0)
-            self._telemetry.append(
-                {
-                    "created_at": now_iso(),
-                    "latency_ms": latency_ms,
-                    "token_count": token_count,
-                    "tokens_per_sec": tokens_per_sec,
-                }
-            )
-        if cancel_check and cancel_check():
-            raise RouteRequestCancelledError("Request cancelled by user.")
-        return text
-
-    def health(self) -> dict[str, Any]:
-        with self._lock:
-            status = self._status_payload_locked()
-            return {
-                "available": status["available"],
-                "status": status["status"],
-                "worker_pid": status["worker_pid"],
-                "last_error": status["last_error"],
-            }
+MlxRuntimeManager = mlx_runtime_service.MlxRuntimeManager
 
 
 class AsyncJobStore:
@@ -2718,162 +1980,7 @@ class ExperimentStore:
             return self._read_json(self._path(experiment_id))
 
 
-class PaperManager:
-    def __init__(self, config: BrokerConfig) -> None:
-        self._config = config
-        self._store = PaperStore(config.data_dir)
-        self._jobs = AsyncJobStore(config.data_dir, "paper")
-
-    def _worker_payload(self, payload: dict[str, Any], *, mode: str) -> dict[str, Any]:
-        data = {"mode": mode}
-        for key in ("url", "pdf_path", "pdfPath", "html_path", "htmlPath", "text_path", "textPath"):
-            if key in payload and payload.get(key):
-                normalized = key.replace("Path", "_path")
-                data[normalized] = payload.get(key)
-        if "allow_html_fallback" in payload or "allowHtmlFallback" in payload:
-            data["allow_html_fallback"] = payload.get("allow_html_fallback", payload.get("allowHtmlFallback", False))
-        return data
-
-    def _run_worker(self, payload: dict[str, Any], *, mode: str, timeout_sec: int, cancel_check: Any = None) -> dict[str, Any]:
-        if not self._config.paper_worker_path.exists():
-            raise RuntimeError(f"Paper worker script not found: {self._config.paper_worker_path}")
-        command = [
-            self._config.paper_worker_python,
-            str(self._config.paper_worker_path),
-        ]
-        completed = run_subprocess_with_cancel(
-            command,
-            input_text=json.dumps(self._worker_payload(payload, mode=mode), ensure_ascii=True),
-            timeout_sec=float(timeout_sec),
-            cancel_check=cancel_check,
-        )
-        stdout = str(completed.stdout or "").strip()
-        stderr = str(completed.stderr or "").strip()
-        if completed.returncode != 0 and not stdout:
-            raise RuntimeError(stderr or "Paper worker exited unsuccessfully.")
-        parsed = json.loads(stdout or "{}")
-        if not isinstance(parsed, dict) or not bool(parsed.get("ok")):
-            error = parsed.get("error") if isinstance(parsed.get("error"), dict) else {}
-            raise RuntimeError(str(error.get("message", stderr or "Paper worker failed.")))
-        data = parsed.get("data")
-        if not isinstance(data, dict):
-            raise RuntimeError("Paper worker returned an invalid payload.")
-        return data
-
-    def inspect(self, payload: dict[str, Any]) -> dict[str, Any]:
-        inspect_payload = self._run_worker(
-            payload,
-            mode="inspect",
-            timeout_sec=min(45, self._config.paper_job_timeout_sec),
-        )
-        cached = self._store.find_by_source_key(str(inspect_payload.get("source_key", "")))
-        return {
-            "ok": True,
-            "inspect": inspect_payload,
-            "cached_paper": self._store._summary(cached) if cached else None,
-        }
-
-    def start_job(self, payload: dict[str, Any]) -> dict[str, Any]:
-        analysis_mode = str(payload.get("analysis_mode", payload.get("analysisMode", "digest")) or "digest").strip().lower()
-        if analysis_mode not in {"extract", "digest"}:
-            raise ValueError("analysis_mode must be extract or digest.")
-        backend = str(payload.get("backend", "") or "").strip().lower()
-        if analysis_mode == "digest" and backend not in {"", "llama", "mlx"}:
-            raise ValueError("paper analysis backend must be llama or mlx.")
-        if analysis_mode == "digest" and not backend:
-            backend = "mlx" if self._config.mlx_model_path else "llama"
-        summary = {
-            "url": str(payload.get("url", "") or ""),
-            "pdf_path": str(payload.get("pdf_path", payload.get("pdfPath", "")) or ""),
-            "html_path": str(payload.get("html_path", payload.get("htmlPath", "")) or ""),
-            "text_path": str(payload.get("text_path", payload.get("textPath", "")) or ""),
-            "analysis_mode": analysis_mode,
-            "backend": backend,
-        }
-        job = self._jobs.create(
-            "paper.digest" if analysis_mode == "digest" else "paper.extract",
-            summary,
-        )
-        request_payload = {**payload, "analysis_mode": analysis_mode, "backend": backend}
-        thread = threading.Thread(target=self._run_job, args=(job["job_id"], request_payload), daemon=True)
-        thread.start()
-        return {"ok": True, "job": job}
-
-    def _run_job(self, job_id: str, payload: dict[str, Any]) -> None:
-        try:
-            self._jobs.update(job_id, {"status": "running"})
-            if self._jobs.is_cancel_requested(job_id):
-                self._jobs.update(job_id, {"status": "cancelled", "error": {"code": "cancelled", "message": "Job cancelled."}})
-                return
-            paper = self._run_worker(
-                payload,
-                mode="extract",
-                timeout_sec=self._config.paper_job_timeout_sec,
-                cancel_check=lambda: self._jobs.is_cancel_requested(job_id),
-            )
-            stored = self._store.upsert_extracted(paper)
-            digest_text = ""
-            backend = str(payload.get("backend", "") or "").strip().lower()
-            if str(payload.get("analysis_mode", "")) == "digest":
-                if self._jobs.is_cancel_requested(job_id):
-                    self._jobs.update(job_id, {"status": "cancelled", "error": {"code": "cancelled", "message": "Job cancelled."}})
-                    return
-                digest_text = generate_paper_digest(
-                    stored,
-                    backend=backend,
-                    cancel_check=lambda: self._jobs.is_cancel_requested(job_id),
-                )
-                digest_entry = {
-                    "digest_id": f"digest_{sha1(f'{job_id}:{backend}:{time.time()}'.encode('utf-8')).hexdigest()[:10]}",
-                    "backend": backend,
-                    "mode": "research_digest",
-                    "created_at": now_iso(),
-                    "text": digest_text,
-                }
-                stored = self._store.append_digest(str(stored.get("paper_id", "")), digest_entry)
-            self._jobs.update(
-                job_id,
-                {
-                    "status": "completed",
-                    "result": {
-                        "paper_id": str(stored.get("paper_id", "")),
-                        "title": str(stored.get("title", "")),
-                        "section_count": int(stored.get("section_count", 0) or 0),
-                        "char_count": int(stored.get("char_count", 0) or 0),
-                        "latest_digest_excerpt": truncate_text(digest_text, 320),
-                    },
-                    "error": None,
-                },
-            )
-        except Exception as error:
-            status = "cancelled" if self._jobs.is_cancel_requested(job_id) else "failed"
-            code = "cancelled" if status == "cancelled" else "job_failed"
-            self._jobs.update(job_id, {"status": status, "error": {"code": code, "message": str(error)}})
-
-    def list_jobs(self, *, status_filter: str = "") -> list[dict[str, Any]]:
-        return self._jobs.list_metadata(status_filter=status_filter)
-
-    def get_job(self, job_id: str) -> dict[str, Any]:
-        return self._jobs.get(job_id)
-
-    def cancel_job(self, job_id: str) -> dict[str, Any]:
-        payload = self._jobs.cancel(job_id)
-        return {"ok": True, "job": payload}
-
-    def list_papers(self) -> dict[str, Any]:
-        return {"papers": self._store.list_metadata()}
-
-    def get_paper(self, paper_id: str) -> dict[str, Any]:
-        return {"paper": self._store.get(paper_id)}
-
-    def get_section(self, paper_id: str, section_id: str) -> dict[str, Any]:
-        return {"paper_id": paper_id, "section": self._store.get_section(paper_id, section_id)}
-
-    def health(self) -> dict[str, Any]:
-        return {
-            "jobs": self._jobs.health(),
-            "papers": len(self._store.list_metadata(limit=500)),
-        }
+PaperManager = papers_service.PaperManager
 
 
 class ExperimentManager:
@@ -4648,6 +3755,16 @@ def summarize_codex_tool_action(tool_name: str, tool_args: dict[str, Any]) -> di
     }:
         selector = summarize_tool_locator(tool_args)
         summary = f"{tool_name} {selector or 'locator'}".strip()
+
+    elif tool_name == "browser.highlight":
+        selector = summarize_tool_locator(tool_args)
+        text_preview = truncate_text(tool_args.get("text", ""), CODEX_APPROVAL_TEXT_PREVIEW_CHARS)
+        if selector:
+            summary = f"{tool_name} {selector}".strip()
+        elif text_preview:
+            summary = f"{tool_name} {text_preview}".strip()
+        else:
+            summary = tool_name
     elif tool_name == "browser.select_option":
         selector = summarize_tool_locator(tool_args)
         option_value = truncate_text(tool_args.get("value", ""), CODEX_APPROVAL_TEXT_PREVIEW_CHARS)
@@ -4818,6 +3935,9 @@ class CodexRunManager:
             raise ValueError("backend must be llama, codex, or mlx.")
         session_id = str(data.get("session_id", "")).strip()
         prompt = str(data.get("prompt", "")).strip()
+        request_prompt_suffix = str(
+            data.get("request_prompt_suffix", data.get("requestPromptSuffix")) or ""
+        ).strip()
         llama_options = normalize_llama_request_options(data)
         rewrite_message_index = ensure_rewrite_message_index(
             data.get("rewrite_message_index", data.get("rewriteMessageIndex"))
@@ -4907,6 +4027,7 @@ class CodexRunManager:
             "last_error": None,
             "cancel_requested": False,
             "_prompt": prompt,
+            "_request_prompt_suffix": request_prompt_suffix,
             "_page_context": page_context,
             "_conversation_message_count": len(conversation.get("messages", [])),
             "_browser_session": browser_session,
@@ -5247,6 +4368,7 @@ class CodexRunManager:
             run = self._load_run_locked(run_id)
             self._raise_if_cancelled_locked(run)
             prompt = str(run.get("_prompt", ""))
+            request_prompt_suffix = str(run.get("_request_prompt_suffix", ""))
             page_context = run.get("_page_context")
             force_browser_action = bool(run.get("_force_browser_action"))
             page_context_text = format_page_context(page_context)
@@ -5263,16 +4385,14 @@ class CodexRunManager:
         use_previous_response_id = bool(
             stored_response_id and current_message_count == stored_message_count + 1
         )
-        model_prompt = prompt
-        if page_context_text:
-            model_prompt += "\n\n[Page Context]\n" + page_context_text
+        model_prompt = compose_request_prompt(prompt, request_prompt_suffix, page_context_text)
 
         if use_previous_response_id:
             request_input: list[dict[str, Any]] = [{"role": "user", "content": model_prompt}]
             previous_response_id = stored_response_id
         else:
             request_input = build_model_context(conversation)
-            if page_context_text:
+            if request_prompt_suffix or page_context_text:
                 request_input = inject_page_context(request_input, model_prompt)
             previous_response_id = None
 
@@ -5309,7 +4429,7 @@ class CodexRunManager:
                 )
                 if should_retry_without_previous:
                     request_input = build_model_context(conversation)
-                    if page_context_text:
+                    if request_prompt_suffix or page_context_text:
                         request_input = inject_page_context(request_input, model_prompt)
                     previous_response_id = None
                     continue
@@ -5401,6 +4521,7 @@ class CodexRunManager:
             run = self._load_run_locked(run_id)
             self._raise_if_cancelled_locked(run)
             prompt = str(run.get("_prompt", ""))
+            request_prompt_suffix = str(run.get("_request_prompt_suffix", ""))
             page_context = run.get("_page_context")
             force_browser_action = bool(run.get("_force_browser_action"))
             allowed_hosts = list(run.get("_allowed_hosts", []))
@@ -5408,12 +4529,10 @@ class CodexRunManager:
             chat_template_kwargs = llama_options.get("chat_template_kwargs")
             reasoning_budget = llama_options.get("reasoning_budget")
         conversation = CONVERSATIONS.get(run["conversation_id"])
-        model_prompt = prompt
         page_context_text = format_page_context(page_context)
-        if page_context_text:
-            model_prompt += "\n\n[Page Context]\n" + page_context_text
+        model_prompt = compose_request_prompt(prompt, request_prompt_suffix, page_context_text)
         messages = build_model_context(conversation)
-        if page_context_text:
+        if request_prompt_suffix or page_context_text:
             messages = inject_page_context(messages, model_prompt)
         if force_browser_action:
             if int(EXTENSION_RELAY.health().get("connected_clients", 0)) <= 0:
@@ -5421,14 +4540,17 @@ class CodexRunManager:
             if not allowed_hosts:
                 raise RuntimeError("Browser action mode requires at least one allowlisted host.")
             agent_max_steps = BROWSER_CONFIG.agent_max_steps()
-            return run_llama_browser_agent(
-                run["conversation_id"],
-                messages,
-                allowed_hosts,
-                agent_max_steps,
-                chat_template_kwargs=chat_template_kwargs,
-                reasoning_budget=reasoning_budget,
-                cancel_check=lambda: self._run_cancel_requested(run_id),
+            return (
+                run_llama_browser_agent(
+                    run["conversation_id"],
+                    messages,
+                    allowed_hosts,
+                    agent_max_steps,
+                    chat_template_kwargs=chat_template_kwargs,
+                    reasoning_budget=reasoning_budget,
+                    cancel_check=lambda: self._run_cancel_requested(run_id),
+                ),
+                "",
             )
         answer_text, reasoning_text = call_llama_stream(
             messages,
@@ -5448,16 +4570,15 @@ class CodexRunManager:
             run = self._load_run_locked(run_id)
             self._raise_if_cancelled_locked(run)
             prompt = str(run.get("_prompt", ""))
+            request_prompt_suffix = str(run.get("_request_prompt_suffix", ""))
             page_context = run.get("_page_context")
             allowed_hosts = list(run.get("_allowed_hosts", []))
             force_browser_action = bool(run.get("_force_browser_action"))
         conversation = CONVERSATIONS.get(run["conversation_id"])
-        model_prompt = prompt
         page_context_text = format_page_context(page_context)
-        if page_context_text:
-            model_prompt += "\n\n[Page Context]\n" + page_context_text
+        model_prompt = compose_request_prompt(prompt, request_prompt_suffix, page_context_text)
         messages = build_model_context(conversation)
-        if page_context_text:
+        if request_prompt_suffix or page_context_text:
             messages = inject_page_context(messages, model_prompt)
         if force_browser_action:
             if int(EXTENSION_RELAY.health().get("connected_clients", 0)) <= 0:
@@ -5491,13 +4612,12 @@ class CodexRunManager:
             run = self._load_run_locked(run_id)
             self._raise_if_cancelled_locked(run)
             prompt = str(run.get("_prompt", ""))
+            request_prompt_suffix = str(run.get("_request_prompt_suffix", ""))
             page_context = run.get("_page_context")
             allowed_hosts = list(run.get("_allowed_hosts", []))
             force_browser_action = bool(run.get("_force_browser_action"))
         page_context_text = format_page_context(page_context)
-        model_prompt = prompt
-        if page_context_text:
-            model_prompt += "\n\n[Page Context]\n" + page_context_text
+        model_prompt = compose_request_prompt(prompt, request_prompt_suffix, page_context_text)
         conversation = CONVERSATIONS.get(run["conversation_id"])
         messages = build_model_context(conversation)
         cli_session_id = ""
@@ -5719,38 +4839,16 @@ def compact_text_block(value: Any, limit: int) -> str:
     return cleaned[:limit]
 
 
+
 def normalize_page_context(value: Any) -> dict[str, Any] | None:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise ValueError("page_context must be an object.")
-    output: dict[str, Any] = {}
-    for key in ("url", "text_excerpt"):
-        raw = value.get(key)
-        if raw is None:
-            continue
-        limit = PAGE_CONTEXT_FIELD_LIMITS[key]
-        if key == "url":
-            cleaned = str(raw).strip()[:limit]
-        else:
-            cleaned = compact_text_block(raw, limit)
-        if cleaned:
-            output[key] = cleaned
-    return output
+    return read_assistant_service.normalize_page_context(value, PAGE_CONTEXT_FIELD_LIMITS)
 
 
 def format_page_context(page_context: dict[str, Any] | None) -> str:
-    if not page_context:
-        return ""
-    sections: list[str] = []
-    url = str(page_context.get("url", "")).strip()
-    if url:
-        sections.append(f"URL: {url}")
-    text_excerpt = str(page_context.get("text_excerpt", "")).strip()
-    if text_excerpt:
-        sections.append(text_excerpt)
-    return "\n\n".join(sections)[:PAGE_CONTEXT_PROMPT_CHAR_BUDGET]
-
+    return read_assistant_service.format_page_context(
+        page_context,
+        PAGE_CONTEXT_PROMPT_CHAR_BUDGET,
+    )
 
 def inject_page_context(messages: list[dict[str, str]], content: str) -> list[dict[str, str]]:
     updated = list(messages)
@@ -5760,6 +4858,17 @@ def inject_page_context(messages: list[dict[str, str]], content: str) -> list[di
             return updated
     updated.append({"role": "user", "content": content})
     return updated
+
+
+def compose_request_prompt(prompt: str, request_prompt_suffix: str = "", page_context_text: str = "") -> str:
+    composed = str(prompt or "").strip()
+    suffix = str(request_prompt_suffix or "").strip()
+    if suffix:
+        composed = f"{composed}\n\n{suffix}" if composed else suffix
+    context = str(page_context_text or "").strip()
+    if context:
+        composed = f"{composed}\n\n[Page Context]\n{context}" if composed else f"[Page Context]\n{context}"
+    return composed
 
 
 def gather_risk_flags(prompt: str, incoming: list[str]) -> list[str]:
@@ -6191,213 +5300,11 @@ def run_subprocess_with_cancel(
     )
 
 
-def summarize_mlx_worker_failure(detail: Any) -> str:
-    text = " ".join(str(detail or "").split())[:600]
-    if not text:
-        return ""
-    if "NSRangeException" in text and ("DeviceC2Ev" in text or "MetalAllocator" in text):
-        return (
-            "MLX crashed during Metal device initialization. "
-            "The process does not appear to have a usable Metal device in this runtime."
-        )
-    return text
-
-
-def read_mlx_worker_response(
-    process: subprocess.Popen[str],
-    expected_request_id: str,
-    timeout_sec: float,
-) -> dict[str, Any]:
-
-    def _stderr_excerpt() -> str:
-        try:
-            if not process.stderr:
-                return ""
-            return summarize_mlx_worker_failure(process.stderr.read() or "")
-        except Exception:
-            return ""
-
-    deadline = time.monotonic() + max(0.1, timeout_sec)
-    fd = process.stdout.fileno()
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            if process.poll() is not None:
-                detail = _stderr_excerpt()
-                if detail:
-                    raise RuntimeError(f"MLX worker exited before responding: {detail}")
-            raise TimeoutError("Timed out waiting for MLX worker response.")
-        ready, _, _ = select.select([fd], [], [], remaining)
-        if not ready:
-            if process.poll() is not None:
-                detail = _stderr_excerpt()
-                if detail:
-                    raise RuntimeError(f"MLX worker exited before responding: {detail}")
-            continue
-        line = process.stdout.readline()
-        if line == "":
-            detail = _stderr_excerpt()
-            if detail:
-                raise RuntimeError(f"MLX worker closed its stdout stream: {detail}")
-            raise RuntimeError("MLX worker closed its stdout stream.")
-        try:
-            parsed = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(parsed, dict):
-            continue
-        if str(parsed.get("request_id", "")) == expected_request_id:
-            return parsed
-
-
-def run_ephemeral_mlx_completion(
-    messages: list[dict[str, str]],
-    *,
-    cancel_check: Any = None,
-) -> str:
-    if cancel_check and cancel_check():
-        raise RouteRequestCancelledError("Request cancelled by user.")
-    if not CONFIG.mlx_model_path:
-        raise RuntimeError("MLX is not configured. Set BROKER_MLX_MODEL_PATH first.")
-    if not CONFIG.mlx_worker_path.exists():
-        raise RuntimeError(f"MLX worker script not found: {CONFIG.mlx_worker_path}")
-    contract = {
-        **MLX_CHAT_CONTRACT_BASE,
-        "max_context_chars": MLX_RUNTIME.effective_max_context_chars(),
-    }
-    command = [
-        CONFIG.mlx_worker_python,
-        str(CONFIG.mlx_worker_path),
-        "--model-path",
-        str(Path(CONFIG.mlx_model_path).expanduser()),
-        "--max-context-chars",
-        str(contract["max_context_chars"]),
-    ]
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
-    try:
-        startup = read_mlx_worker_response(process, "startup", float(CONFIG.mlx_start_timeout_sec))
-        if not bool(startup.get("ok")):
-            error = startup.get("error") if isinstance(startup.get("error"), dict) else {}
-            raise RuntimeError(str(error.get("message", "MLX worker startup failed.")))
-        request_id = f"mlx_{uuid.uuid4().hex[:12]}"
-        payload = {
-            "request_id": request_id,
-            "op": "generate",
-            "schema_version": contract["schema_version"],
-            "contract": contract,
-            "messages": messages,
-            "params": MLX_RUNTIME.status().get("generation_config", {}),
-        }
-        process.stdin.write(json.dumps(payload, ensure_ascii=True) + "\n")
-        process.stdin.flush()
-        if cancel_check and cancel_check():
-            raise RouteRequestCancelledError("Request cancelled by user.")
-        response = read_mlx_worker_response(process, request_id, float(CONFIG.mlx_generation_timeout_sec))
-        if not bool(response.get("ok")):
-            error = response.get("error") if isinstance(response.get("error"), dict) else {}
-            raise RuntimeError(str(error.get("message", "MLX paper analysis failed.")))
-        data = response.get("data") if isinstance(response.get("data"), dict) else {}
-        return str(data.get("text", "")).strip()
-    finally:
-        try:
-            shutdown_id = f"mlx_{uuid.uuid4().hex[:12]}"
-            if process.stdin and process.poll() is None:
-                process.stdin.write(json.dumps({"request_id": shutdown_id, "op": "shutdown"}, ensure_ascii=True) + "\n")
-                process.stdin.flush()
-        except Exception:
-            pass
-        terminate_subprocess(process, timeout_sec=float(CONFIG.mlx_stop_timeout_sec))
-
-
-def select_paper_analysis_context(paper: dict[str, Any], *, char_budget: int = 12000) -> str:
-    title = str(paper.get("title", "")).strip()
-    authors = ", ".join(str(author).strip() for author in paper.get("authors", []) if str(author).strip())
-    abstract = str(paper.get("abstract", "")).strip()
-    headings = paper.get("headings") if isinstance(paper.get("headings"), list) else []
-    sections = paper.get("sections") if isinstance(paper.get("sections"), list) else []
-
-    selected_sections: list[dict[str, Any]] = []
-    preferred_patterns = [
-        re.compile(r"\babstract\b", re.IGNORECASE),
-        re.compile(r"\bintro", re.IGNORECASE),
-        re.compile(r"\bmethod|approach|model|architecture\b", re.IGNORECASE),
-        re.compile(r"\bresult|evaluation|experiment\b", re.IGNORECASE),
-        re.compile(r"\bdiscussion|conclusion|limitation\b", re.IGNORECASE),
-    ]
-    used_ids: set[str] = set()
-    for pattern in preferred_patterns:
-        for section in sections:
-            section_id = str(section.get("section_id", ""))
-            heading = str(section.get("heading", ""))
-            if section_id in used_ids:
-                continue
-            if pattern.search(heading):
-                selected_sections.append(section)
-                used_ids.add(section_id)
-                break
-    for section in sections:
-        if len(selected_sections) >= 4:
-            break
-        section_id = str(section.get("section_id", ""))
-        if section_id in used_ids:
-            continue
-        selected_sections.append(section)
-        used_ids.add(section_id)
-
-    parts: list[str] = []
-    if title:
-        parts.append(f"Title: {title}")
-    if authors:
-        parts.append(f"Authors: {authors}")
-    if abstract:
-        parts.append(f"Abstract:\n{abstract}")
-    if headings:
-        heading_lines = [str(item.get("heading", "")).strip() for item in headings[:12] if str(item.get("heading", "")).strip()]
-        if heading_lines:
-            parts.append("Headings:\n- " + "\n- ".join(heading_lines))
-    for section in selected_sections:
-        heading = str(section.get("heading", "")).strip() or "Section"
-        body = str(section.get("text", "")).strip()
-        if body:
-            parts.append(f"{heading}:\n{truncate_text(body, 2500)}")
-    joined = "\n\n".join(parts)
-    return truncate_text(joined, char_budget)
-
-
-def generate_paper_digest(paper: dict[str, Any], *, backend: str, cancel_check: Any = None) -> str:
-    normalized_backend = str(backend or "").strip().lower()
-    if normalized_backend not in {"llama", "mlx"}:
-        raise RuntimeError("paper analysis backend must be llama or mlx.")
-    context = select_paper_analysis_context(paper)
-    if not context:
-        raise RuntimeError("Paper artifact is empty after extraction.")
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a research assistant. Produce a concise paper digest with exactly these headings: "
-                "Summary, Key Claims, Method, Results, Limitations, Open Questions. "
-                "Use only the supplied paper content and avoid speculation."
-            ),
-        },
-        {
-            "role": "user",
-            "content": context,
-        },
-    ]
-    if normalized_backend == "llama":
-        answer, _reasoning = call_llama(messages, cancel_check=cancel_check)
-        return answer.strip()
-    if MLX_RUNTIME.status().get("status") == "running":
-        return MLX_RUNTIME.generate(messages, cancel_check=cancel_check).strip()
-    return run_ephemeral_mlx_completion(messages, cancel_check=cancel_check).strip()
+summarize_mlx_worker_failure = mlx_runtime_service.summarize_mlx_worker_failure
+read_mlx_worker_response = mlx_runtime_service.read_mlx_worker_response
+run_ephemeral_mlx_completion = mlx_runtime_service.run_ephemeral_mlx_completion
+select_paper_analysis_context = papers_service.select_paper_analysis_context
+generate_paper_digest = papers_service.generate_paper_digest
 
 
 def build_codex_cli_prompt(
@@ -7452,6 +6359,9 @@ def route_request(data: dict[str, Any]) -> dict[str, Any]:
     session_id = str(data.get("session_id", "")).strip()
     backend = str(data.get("backend", "")).strip()
     prompt = str(data.get("prompt", "")).strip()
+    request_prompt_suffix = str(
+        data.get("request_prompt_suffix", data.get("requestPromptSuffix")) or ""
+    ).strip()
     llama_options = normalize_llama_request_options(data)
     request_id = ensure_route_request_id(data.get("request_id", data.get("requestId")))
     rewrite_message_index = ensure_rewrite_message_index(
@@ -7489,9 +6399,7 @@ def route_request(data: dict[str, Any]) -> dict[str, Any]:
         }
 
     page_context_text = format_page_context(page_context)
-    model_prompt = prompt
-    if page_context_text:
-        model_prompt += "\n\n[Page Context]\n" + page_context_text
+    model_prompt = compose_request_prompt(prompt, request_prompt_suffix, page_context_text)
 
     ROUTE_REQUESTS.start(session_id, request_id, backend)
 
@@ -7517,7 +6425,7 @@ def route_request(data: dict[str, Any]) -> dict[str, Any]:
         messages, context_stats = _build_model_context_with_stats(
             conversation, max_context_chars=context_chars
         )
-        if page_context_text:
+        if request_prompt_suffix or page_context_text:
             messages = inject_page_context(messages, model_prompt)
         context_usage: dict[str, Any] = {
             "backend": backend,
@@ -7768,28 +6676,22 @@ def handle_job_cancel(job_id: str) -> dict[str, Any]:
 
 
 def handle_paper_inspect(data: dict[str, Any]) -> dict[str, Any]:
-    return PAPERS.inspect(data)
-
+    return read_assistant_service.deprecated_papers_payload()
 
 def handle_paper_job_start(data: dict[str, Any]) -> dict[str, Any]:
-    return PAPERS.start_job(data)
-
+    return read_assistant_service.deprecated_papers_payload()
 
 def handle_paper_job_get(job_id: str) -> dict[str, Any]:
-    return {"job": PAPERS.get_job(job_id)}
-
+    return read_assistant_service.deprecated_papers_payload()
 
 def handle_papers_list() -> dict[str, Any]:
-    return PAPERS.list_papers()
-
+    return read_assistant_service.deprecated_papers_payload()
 
 def handle_paper_get(paper_id: str) -> dict[str, Any]:
-    return PAPERS.get_paper(paper_id)
-
+    return read_assistant_service.deprecated_papers_payload()
 
 def handle_paper_section_get(paper_id: str, section_id: str) -> dict[str, Any]:
-    return PAPERS.get_section(paper_id, section_id)
-
+    return read_assistant_service.deprecated_papers_payload()
 
 def handle_experiment_job_start(data: dict[str, Any]) -> dict[str, Any]:
     return EXPERIMENTS.start_job(data)
@@ -7812,62 +6714,31 @@ def handle_experiment_compare(experiment_id: str, other_id: str) -> dict[str, An
 
 
 def handle_models_get() -> dict[str, Any]:
-    return MLX_RUNTIME.models_payload()
+    return mlx_runtime_service.handle_models_get(MLX_RUNTIME)
 
 
 def handle_mlx_status_get() -> dict[str, Any]:
-    return {"mlx": MLX_RUNTIME.status()}
+    return mlx_runtime_service.handle_mlx_status_get(MLX_RUNTIME)
 
 
 def handle_mlx_config_post(data: dict[str, Any]) -> dict[str, Any]:
-    updates: dict[str, Any]
-    generation = data.get("generation") if isinstance(data, dict) else None
-    if isinstance(generation, dict):
-        updates = dict(generation)
-    else:
-        updates = dict(data) if isinstance(data, dict) else {}
-    if isinstance(data, dict):
-        if "system_prompt" in data:
-            updates["system_prompt"] = data.get("system_prompt")
-        elif "systemPrompt" in data:
-            updates["system_prompt"] = data.get("systemPrompt")
-    status = MLX_RUNTIME.update_generation_config(updates if isinstance(updates, dict) else {})
-    return {"ok": True, "mlx": status}
+    return mlx_runtime_service.handle_mlx_config_post(MLX_RUNTIME, data)
 
 
 def handle_mlx_session_action(action: str) -> dict[str, Any]:
-    normalized = str(action or "").strip().lower()
-    if normalized == "start":
-        status = MLX_RUNTIME.start()
-    elif normalized == "stop":
-        status = MLX_RUNTIME.stop()
-    elif normalized == "restart":
-        status = MLX_RUNTIME.restart()
-    else:
-        raise ValueError("Unsupported MLX session action.")
-    return {"ok": True, "mlx": status}
+    return mlx_runtime_service.handle_mlx_session_action(MLX_RUNTIME, action)
 
 
 def handle_mlx_adapters_list() -> dict[str, Any]:
-    payload = MLX_RUNTIME.list_adapters()
-    return {"ok": True, **payload}
+    return mlx_runtime_service.handle_mlx_adapters_list(MLX_RUNTIME)
 
 
 def handle_mlx_adapters_load(data: dict[str, Any]) -> dict[str, Any]:
-    adapter_id = str(data.get("adapter_id", data.get("adapterId", ""))).strip()
-    adapter_path = str(data.get("path", data.get("adapter_path", data.get("adapterPath", "")))).strip()
-    name = str(data.get("name", "")).strip()
-    payload = MLX_RUNTIME.load_adapter(
-        adapter_id=adapter_id,
-        path=adapter_path,
-        name=name,
-    )
-    return {"ok": True, **payload}
+    return mlx_runtime_service.handle_mlx_adapters_load(MLX_RUNTIME, data)
 
 
 def handle_mlx_adapters_unload(_data: dict[str, Any]) -> dict[str, Any]:
-    payload = MLX_RUNTIME.unload_adapter()
-    return {"ok": True, **payload}
+    return mlx_runtime_service.handle_mlx_adapters_unload(MLX_RUNTIME, _data)
 
 
 def handle_training_dataset_import(data: dict[str, Any]) -> dict[str, Any]:
@@ -8010,7 +6881,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
         paper_job_id = self._paper_job_id_from_path(path)
         if paper_job_id:
-            self._send_json(HTTPStatus.OK, handle_paper_job_get(paper_job_id))
+            self._send_json(HTTPStatus.GONE, handle_paper_job_get(paper_job_id))
             return
         experiment_job_id = self._experiment_job_id_from_path(path)
         if experiment_job_id:
@@ -8023,7 +6894,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
         paper_section = self._paper_section_ids_from_path(path)
         if paper_section:
             paper_id, section_id = paper_section
-            self._send_json(HTTPStatus.OK, handle_paper_section_get(paper_id, section_id))
+            self._send_json(HTTPStatus.GONE, handle_paper_section_get(paper_id, section_id))
             return
         experiment_compare = self._experiment_compare_ids_from_path(path)
         if experiment_compare:
@@ -8031,11 +6902,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, handle_experiment_compare(experiment_id, other_id))
             return
         if path == "/papers":
-            self._send_json(HTTPStatus.OK, handle_papers_list())
+            self._send_json(HTTPStatus.GONE, handle_papers_list())
             return
         paper_id = self._paper_id_from_path(path)
         if paper_id:
-            self._send_json(HTTPStatus.OK, handle_paper_get(paper_id))
+            self._send_json(HTTPStatus.GONE, handle_paper_get(paper_id))
             return
         if path == "/experiments":
             self._send_json(HTTPStatus.OK, handle_experiments_list())
@@ -8135,8 +7006,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 result = handle_route_cancel(data)
             elif path == "/papers/inspect":
                 result = handle_paper_inspect(data)
+                self._send_json(HTTPStatus.GONE, result)
+                return
             elif path == "/papers/jobs":
                 result = handle_paper_job_start(data)
+                self._send_json(HTTPStatus.GONE, result)
+                return
             elif path == "/experiments/jobs":
                 result = handle_experiment_job_start(data)
             elif path == "/mlx/training/datasets/import":

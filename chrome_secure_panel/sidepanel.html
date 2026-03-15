@@ -31,11 +31,11 @@
         <div class="topbar-right">
           <label class="toggle compact">
             <input id="include-page-context" type="checkbox" />
-            <span>Page context</span>
+            <span>Include current page</span>
           </label>
           <label class="toggle compact">
             <input id="force-browser-action" type="checkbox" />
-            <span>Browser action</span>
+            <span>Allow page actions (scroll/highlight)</span>
           </label>
           <span id="context-usage" class="status-badge context-badge hidden">Context: --/--</span>
           <button
@@ -453,32 +453,16 @@
         </section>
 
         <section class="tools-card">
-          <h3>Paper Analysis</h3>
-          <p id="papers-status" class="tools-status">No paper activity yet.</p>
-          <label class="tools-field">
-            <span>URL or Local Path</span>
-            <input
-              id="paper-source-input"
-              type="text"
-              placeholder="https://arxiv.org/abs/... or /path/to/paper.pdf"
-            />
-          </label>
-          <div class="button-row tools-actions">
-            <button id="paper-use-active-btn" class="ghost" type="button">Use Current Tab</button>
-            <button id="paper-inspect-btn" type="button">Quick Inspect</button>
-            <button id="paper-analyze-btn" type="button">Analyze Paper</button>
+          <h3>Read Assistant</h3>
+          <p class="tools-help">Use chat with current-page context. ArXiv HTML is the best-supported reading flow.</p>
+          <div class="button-row">
+            <button id="read-context-refresh-btn" class="ghost" type="button">Refresh Context</button>
+            <button id="read-explain-btn" type="button">Explain Selection</button>
+            <button id="read-guide-btn" type="button">Guide This Page</button>
+            <button id="read-show-btn" type="button">Show Me Where</button>
           </div>
-          <div id="paper-inspect-output" class="models-adapter-list"></div>
-        </section>
-
-        <section class="tools-card">
-          <h3>Paper Jobs</h3>
-          <div id="paper-job-list" class="tools-list"></div>
-        </section>
-
-        <section class="tools-card">
-          <h3>Paper Library</h3>
-          <div id="paper-list" class="tools-list"></div>
+          <div id="read-assistant-status" class="tools-status">Read assistant idle.</div>
+          <pre id="read-assistant-preview" class="models-adapter-list">No active page context.</pre>
         </section>
 
         <section class="tools-card">
