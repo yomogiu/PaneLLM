@@ -560,6 +560,51 @@ def resolve_route_allowlist(
     return allowlist
 
 
+def normalize_codex_bool(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else ""
+    if isinstance(value, str):
+        value = value.strip().lower()
+        return "true" if value in {"1", "true", "on", "yes"} else ""
+    return "true" if bool(value) else ""
+
+
+def page_context_fingerprint(context: dict[str, Any] | None) -> str:
+    if not isinstance(context, dict):
+        return ""
+    payload = {
+        "url": str(context.get("url", "") or ""),
+        "title": str(context.get("title", "") or ""),
+        "content_kind": str(context.get("content_kind", "") or ""),
+        "text_excerpt": str(context.get("text_excerpt", "") or ""),
+        "heading_path": [
+            str(item)
+            for item in (context.get("heading_path") if isinstance(context.get("heading_path"), list) else [])
+            if str(item).strip()
+        ],
+    }
+    raw = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return sha1(raw.encode("utf-8")).hexdigest()
+
+
+def should_reuse_session_page_context(
+    codex_state: dict[str, Any],
+    run: dict[str, Any],
+    conversation_message_count: int,
+) -> bool:
+    current_fingerprint = str(run.get("_page_context_fingerprint", "") or "")
+    stored_fingerprint = str(
+        codex_state.get("last_page_context_fingerprint", "") if isinstance(codex_state, dict) else ""
+    )
+    try:
+        stored_message_count = int(
+            codex_state.get("last_response_message_count", 0) if isinstance(codex_state, dict) else 0
+        )
+    except (TypeError, ValueError):
+        stored_message_count = 0
+    return current_fingerprint == stored_fingerprint and conversation_message_count == stored_message_count + 1
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -957,6 +1002,16 @@ class ConversationStore:
             "last_run_status": str(raw.get("last_run_status", "") or ""),
             "last_response_message_count": int(raw.get("last_response_message_count", 0) or 0),
             "cli_session_id": str(raw.get("cli_session_id", "") or ""),
+            "page_context_enabled": normalize_codex_bool(raw.get("page_context_enabled")),
+            "page_context_fingerprint": str(raw.get("page_context_fingerprint", "") or ""),
+            "page_context_url": str(raw.get("page_context_url", "") or ""),
+            "page_context_title": str(raw.get("page_context_title", "") or ""),
+            "page_context_updated_at": str(raw.get("page_context_updated_at", "") or ""),
+            "last_page_context_message_count": int(
+                raw.get("last_page_context_message_count", 0) or 0
+            ),
+            "last_page_context_fingerprint": str(raw.get("last_page_context_fingerprint", "") or ""),
+            "page_context_payload": normalize_page_context(raw.get("page_context_payload")),
         }
 
     def _normalize_reasoning_blocks(self, value: Any) -> list[str]:
@@ -1092,6 +1147,8 @@ class ConversationStore:
         codex["last_run_id"] = ""
         codex["last_run_status"] = ""
         codex["last_response_message_count"] = 0
+        codex["last_page_context_message_count"] = 0
+        codex["last_page_context_fingerprint"] = ""
         codex["cli_session_id"] = ""
         conversation["codex"] = codex
 
@@ -1110,6 +1167,14 @@ class ConversationStore:
         for key, value in updates.items():
             if key == "last_response_message_count":
                 codex[key] = int(value or 0)
+            elif key == "last_page_context_message_count":
+                codex[key] = int(value or 0)
+            elif key == "last_page_context_fingerprint":
+                codex[key] = str(value or "")
+            elif key == "page_context_enabled":
+                codex[key] = normalize_codex_bool(value)
+            elif key == "page_context_payload":
+                codex[key] = normalize_page_context(value)
             else:
                 codex[key] = str(value or "")
         conversation["codex"] = codex
@@ -3462,11 +3527,10 @@ class CodexRunManager:
                 "run_id": None,
             }
 
-        page_context = normalize_page_context(data.get("page_context"))
-        allowed_hosts = resolve_route_allowlist(
-            data.get("allowed_hosts", data.get("allowedHosts")),
-            page_context,
-        )
+        raw_include_page_context = data.get("include_page_context", data.get("includePageContext"))
+        include_page_context = normalize_codex_bool(raw_include_page_context) == "true"
+        incoming_page_context = normalize_page_context(data.get("page_context"))
+        requested_allowed_hosts = data.get("allowed_hosts", data.get("allowedHosts"))
         if backend == "codex" and not (
             CONFIG.openai_api_key or (CONFIG.codex_cli_path and CONFIG.codex_cli_logged_in)
         ):
@@ -3476,8 +3540,6 @@ class CodexRunManager:
         extension_clients = int(EXTENSION_RELAY.health().get("connected_clients", 0))
         if force_browser_action and extension_clients <= 0:
             raise RuntimeError("Browser action mode requires a connected extension relay client.")
-        if force_browser_action and not allowed_hosts:
-            raise RuntimeError("Browser action mode requires at least one allowlisted host.")
         if backend == "llama":
             ensure_llama_backend_available(CONFIG)
         elif backend == "mlx":
@@ -3490,6 +3552,17 @@ class CodexRunManager:
                 rewrite_message_index,
                 prompt,
             )
+
+        codex = conversation.get("codex", {})
+        cached_page_context = normalize_page_context(codex.get("page_context_payload"))
+        page_context = incoming_page_context if include_page_context else None
+        if not page_context and include_page_context and cached_page_context is not None:
+            page_context = cached_page_context
+        if include_page_context and page_context is None:
+            raise ValueError("includePageContext was requested but no page context is available for this session.")
+        allowed_hosts = resolve_route_allowlist(requested_allowed_hosts, page_context)
+        if force_browser_action and not allowed_hosts:
+            raise RuntimeError("Browser action mode requires at least one allowlisted host.")
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         browser_session: dict[str, Any] | None = None
         browser_run: dict[str, Any] | None = None
@@ -3539,6 +3612,7 @@ class CodexRunManager:
             "_prompt": prompt,
             "_request_prompt_suffix": request_prompt_suffix,
             "_page_context": page_context,
+            "_page_context_fingerprint": page_context_fingerprint(page_context),
             "_conversation_message_count": len(conversation.get("messages", [])),
             "_browser_session": browser_session,
             "_browser_run": browser_run,
@@ -3559,17 +3633,28 @@ class CodexRunManager:
             )
             self._set_status_locked(run, "thinking")
 
-        if backend == "codex":
-            CONVERSATIONS.update_codex_state(
-                session_id,
-                {
-                    "mode": codex_mode,
-                    "model": CONFIG.openai_codex_model if codex_mode == "responses" else "",
-                    "active_run_id": run_id,
-                    "last_run_id": run_id,
-                    "last_run_status": "thinking",
-                },
-            )
+        codex_update = {
+            "mode": codex_mode if backend == "codex" else backend,
+            "model": CONFIG.openai_codex_model if codex_mode == "responses" else "",
+            "active_run_id": run_id,
+            "last_run_id": run_id,
+            "last_run_status": "thinking",
+            "page_context_enabled": bool(include_page_context),
+        }
+        if page_context is not None:
+            context_fingerprint = page_context_fingerprint(page_context)
+            codex_update["last_page_context_fingerprint"] = context_fingerprint
+            codex_update["page_context_fingerprint"] = context_fingerprint
+            codex_update["page_context_payload"] = page_context
+            codex_update["page_context_url"] = page_context.get("url", "")
+            codex_update["page_context_title"] = page_context.get("title", "")
+            codex_update["page_context_updated_at"] = now_iso()
+            codex_update["last_page_context_message_count"] = len(conversation.get("messages", []))
+        else:
+            codex_update["page_context_fingerprint"] = ""
+            codex_update["last_page_context_fingerprint"] = ""
+            codex_update["last_page_context_message_count"] = len(conversation.get("messages", []))
+        CONVERSATIONS.update_codex_state(session_id, codex_update)
 
         thread = threading.Thread(target=self._run_worker, args=(run_id,), daemon=True)
         thread.start()
@@ -3743,18 +3828,17 @@ class CodexRunManager:
                 assistant_text,
                 reasoning_blocks=reasoning_blocks,
             )
-            if backend == "codex":
-                updates = {
-                    "mode": codex_mode,
-                    "model": CONFIG.openai_codex_model if codex_mode == "responses" else "",
-                    "active_run_id": "",
-                    "last_run_id": run["run_id"],
-                    "last_run_status": status,
-                }
-                if response_id:
-                    updates["last_response_id"] = response_id
-                    updates["last_response_message_count"] = len(conversation.get("messages", []))
-                CONVERSATIONS.update_codex_state(conversation_id, updates)
+            updates = {
+                "mode": codex_mode,
+                "model": CONFIG.openai_codex_model if codex_mode == "responses" else "",
+                "active_run_id": "",
+                "last_run_id": run["run_id"],
+                "last_run_status": status,
+                "last_response_message_count": len(conversation.get("messages", [])),
+            }
+            if backend == "codex" and response_id:
+                updates["last_response_id"] = response_id
+            CONVERSATIONS.update_codex_state(conversation_id, updates)
         elif backend == "codex":
             CONVERSATIONS.update_codex_state(
                 conversation_id,
@@ -3893,16 +3977,26 @@ class CodexRunManager:
         stored_message_count = int(codex_state.get("last_response_message_count", 0) or 0)
         current_message_count = len(conversation.get("messages", []))
         use_previous_response_id = bool(
-            stored_response_id and current_message_count == stored_message_count + 1
+            stored_response_id
+            and current_message_count == stored_message_count + 1
+            and should_reuse_session_page_context(
+                codex_state,
+                run,
+                current_message_count,
+            )
         )
-        model_prompt = compose_request_prompt(prompt, request_prompt_suffix, page_context_text)
+        model_prompt = compose_request_prompt(
+            prompt,
+            request_prompt_suffix,
+            "" if use_previous_response_id else page_context_text,
+        )
 
         if use_previous_response_id:
             request_input: list[dict[str, Any]] = [{"role": "user", "content": model_prompt}]
             previous_response_id = stored_response_id
         else:
             request_input = build_model_context(conversation)
-            if request_prompt_suffix or page_context_text:
+            if request_prompt_suffix or (not use_previous_response_id and page_context_text):
                 request_input = inject_page_context(request_input, model_prompt)
             previous_response_id = None
 
@@ -3939,7 +4033,7 @@ class CodexRunManager:
                 )
                 if should_retry_without_previous:
                     request_input = build_model_context(conversation)
-                    if request_prompt_suffix or page_context_text:
+                    if request_prompt_suffix or (not use_previous_response_id and page_context_text):
                         request_input = inject_page_context(request_input, model_prompt)
                     previous_response_id = None
                     continue
@@ -4040,9 +4134,20 @@ class CodexRunManager:
             reasoning_budget = llama_options.get("reasoning_budget")
         conversation = CONVERSATIONS.get(run["conversation_id"])
         page_context_text = format_page_context(page_context)
-        model_prompt = compose_request_prompt(prompt, request_prompt_suffix, page_context_text)
+        codex_state = conversation.get("codex", {})
+        current_message_count = len(conversation.get("messages", []))
+        use_previous_session_context = should_reuse_session_page_context(
+            codex_state,
+            run,
+            current_message_count,
+        )
+        model_prompt = compose_request_prompt(
+            prompt,
+            request_prompt_suffix,
+            "" if use_previous_session_context else page_context_text,
+        )
         messages = build_model_context(conversation)
-        if request_prompt_suffix or page_context_text:
+        if request_prompt_suffix or (not use_previous_session_context and page_context_text):
             messages = inject_page_context(messages, model_prompt)
         if force_browser_action:
             if int(EXTENSION_RELAY.health().get("connected_clients", 0)) <= 0:
@@ -4086,9 +4191,20 @@ class CodexRunManager:
             force_browser_action = bool(run.get("_force_browser_action"))
         conversation = CONVERSATIONS.get(run["conversation_id"])
         page_context_text = format_page_context(page_context)
-        model_prompt = compose_request_prompt(prompt, request_prompt_suffix, page_context_text)
+        codex_state = conversation.get("codex", {})
+        current_message_count = len(conversation.get("messages", []))
+        use_previous_session_context = should_reuse_session_page_context(
+            codex_state,
+            run,
+            current_message_count,
+        )
+        model_prompt = compose_request_prompt(
+            prompt,
+            request_prompt_suffix,
+            "" if use_previous_session_context else page_context_text,
+        )
         messages = build_model_context(conversation)
-        if request_prompt_suffix or page_context_text:
+        if request_prompt_suffix or (not use_previous_session_context and page_context_text):
             messages = inject_page_context(messages, model_prompt)
         if force_browser_action:
             if int(EXTENSION_RELAY.health().get("connected_clients", 0)) <= 0:
@@ -4127,11 +4243,23 @@ class CodexRunManager:
             allowed_hosts = list(run.get("_allowed_hosts", []))
             force_browser_action = bool(run.get("_force_browser_action"))
         page_context_text = format_page_context(page_context)
-        model_prompt = compose_request_prompt(prompt, request_prompt_suffix, page_context_text)
         conversation = CONVERSATIONS.get(run["conversation_id"])
         messages = build_model_context(conversation)
-        cli_session_id = ""
         codex_state = conversation.get("codex", {})
+        current_message_count = len(conversation.get("messages", []))
+        use_previous_session_context = should_reuse_session_page_context(
+            codex_state,
+            run,
+            current_message_count,
+        )
+        model_prompt = compose_request_prompt(
+            prompt,
+            request_prompt_suffix,
+            "" if use_previous_session_context else page_context_text,
+        )
+        if request_prompt_suffix or (not use_previous_session_context and page_context_text):
+            messages = inject_page_context(messages, model_prompt)
+        cli_session_id = ""
         if isinstance(codex_state, dict):
             cli_session_id = str(codex_state.get("cli_session_id", "") or "")
         extension_clients = int(EXTENSION_RELAY.health().get("connected_clients", 0))

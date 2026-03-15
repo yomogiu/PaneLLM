@@ -271,20 +271,21 @@ async function captureReadAssistantContext(_message) {
 async function buildAssistantBrokerPayload(message) {
   await hostPolicyReady;
   validatePromptMessage(message);
-  const needsPageAccess = Boolean(message.includePageContext);
+  const includePageContext = Boolean(message.includePageContext);
   const forceBrowserAction = message.forceBrowserAction === true;
   let tab = null;
 
-  if (needsPageAccess) {
+  if (includePageContext) {
     tab = await getActiveTab();
-    if (!tab?.id || !tab.url) {
-      throw new Error("Unable to resolve the active tab.");
-    }
-    if (!isHostAllowed(tab.url)) {
-      throw createHostNotAllowlistedError(
-        tab.url,
-        "Active tab is not in the extension allowlist."
-      );
+    if (tab?.id && tab.url) {
+      if (!isHostAllowed(tab.url)) {
+        throw createHostNotAllowlistedError(
+          tab.url,
+          "Active tab is not in the extension allowlist."
+        );
+      }
+    } else {
+      tab = null;
     }
   }
 
@@ -305,6 +306,8 @@ async function buildAssistantBrokerPayload(message) {
     session_id: message.sessionId,
     prompt: message.prompt,
     request_prompt_suffix: String(message.requestPromptSuffix || "").trim(),
+    include_page_context: includePageContext,
+    includePageContext: includePageContext,
     page_context: pageContext,
     // Keep broker-side browser policy aligned with the extension runtime allowlist.
     allowed_hosts: normalizeAllowedHosts(),
@@ -625,6 +628,9 @@ function validatePromptMessage(message) {
   }
   if (message.forceBrowserAction !== undefined && typeof message.forceBrowserAction !== "boolean") {
     throw new Error("forceBrowserAction must be a boolean when provided.");
+  }
+  if (message.includePageContext !== undefined && typeof message.includePageContext !== "boolean") {
+    throw new Error("includePageContext must be a boolean when provided.");
   }
 }
 
