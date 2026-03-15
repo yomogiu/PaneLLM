@@ -1,6 +1,6 @@
 # Local Broker
 
-The broker is the local control plane for chat routing, run state, browser automation, MLX runtime management, experiments, training, and conversation persistence.
+The broker is the local control plane for chat routing, backend discovery, browser automation, and conversation persistence.
 
 ## Start
 
@@ -37,26 +37,13 @@ python3 broker/local_broker.py
 - `BROKER_BROWSER_COMMAND_TIMEOUT_SEC` default `25`
 - `BROKER_EXTENSION_CLIENT_STALE_SEC` default `90`
 - `BROKER_DEFAULT_DOMAIN_ALLOWLIST` default `127.0.0.1,localhost`
-- `BROKER_MLX_MODEL_PATH` required to enable MLX
-- `BROKER_MLX_WORKER_PYTHON` default `python3`
-- `BROKER_MLX_WORKER_PATH` default `broker/mlx_worker.py`
-- `BROKER_MLX_START_TIMEOUT_SEC` default `60`
-- `BROKER_MLX_STOP_TIMEOUT_SEC` default `8`
-- `BROKER_MLX_GENERATION_TIMEOUT_SEC` default `180`
-- `BROKER_MLX_MAX_CONTEXT_CHARS` default `56000`, capped at `56000`
-- `BROKER_MLX_DEFAULT_TEMPERATURE` default `0.2`
-- `BROKER_MLX_DEFAULT_TOP_P` default `0.95`
-- `BROKER_MLX_DEFAULT_TOP_K` default `50`
-- `BROKER_MLX_DEFAULT_MAX_TOKENS` default `512`
-- `BROKER_MLX_DEFAULT_REPETITION_PENALTY` default `1.0`
-- `BROKER_MLX_DEFAULT_SEED` optional
-- `BROKER_MLX_DEFAULT_ENABLE_THINKING` default `false`
-- `BROKER_MLX_DEFAULT_SYSTEM_PROMPT` optional
+- `MLX_URL` optional local OpenAI-compatible MLX endpoint
+- `MLX_MODEL` optional preferred MLX model id
+- `MLX_API_KEY` optional bearer token for the MLX server
 - `BROKER_EXPERIMENT_WORKER_PYTHON` default `python3`
 - `BROKER_EXPERIMENT_WORKER_PATH` default `broker/experiment_worker.py`
 - `BROKER_EXPERIMENT_JOB_TIMEOUT_SEC` default `900`
 - `BROKER_TRAINING_WORKER_PYTHON` default `python3`
-- `BROKER_TRAINING_WORKER_PATH` default `broker/training_worker.py`
 - `BROKER_TRAINING_JOB_TIMEOUT_SEC` default `7200`
 
 ## Health
@@ -74,9 +61,7 @@ python3 broker/local_broker.py
   "browser_automation": {},
   "codex_runs": {},
   "llama": {},
-  "mlx": {},
   "experiments": {},
-  "training": {}
 }
 ```
 
@@ -189,49 +174,19 @@ Current behavior:
 - Injects a session-scoped browser MCP override when the extension relay is connected
 - Passes broker URL and allowlisted hosts to that MCP server via per-run config overrides
 
-## MLX endpoints
+
+## Backend discovery
 
 - `GET /models`
-- `GET /mlx/status`
-- `POST /mlx/config`
-- `POST /mlx/session/start`
-- `POST /mlx/session/stop`
-- `POST /mlx/session/restart`
-- `GET /mlx/adapters`
-- `POST /mlx/adapters/load`
-- `POST /mlx/adapters/unload`
 
-MLX contract highlights:
+`GET /models` returns backend availability and per-backend capability metadata for the sidepanel backend selector.
 
-- Versioned schema: `mlx_chat_v1`
-- OpenAI-style message format
-- No tool calls in v1
-- Tail truncation by char budget
-- Runtime generation config is persisted under `broker/.data/mlx_config.json`
+MLX is treated as another OpenAI-compatible local chat backend:
 
-## Experiments and training
-
-Experiment endpoints:
-
-- `POST /experiments/jobs`
-- `GET /experiments/jobs/<job_id>`
-- `GET /experiments`
-- `GET /experiments/<experiment_id>`
-- `GET /experiments/<experiment_id>/compare/<other_experiment_id>`
-- `GET /jobs?kind=experiment|training&status=...`
-- `POST /jobs/<job_id>/cancel`
-
-Training endpoints:
-
-- `POST /mlx/training/datasets/import`
-- `GET /mlx/training/datasets`
-- `GET /mlx/training/datasets/<dataset_id>`
-- `DELETE /mlx/training/datasets/<dataset_id>`
-- `POST /mlx/training/jobs`
-- `GET /mlx/training/jobs/<job_id>`
-- `GET /mlx/training/runs`
-- `GET /mlx/training/runs/<run_id>`
-- `POST /mlx/training/checkpoints/promote`
+- `MLX_URL` points at a local chat completions endpoint
+- `MLX_MODEL` optionally pins the preferred model id
+- `MLX_API_KEY` optionally sets a bearer token
+- Chat still uses `POST /runs` with `backend: "mlx"`
 
 ## Extension relay and conversations
 

@@ -198,53 +198,42 @@ def check_llama() -> CheckResult:
 
 def check_mlx() -> list[CheckResult]:
     results: list[CheckResult] = []
-    worker_python = os.environ.get("BROKER_MLX_WORKER_PYTHON", "python3").strip() or "python3"
-    worker_path = shutil.which(worker_python) if "/" not in worker_python else worker_python
-    if not worker_path:
+    mlx_url = os.environ.get("MLX_URL", "").strip()
+    if not mlx_url:
         results.append(
             warn(
-                "MLX worker Python",
-                f"{worker_python} is not in PATH",
-                "Set BROKER_MLX_WORKER_PYTHON to the interpreter you want the MLX worker to use.",
+                "MLX",
+                "MLX_URL is not set",
+                'export MLX_URL="http://127.0.0.1:18001/v1/chat/completions"',
             )
         )
         return results
 
-    import_check = run_command([worker_path, "-c", "import mlx_lm"], timeout_sec=8.0)
-    if import_check and import_check.returncode == 0:
-        results.append(ok("MLX runtime", f"mlx_lm imports under {worker_path}"))
-    else:
+    parsed = urlparse(mlx_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         results.append(
             warn(
-                "MLX runtime",
-                f"mlx_lm does not import under {worker_path}",
-                f"{worker_path} -m pip install mlx-lm",
-            )
-        )
-
-    model_path_raw = os.environ.get("BROKER_MLX_MODEL_PATH", "").strip()
-    if not model_path_raw:
-        results.append(
-            warn(
-                "MLX model path",
-                "BROKER_MLX_MODEL_PATH is not set",
-                'export BROKER_MLX_MODEL_PATH="$HOME/models/mlx/<your-model-folder>"',
+                "MLX",
+                f"MLX_URL is invalid: {mlx_url}",
+                'Export a valid URL, for example `export MLX_URL="http://127.0.0.1:18001/v1/chat/completions"`.',
             )
         )
         return results
 
-    model_path = Path(model_path_raw).expanduser()
-    if model_path.exists():
-        results.append(ok("MLX model path", str(model_path)))
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if is_port_open(parsed.hostname, port):
+        results.append(ok("MLX", f"endpoint reachable at {mlx_url}"))
     else:
         results.append(
             warn(
-                "MLX model path",
-                f"path does not exist: {model_path}",
-                "Point BROKER_MLX_MODEL_PATH at a local MLX model directory.",
+                "MLX",
+                f"cannot connect to {mlx_url}",
+                "Start your local MLX server, or set MLX_URL to the correct host and port.",
             )
         )
 
+    mlx_model = os.environ.get("MLX_MODEL", "").strip()
+    results.append(ok("MLX model", mlx_model or "auto-detect from /v1/models"))
     return results
 
 

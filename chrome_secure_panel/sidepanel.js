@@ -32,6 +32,7 @@ const state = {
   historyOpen: false,
   historyPinned: false,
   brokerHealth: null,
+  availableBackends: [],
   busy: false,
   stopping: false,
   activeRunId: "",
@@ -174,6 +175,23 @@ const toolsAllowActiveBtn = $("tools-allow-active-btn");
 const toolsAgentMaxStepsEl = $("tools-agent-max-steps");
 const toolsBrowserApplyBtn = $("tools-browser-apply-btn");
 const toolsAllowedListEl = $("tools-allowed-list");
+
+
+function getBackendCapabilities(backend = backendEl?.value) {
+  const normalized = String(backend || "").trim();
+  const backends = Array.isArray(state.availableBackends) ? state.availableBackends : [];
+  const selected = backends.find((item) => String(item?.id || "").trim() === normalized);
+  return selected && typeof selected.capabilities === "object" ? selected.capabilities : {};
+}
+
+function backendSupportsReasoningControls(backend = backendEl?.value) {
+  const normalized = String(backend || "").trim();
+  const capabilities = getBackendCapabilities(normalized);
+  if (Object.keys(capabilities).length > 0) {
+    return Boolean(capabilities.supports_reasoning_controls);
+  }
+  return normalized === "llama";
+}
 
 function setReadAssistantExplainEnabled() {
   const composerExplainBtn = $("composer-read-explain-btn");
@@ -1076,6 +1094,7 @@ function renderBackendOptions(selectEl, backends = [], current = "mlx") {
 function renderModelsBackends(backends = []) {
   const current = String(modelsBackendEl?.value || backendEl?.value || "mlx");
   renderBackendOptions(modelsBackendEl, backends, current);
+  state.availableBackends = Array.isArray(backends) ? backends : [];
   renderBackendOptions(backendEl, backends, current);
   const resolved = String(modelsBackendEl?.value || backendEl?.value || current);
   if (modelsBackendEl) {
