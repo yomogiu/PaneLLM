@@ -63,6 +63,12 @@ PAGE_CONTEXT_FIELD_LIMITS = {
     "heading_path": 160,
     "selection_context": 700,
 }
+PAPER_SOURCE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+PAPER_ID_RE = re.compile(r"^[A-Za-z0-9._/-]{1,128}$")
+PAPER_STATUS_VALUES = {"idle", "requested", "ready", "error"}
+ARXIV_HOSTS = {"arxiv.org", "www.arxiv.org"}
+ARXIV_ROUTE_PREFIXES = {"abs", "pdf", "html"}
+PAPER_SUMMARY_PROMPT_PATH = REPO_ROOT / "broker" / "prompts" / "paper_summary.md"
 PAGE_CONTEXT_PROMPT_CHAR_BUDGET = 7200
 CODEX_TOOL_OUTPUT_CHAR_BUDGET = 12000
 CODEX_APPROVAL_TEXT_PREVIEW_CHARS = 120
@@ -587,6 +593,273 @@ def page_context_fingerprint(context: dict[str, Any] | None) -> str:
     return sha1(raw.encode("utf-8")).hexdigest()
 
 
+def normalize_paper_source(value: Any) -> str:
+    source = str(value or "").strip().lower()
+    if PAPER_SOURCE_RE.fullmatch(source):
+        return source
+    raise ValueError("paper_source is invalid.")
+
+
+def normalize_paper_id(value: Any) -> str:
+    paper_id = str(value or "").strip()
+    if PAPER_ID_RE.fullmatch(paper_id):
+        return paper_id
+    raise ValueError("paper_id is invalid.")
+
+
+def canonicalize_arxiv_identifier(value: Any) -> str:
+    identifier, _ = split_arxiv_identifier(value)
+    return identifier
+
+
+def normalize_paper_version(value: Any) -> str:
+    version = str(value or "").strip()
+    if not version:
+        return ""
+    if version.lower().startswith("v") and version[1:].isdigit():
+        return f"v{int(version[1:])}"
+    if version.isdigit():
+        return f"v{int(version)}"
+    match = re.fullmatch(r"v(\d+)", version, flags=re.IGNORECASE)
+    if match:
+        return f"v{int(match.group(1))}"
+    return version[:16]
+
+
+def split_arxiv_identifier(value: Any) -> tuple[str, str]:
+    identifier = str(value or "").strip().strip("/")
+    if identifier.lower().endswith(".pdf"):
+        identifier = identifier[:-4]
+    version = ""
+    match = re.search(r"v(\d+)$", identifier, flags=re.IGNORECASE)
+    if match:
+        version = f"v{int(match.group(1))}"
+        identifier = identifier[: match.start()]
+    return identifier.strip("/"), version
+
+
+def normalize_paper_versions(value: Any, *, limit: int = 16) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, int, float)):
+        candidates = [value]
+    elif isinstance(value, list):
+        candidates = value
+    else:
+        return []
+    versions: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        version = normalize_paper_version(item)
+        if not version or version in seen:
+            continue
+        seen.add(version)
+        versions.append(version)
+    versions.sort(key=lambda item: int(item[1:]) if item.startswith("v") and item[1:].isdigit() else -1, reverse=True)
+    return versions[:limit]
+
+
+def merge_paper_contexts(primary: Any, secondary: Any) -> dict[str, Any] | None:
+    primary_paper = normalize_paper_context(primary)
+    secondary_paper = normalize_paper_context(secondary)
+    if primary_paper and secondary_paper:
+        if not papers_equal(primary_paper, secondary_paper):
+            return primary_paper
+        merged = dict(primary_paper)
+        for key in ("title", "canonical_url", "paper_version", "versioned_url"):
+            if not merged.get(key) and secondary_paper.get(key):
+                merged[key] = secondary_paper.get(key)
+        return merged
+    return primary_paper or secondary_paper
+
+
+def extract_arxiv_paper(raw_url: Any, title: Any = "") -> dict[str, Any] | None:
+    try:
+        parsed = urlsplit(str(raw_url or "").strip())
+    except Exception:
+        return None
+    host = normalize_host(parsed.hostname or "")
+    if host not in ARXIV_HOSTS:
+        return None
+    segments = [unquote(part).strip() for part in (parsed.path or "").split("/") if part.strip()]
+    if len(segments) < 2 or segments[0].lower() not in ARXIV_ROUTE_PREFIXES:
+        return None
+    identifier = "/".join(segments[1:])
+    canonical_id, paper_version = split_arxiv_identifier(identifier)
+    if not canonical_id or not PAPER_ID_RE.fullmatch(canonical_id):
+        return None
+    clean_title = " ".join(str(title or "").split())[:240]
+    versioned_url = f"https://arxiv.org/abs/{canonical_id}{paper_version}" if paper_version else ""
+    return {
+        "source": "arxiv",
+        "paper_id": canonical_id,
+        "canonical_url": f"https://arxiv.org/abs/{canonical_id}",
+        "paper_version": paper_version,
+        "versioned_url": versioned_url,
+        "title": clean_title,
+    }
+
+
+def extract_paper_context(raw_url: Any, title: Any = "") -> dict[str, Any] | None:
+    return extract_arxiv_paper(raw_url, title)
+
+
+def normalize_paper_context(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("paper_context must be an object.")
+
+    raw_source = value.get("source")
+    raw_paper_id = value.get("paper_id", value.get("paperId"))
+    raw_url = value.get("canonical_url", value.get("canonicalUrl", value.get("url")))
+    raw_version = normalize_paper_version(value.get("paper_version", value.get("paperVersion")))
+    raw_versioned_url = str(
+        value.get(
+            "versioned_url",
+            value.get("versionedUrl", value.get("paper_version_url", value.get("paperVersionUrl"))),
+        )
+        or ""
+    ).strip()[: PAGE_CONTEXT_FIELD_LIMITS["url"]]
+    raw_title = value.get("title")
+
+    clean_title = " ".join(str(raw_title or "").split())[:240]
+    clean_url = str(raw_url or "").strip()[: PAGE_CONTEXT_FIELD_LIMITS["url"]]
+
+    if raw_source or raw_paper_id:
+        source = normalize_paper_source(raw_source)
+        paper_id = str(raw_paper_id or "").strip()
+        paper_version = raw_version
+        versioned_url = raw_versioned_url
+        if source == "arxiv":
+            paper_id, derived_version = split_arxiv_identifier(paper_id)
+            if not paper_id:
+                raise ValueError("paper_id is invalid.")
+            derived = None
+            if clean_url:
+                derived = extract_arxiv_paper(clean_url, clean_title)
+                if derived is not None and derived["paper_id"] != paper_id:
+                    raise ValueError("paper_context url does not match paper_id.")
+            if derived is not None and not derived.get("paper_version", "") and versioned_url:
+                derived_versioned = extract_arxiv_paper(versioned_url, clean_title)
+                if derived_versioned is not None:
+                    if derived_versioned["paper_id"] != paper_id:
+                        raise ValueError("paper_context url does not match paper_id.")
+                    derived = derived_versioned
+            elif derived is None and versioned_url:
+                derived_versioned = extract_arxiv_paper(versioned_url, clean_title)
+                if derived_versioned is not None:
+                    if derived_versioned["paper_id"] != paper_id:
+                        raise ValueError("paper_context url does not match paper_id.")
+                    derived = derived_versioned
+            if derived is not None:
+                clean_url = derived["canonical_url"]
+                if not paper_version:
+                    paper_version = derived.get("paper_version", "") or derived_version
+                if not versioned_url:
+                    versioned_url = derived.get("versioned_url", "")
+            elif derived_version and not paper_version:
+                paper_version = derived_version
+            if not clean_url:
+                clean_url = f"https://arxiv.org/abs/{paper_id}"
+            if paper_version:
+                versioned_url = f"https://arxiv.org/abs/{paper_id}{paper_version}"
+        paper_id = normalize_paper_id(paper_id)
+        return {
+            "source": source,
+            "paper_id": paper_id,
+            "canonical_url": clean_url,
+            "paper_version": paper_version,
+            "versioned_url": versioned_url,
+            "title": clean_title,
+        }
+
+    derived = extract_paper_context(clean_url, clean_title)
+    if derived:
+        return derived
+    raise ValueError("paper_context is invalid.")
+
+
+def papers_equal(left: Any, right: Any) -> bool:
+    left_paper = normalize_paper_context(left)
+    right_paper = normalize_paper_context(right)
+    if not left_paper and not right_paper:
+        return True
+    if not left_paper or not right_paper:
+        return False
+    return left_paper["source"] == right_paper["source"] and left_paper["paper_id"] == right_paper["paper_id"]
+
+
+def conversation_paper_context(conversation: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(conversation, dict):
+        return None
+    codex = conversation.get("codex")
+    if not isinstance(codex, dict):
+        return None
+
+    direct_paper = None
+    direct_candidate = {
+        "source": codex.get("paper_source"),
+        "paper_id": codex.get("paper_id"),
+        "canonical_url": codex.get("paper_url") or codex.get("page_context_url"),
+        "paper_version": codex.get("paper_version"),
+        "paper_version_url": codex.get("paper_version_url") or codex.get("versioned_url"),
+        "versioned_url": codex.get("paper_version_url") or codex.get("versioned_url"),
+        "title": codex.get("paper_title") or codex.get("page_context_title"),
+    }
+    if any(direct_candidate.values()):
+        try:
+            direct_paper = normalize_paper_context(direct_candidate)
+        except ValueError:
+            direct_paper = None
+
+    page_paper = None
+    page_payload = codex.get("page_context_payload")
+    if isinstance(page_payload, dict):
+        try:
+            page_paper = normalize_paper_context(
+                {
+                    "url": page_payload.get("url", ""),
+                    "title": page_payload.get("title", ""),
+                }
+            )
+        except ValueError:
+            page_paper = None
+
+    if direct_paper and page_paper:
+        if papers_equal(direct_paper, page_paper):
+            return merge_paper_contexts(direct_paper, page_paper)
+        return direct_paper
+    return direct_paper or page_paper
+
+
+def default_paper_summary_prompt() -> str:
+    return "\n".join(
+        [
+            "# Paper Summary",
+            "",
+            "Use only the provided page context.",
+            "Write a concise saved summary for this paper page.",
+            "",
+            "Requirements:",
+            "- Start with a 2-4 sentence summary of the paper's core idea.",
+            "- Then add short sections named `Key contributions`, `Why it matters`, and `Limits / caveats`.",
+            "- Keep the writing factual and grounded in the provided page only.",
+            "- If the context is insufficient to support a claim, say so briefly instead of guessing.",
+            "- Do not mention these instructions in the answer.",
+        ]
+    ).strip()
+
+
+def load_paper_summary_prompt() -> str:
+    try:
+        raw = PAPER_SUMMARY_PROMPT_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return default_paper_summary_prompt()
+    prompt = str(raw or "").strip()
+    return prompt or default_paper_summary_prompt()
+
+
 def should_reuse_session_page_context(
     codex_state: dict[str, Any],
     run: dict[str, Any],
@@ -942,18 +1215,14 @@ def latest_codex_session_entry() -> dict[str, Any] | None:
 
 def discover_new_codex_session_id(previous_entry: dict[str, Any] | None) -> str:
     previous_id = str((previous_entry or {}).get("id", "") or "")
-    previous_updated_at = str((previous_entry or {}).get("updated_at", "") or "")
     entries = read_codex_session_index(limit=400)
     for entry in reversed(entries):
         entry_id = str(entry.get("id", "") or "")
-        updated_at = str(entry.get("updated_at", "") or "")
         if not entry_id:
             continue
         if entry_id != previous_id:
             return entry_id
-        if previous_updated_at and updated_at > previous_updated_at:
-            return entry_id
-    return previous_id
+    return ""
 
 
 class ConversationStore:
@@ -1007,11 +1276,22 @@ class ConversationStore:
             "page_context_url": str(raw.get("page_context_url", "") or ""),
             "page_context_title": str(raw.get("page_context_title", "") or ""),
             "page_context_updated_at": str(raw.get("page_context_updated_at", "") or ""),
+            "paper_source": str(raw.get("paper_source", "") or ""),
+            "paper_id": str(raw.get("paper_id", "") or ""),
+            "paper_url": str(raw.get("paper_url", "") or ""),
+            "paper_version": normalize_paper_version(raw.get("paper_version", "")),
+            "paper_version_url": str(raw.get("paper_version_url", "") or ""),
+            "paper_chat_kind": str(raw.get("paper_chat_kind", "") or "").strip().lower(),
+            "paper_history_label": str(raw.get("paper_history_label", "") or ""),
+            "paper_focus_text": str(raw.get("paper_focus_text", "") or ""),
+            "paper_title": str(raw.get("paper_title", "") or ""),
+            "paper_updated_at": str(raw.get("paper_updated_at", "") or ""),
             "last_page_context_message_count": int(
                 raw.get("last_page_context_message_count", 0) or 0
             ),
             "last_page_context_fingerprint": str(raw.get("last_page_context_fingerprint", "") or ""),
             "page_context_payload": normalize_page_context(raw.get("page_context_payload")),
+            "highlight_captures": normalize_highlight_capture_list(raw.get("highlight_captures")),
         }
 
     def _normalize_reasoning_blocks(self, value: Any) -> list[str]:
@@ -1150,6 +1430,7 @@ class ConversationStore:
         codex["last_page_context_message_count"] = 0
         codex["last_page_context_fingerprint"] = ""
         codex["cli_session_id"] = ""
+        codex["highlight_captures"] = []
         conversation["codex"] = codex
 
         self.save(conversation)
@@ -1175,31 +1456,59 @@ class ConversationStore:
                 codex[key] = normalize_codex_bool(value)
             elif key == "page_context_payload":
                 codex[key] = normalize_page_context(value)
+            elif key == "highlight_captures":
+                codex[key] = normalize_highlight_capture_list(value)
             else:
                 codex[key] = str(value or "")
         conversation["codex"] = codex
         self.save(conversation)
         return conversation
 
-    def list_metadata(self) -> list[dict[str, Any]]:
+    def list_metadata(
+        self,
+        *,
+        paper_source: str | None = None,
+        paper_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        required_source = normalize_paper_source(paper_source) if paper_source else ""
+        required_paper_id = normalize_paper_id(paper_id) if paper_id else ""
         items: list[dict[str, Any]] = []
         for path in self._dir.glob("*.json"):
             try:
                 payload = self._normalize_conversation(json.loads(path.read_text(encoding="utf-8")))
             except Exception:
                 continue
+            paper = conversation_paper_context(payload)
+            if required_source:
+                if not paper:
+                    continue
+                if paper["source"] != required_source or paper["paper_id"] != required_paper_id:
+                    continue
+            codex = payload.get("codex", {})
             messages = payload.get("messages", [])
-            last_message = messages[-1]["content"] if messages else ""
-            items.append(
-                {
-                    "id": payload.get("id", path.stem),
-                    "title": payload.get("title", "New Chat"),
-                    "created_at": payload.get("created_at"),
-                    "updated_at": payload.get("updated_at"),
-                    "message_count": len(messages),
-                    "preview": str(last_message)[:80],
-                }
-            )
+            if not messages:
+                continue
+            item = {
+                "id": payload.get("id", path.stem),
+                "title": payload.get("title", "New Chat"),
+                "created_at": payload.get("created_at"),
+                "updated_at": payload.get("updated_at"),
+                "message_count": len(messages),
+                "preview": build_conversation_highlight(payload),
+                "paper_chat_kind": str(codex.get("paper_chat_kind", "") or ""),
+                "paper_history_label": str(codex.get("paper_history_label", "") or ""),
+                "paper_focus_text": str(codex.get("paper_focus_text", "") or ""),
+                "paper_version": normalize_paper_version(
+                    codex.get("paper_version", "") or (paper.get("paper_version", "") if paper else "")
+                ),
+                "paper_version_url": str(
+                    codex.get("paper_version_url", "") or (paper.get("versioned_url", "") if paper else "")
+                    or ""
+                ),
+            }
+            if paper:
+                item["paper"] = paper
+            items.append(item)
         items.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
         return items
 
@@ -1207,10 +1516,14 @@ class ConversationStore:
         path = self._path(conversation_id)
         if not path.exists():
             raise FileNotFoundError("Conversation not found.")
-        return self._normalize_conversation(
+        conversation = self._normalize_conversation(
             json.loads(path.read_text(encoding="utf-8")),
             conversation_id,
         )
+        paper = conversation_paper_context(conversation)
+        if paper:
+            conversation["paper"] = paper
+        return conversation
 
     def delete(self, conversation_id: str) -> bool:
         path = self._path(conversation_id)
@@ -1218,6 +1531,224 @@ class ConversationStore:
             return False
         path.unlink()
         return True
+
+
+class PaperStateStore:
+    def __init__(self, root: Path) -> None:
+        self._root = root
+        self._dir = root / "papers"
+        self._dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self._root, 0o700)
+            os.chmod(self._dir, 0o700)
+        except OSError:
+            pass
+
+    def _filename(self, source: str, paper_id: str) -> str:
+        safe_id = re.sub(r"[^A-Za-z0-9._-]+", "_", paper_id).strip("._")
+        if not safe_id:
+            safe_id = sha1(paper_id.encode("utf-8")).hexdigest()[:16]
+        return f"{source}--{safe_id}.json"
+
+    def _path(self, source: str, paper_id: str) -> Path:
+        validated_source = normalize_paper_source(source)
+        validated_paper_id = normalize_paper_id(paper_id)
+        return self._dir / self._filename(validated_source, validated_paper_id)
+
+    def _normalize_highlights(self, value: Any) -> list[Any]:
+        return normalize_paper_highlights(value)
+
+    def _normalize_observed_versions(self, value: Any) -> list[str]:
+        return normalize_paper_versions(value)
+
+    def _merge_observed_versions(
+        self,
+        record: dict[str, Any],
+        *version_values: Any,
+    ) -> dict[str, Any]:
+        versions = normalize_paper_versions(record.get("observed_versions"))
+        for value in version_values:
+            versions = normalize_paper_versions([*versions, *normalize_paper_versions(value)])
+        record["observed_versions"] = versions
+        return record
+
+    def _normalize_record(
+        self,
+        value: Any,
+        *,
+        source: str | None = None,
+        paper_id: str | None = None,
+    ) -> dict[str, Any]:
+        raw = value if isinstance(value, dict) else {}
+        normalized_source = normalize_paper_source(source or raw.get("source"))
+        raw_identifier = paper_id or raw.get("paper_id")
+        normalized_paper_id = normalize_paper_id(
+            canonicalize_arxiv_identifier(raw_identifier) if normalized_source == "arxiv" else raw_identifier
+        )
+        stamp = now_iso()
+        status = str(raw.get("summary_status", "idle") or "idle").strip().lower()
+        if status not in PAPER_STATUS_VALUES:
+            status = "idle"
+        canonical_url = str(raw.get("canonical_url", "") or "").strip()[: PAGE_CONTEXT_FIELD_LIMITS["url"]]
+        if not canonical_url and normalized_source == "arxiv":
+            canonical_url = f"https://arxiv.org/abs/{normalized_paper_id}"
+        return {
+            "source": normalized_source,
+            "paper_id": normalized_paper_id,
+            "canonical_url": canonical_url,
+            "title": " ".join(str(raw.get("title", "") or "").split())[:240],
+            "observed_versions": self._normalize_observed_versions(raw.get("observed_versions")),
+            "summary": str(raw.get("summary", "") or ""),
+            "summary_status": status,
+            "summary_requested_at": str(raw.get("summary_requested_at", "") or ""),
+            "last_summary_conversation_id": str(raw.get("last_summary_conversation_id", "") or ""),
+            "last_summary_version": normalize_paper_version(raw.get("last_summary_version", "")),
+            "summary_error": str(raw.get("summary_error", "") or "")[:800],
+            "highlights": self._normalize_highlights(raw.get("highlights")),
+            "created_at": str(raw.get("created_at", "") or stamp),
+            "updated_at": str(raw.get("updated_at", "") or stamp),
+        }
+
+    def _write(self, path: Path, payload: dict[str, Any]) -> None:
+        raw = json.dumps(payload, ensure_ascii=True, indent=2)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(raw, encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        tmp.replace(path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+    def get_or_create(
+        self,
+        source: str,
+        paper_id: str,
+        *,
+        canonical_url: str = "",
+        title: str = "",
+    ) -> dict[str, Any]:
+        path = self._path(source, paper_id)
+        if path.exists():
+            return self._normalize_record(
+                json.loads(path.read_text(encoding="utf-8")),
+                source=source,
+                paper_id=paper_id,
+            )
+        record = self._normalize_record(
+            {
+                "source": source,
+                "paper_id": paper_id,
+                "canonical_url": canonical_url,
+                "title": title,
+                "summary": "",
+                "summary_status": "idle",
+                "summary_requested_at": "",
+                "last_summary_conversation_id": "",
+                "last_summary_version": "",
+                "summary_error": "",
+                "highlights": [],
+                "observed_versions": [],
+            },
+            source=source,
+            paper_id=paper_id,
+        )
+        self._write(path, record)
+        return record
+
+    def save(self, record: dict[str, Any]) -> dict[str, Any]:
+        normalized = self._normalize_record(record)
+        normalized["updated_at"] = now_iso()
+        self._write(self._path(normalized["source"], normalized["paper_id"]), normalized)
+        return normalized
+
+    def add_highlight(
+        self,
+        source: str,
+        paper_id: str,
+        *,
+        canonical_url: str = "",
+        title: str = "",
+        highlight: Any = None,
+    ) -> dict[str, Any]:
+        record = self.get_or_create(source, paper_id, canonical_url=canonical_url, title=title)
+        if title:
+            record["title"] = " ".join(str(title).split())[:240]
+        if canonical_url:
+            record["canonical_url"] = str(canonical_url).strip()[: PAGE_CONTEXT_FIELD_LIMITS["url"]]
+        normalized_highlights = self._normalize_highlights([highlight])
+        if normalized_highlights:
+            clean_highlight = normalized_highlights[0]
+            clean_signature = paper_highlight_signature(clean_highlight)
+            existing = [
+                item
+                for item in self._normalize_highlights(record.get("highlights"))
+                if paper_highlight_signature(item) != clean_signature
+            ]
+            record["highlights"] = [clean_highlight, *existing][:64]
+            record = self._merge_observed_versions(record, clean_highlight.get("paper_version", ""))
+        return self.save(record)
+
+    def mark_summary_requested(
+        self,
+        source: str,
+        paper_id: str,
+        *,
+        canonical_url: str = "",
+        title: str = "",
+        conversation_id: str = "",
+        paper_version: str = "",
+    ) -> dict[str, Any]:
+        record = self.get_or_create(source, paper_id, canonical_url=canonical_url, title=title)
+        if title:
+            record["title"] = " ".join(str(title).split())[:240]
+        if canonical_url:
+            record["canonical_url"] = str(canonical_url).strip()[: PAGE_CONTEXT_FIELD_LIMITS["url"]]
+        record["summary_status"] = "requested"
+        record["summary_requested_at"] = now_iso()
+        record["last_summary_conversation_id"] = str(conversation_id or "").strip()
+        normalized_version = normalize_paper_version(paper_version)
+        if normalized_version:
+            record["last_summary_version"] = normalized_version
+            record = self._merge_observed_versions(record, normalized_version)
+        record["summary_error"] = ""
+        return self.save(record)
+
+    def store_summary_result(
+        self,
+        source: str,
+        paper_id: str,
+        *,
+        canonical_url: str = "",
+        title: str = "",
+        conversation_id: str = "",
+        paper_version: str = "",
+        summary: str = "",
+        error: str = "",
+    ) -> dict[str, Any]:
+        record = self.get_or_create(source, paper_id, canonical_url=canonical_url, title=title)
+        if title:
+            record["title"] = " ".join(str(title).split())[:240]
+        if canonical_url:
+            record["canonical_url"] = str(canonical_url).strip()[: PAGE_CONTEXT_FIELD_LIMITS["url"]]
+        if conversation_id:
+            record["last_summary_conversation_id"] = str(conversation_id or "").strip()
+        normalized_version = normalize_paper_version(paper_version)
+        if normalized_version:
+            record["last_summary_version"] = normalized_version
+            record = self._merge_observed_versions(record, normalized_version)
+        clean_summary = str(summary or "").strip()
+        if clean_summary:
+            record["summary"] = clean_summary
+            record["summary_status"] = "ready"
+            record["summary_error"] = ""
+        else:
+            record["summary_status"] = "error"
+            record["summary_error"] = str(error or "Paper summary generation failed.").strip()[:800]
+        return self.save(record)
 
 
 @dataclass
@@ -3507,6 +4038,21 @@ class CodexRunManager:
         rewrite_message_index = ensure_rewrite_message_index(
             data.get("rewrite_message_index", data.get("rewriteMessageIndex"))
         )
+        store_user_message = ensure_boolean_flag(
+            data.get("store_user_message", data.get("storeUserMessage")),
+            "store_user_message",
+            default=True,
+        )
+        append_assistant_message = ensure_boolean_flag(
+            data.get("append_assistant_message", data.get("appendAssistantMessage")),
+            "append_assistant_message",
+            default=True,
+        )
+        persist_backend_session = ensure_boolean_flag(
+            data.get("persist_backend_session", data.get("persistBackendSession")),
+            "persist_backend_session",
+            default=store_user_message and append_assistant_message,
+        )
         force_browser_action = ensure_boolean_flag(
             data.get("force_browser_action", data.get("forceBrowserAction")),
             "force_browser_action",
@@ -3515,6 +4061,8 @@ class CodexRunManager:
             raise ValueError("session_id is required.")
         if not prompt:
             raise ValueError("prompt is required.")
+        if rewrite_message_index is not None and not store_user_message:
+            raise ValueError("rewrite_message_index requires store_user_message=true.")
         incoming_signals = data.get("risk_signals") or []
         if not isinstance(incoming_signals, list):
             raise ValueError("risk_signals must be an array when provided.")
@@ -3530,6 +4078,15 @@ class CodexRunManager:
         raw_include_page_context = data.get("include_page_context", data.get("includePageContext"))
         include_page_context = normalize_codex_bool(raw_include_page_context) == "true"
         incoming_page_context = normalize_page_context(data.get("page_context"))
+        incoming_paper_context = normalize_paper_context(
+            data.get("paper_context", data.get("paperContext"))
+        )
+        paper_summary_target = normalize_paper_context(
+            data.get("paper_summary_target", data.get("paperSummaryTarget"))
+        )
+        highlight_context = normalize_highlight_capture(
+            data.get("highlight_context", data.get("highlightContext"))
+        )
         requested_allowed_hosts = data.get("allowed_hosts", data.get("allowedHosts"))
         if backend == "codex" and not (
             CONFIG.openai_api_key or (CONFIG.codex_cli_path and CONFIG.codex_cli_logged_in)
@@ -3545,7 +4102,11 @@ class CodexRunManager:
         elif backend == "mlx":
             ensure_mlx_backend_available(CONFIG)
         if rewrite_message_index is None:
-            conversation = CONVERSATIONS.append_message(session_id, "user", prompt)
+            conversation = (
+                CONVERSATIONS.append_message(session_id, "user", prompt)
+                if store_user_message
+                else CONVERSATIONS.get_or_create(session_id)
+            )
         else:
             conversation = CONVERSATIONS.rewrite_user_message(
                 session_id,
@@ -3555,11 +4116,37 @@ class CodexRunManager:
 
         codex = conversation.get("codex", {})
         cached_page_context = normalize_page_context(codex.get("page_context_payload"))
+        cached_paper_context = conversation_paper_context(conversation)
         page_context = incoming_page_context if include_page_context else None
         if not page_context and include_page_context and cached_page_context is not None:
             page_context = cached_page_context
         if include_page_context and page_context is None:
             raise ValueError("includePageContext was requested but no page context is available for this session.")
+        paper_context = merge_paper_contexts(cached_paper_context, incoming_paper_context)
+        if not paper_context and page_context is not None:
+            try:
+                paper_context = normalize_paper_context(
+                    {
+                        "url": page_context.get("url", ""),
+                        "title": page_context.get("title", ""),
+                    }
+                )
+            except ValueError:
+                paper_context = None
+        if paper_context is not None and page_context is not None:
+            try:
+                page_paper_context = normalize_paper_context(
+                    {
+                        "url": page_context.get("url", ""),
+                        "title": page_context.get("title", ""),
+                    }
+                )
+            except ValueError:
+                page_paper_context = None
+            if page_paper_context is not None and papers_equal(paper_context, page_paper_context):
+                paper_context = merge_paper_contexts(paper_context, page_paper_context)
+        if paper_summary_target is not None and paper_context is not None and papers_equal(paper_summary_target, paper_context):
+            paper_summary_target = merge_paper_contexts(paper_context, paper_summary_target)
         allowed_hosts = resolve_route_allowlist(requested_allowed_hosts, page_context)
         if force_browser_action and not allowed_hosts:
             raise RuntimeError("Browser action mode requires at least one allowlisted host.")
@@ -3613,12 +4200,17 @@ class CodexRunManager:
             "_request_prompt_suffix": request_prompt_suffix,
             "_page_context": page_context,
             "_page_context_fingerprint": page_context_fingerprint(page_context),
+            "_paper_context": paper_context,
             "_conversation_message_count": len(conversation.get("messages", [])),
             "_browser_session": browser_session,
             "_browser_run": browser_run,
             "_allowed_hosts": allowed_hosts,
             "_force_browser_action": bool(force_browser_action),
             "_llama_request_options": llama_options if backend == "llama" else {},
+            "_append_assistant_message": bool(append_assistant_message),
+            "_persist_backend_session": bool(persist_backend_session),
+            "_paper_summary_target": paper_summary_target,
+            "_highlight_context": highlight_context,
             "_approval_decision": None,
         }
 
@@ -3641,19 +4233,49 @@ class CodexRunManager:
             "last_run_status": "thinking",
             "page_context_enabled": bool(include_page_context),
         }
+        if paper_context is not None:
+            codex_update["paper_source"] = paper_context.get("source", "")
+            codex_update["paper_id"] = paper_context.get("paper_id", "")
+            codex_update["paper_url"] = paper_context.get("canonical_url", "")
+            if paper_context.get("paper_version"):
+                codex_update["paper_version"] = paper_context.get("paper_version", "")
+            if paper_context.get("versioned_url"):
+                codex_update["paper_version_url"] = paper_context.get("versioned_url", "")
+            codex_update["paper_title"] = paper_context.get("title", "")
+            codex_update["paper_updated_at"] = now_iso()
+            existing_chat_kind = str(codex.get("paper_chat_kind", "") or "").strip().lower()
+            existing_history_label = str(codex.get("paper_history_label", "") or "").strip()
+            if highlight_context is not None:
+                codex_update["paper_chat_kind"] = "explain_selection"
+                codex_update["paper_history_label"] = "Explain Selection"
+                focus_text = compact_whitespace(highlight_context.get("selection", ""), 240)
+                if focus_text:
+                    codex_update["paper_focus_text"] = focus_text
+            else:
+                if not existing_chat_kind:
+                    codex_update["paper_chat_kind"] = "general"
+                if not existing_history_label and (not existing_chat_kind or existing_chat_kind == "general"):
+                    label_text = compact_whitespace(prompt, 120) or compact_whitespace(
+                        paper_context.get("title", "") or f"arXiv:{paper_context.get('paper_id', '')}",
+                        120,
+                    )
+                    if label_text:
+                        codex_update["paper_history_label"] = label_text
         if page_context is not None:
             context_fingerprint = page_context_fingerprint(page_context)
-            codex_update["last_page_context_fingerprint"] = context_fingerprint
             codex_update["page_context_fingerprint"] = context_fingerprint
             codex_update["page_context_payload"] = page_context
             codex_update["page_context_url"] = page_context.get("url", "")
             codex_update["page_context_title"] = page_context.get("title", "")
             codex_update["page_context_updated_at"] = now_iso()
-            codex_update["last_page_context_message_count"] = len(conversation.get("messages", []))
+            if persist_backend_session:
+                codex_update["last_page_context_fingerprint"] = context_fingerprint
+                codex_update["last_page_context_message_count"] = len(conversation.get("messages", []))
         else:
             codex_update["page_context_fingerprint"] = ""
-            codex_update["last_page_context_fingerprint"] = ""
-            codex_update["last_page_context_message_count"] = len(conversation.get("messages", []))
+            if persist_backend_session:
+                codex_update["last_page_context_fingerprint"] = ""
+                codex_update["last_page_context_message_count"] = len(conversation.get("messages", []))
         CONVERSATIONS.update_codex_state(session_id, codex_update)
 
         thread = threading.Thread(target=self._run_worker, args=(run_id,), daemon=True)
@@ -3797,6 +4419,8 @@ class CodexRunManager:
         append_assistant_message: bool = True,
         codex_mode: str = "responses",
     ) -> None:
+        append_assistant_message = bool(run.get("_append_assistant_message", append_assistant_message))
+        persist_backend_session = bool(run.get("_persist_backend_session", append_assistant_message))
         self._set_status_locked(
             run,
             status,
@@ -3834,12 +4458,46 @@ class CodexRunManager:
                 "active_run_id": "",
                 "last_run_id": run["run_id"],
                 "last_run_status": status,
-                "last_response_message_count": len(conversation.get("messages", [])),
             }
-            if backend == "codex" and response_id:
+            if persist_backend_session:
+                updates["last_response_message_count"] = len(conversation.get("messages", []))
+            if backend == "codex" and response_id and persist_backend_session:
                 updates["last_response_id"] = response_id
+            highlight_context = normalize_highlight_capture(run.get("_highlight_context"))
+            if highlight_context is not None and assistant_text:
+                paper_context = normalize_paper_context(run.get("_paper_context")) or conversation_paper_context(conversation)
+                paper_version = ""
+                if paper_context is not None:
+                    paper_version = normalize_paper_version(paper_context.get("paper_version", ""))
+                finalized_highlight = normalize_highlight_capture(
+                    {
+                        **highlight_context,
+                        "response": assistant_text,
+                        "conversation_id": conversation_id,
+                        "created_at": now_iso(),
+                        "paper_version": paper_version,
+                    }
+                )
+                if finalized_highlight is not None:
+                    existing_highlights = normalize_highlight_capture_list(
+                        conversation.get("codex", {}).get("highlight_captures")
+                    )
+                    updates["highlight_captures"] = normalize_highlight_capture_list(
+                        [finalized_highlight, *existing_highlights]
+                    )
+                    if paper_context is not None:
+                        try:
+                            PAPERS.add_highlight(
+                                paper_context["source"],
+                                paper_context["paper_id"],
+                                canonical_url=paper_context.get("canonical_url", ""),
+                                title=paper_context.get("title", ""),
+                                highlight=finalized_highlight,
+                            )
+                        except Exception:
+                            pass
             CONVERSATIONS.update_codex_state(conversation_id, updates)
-        elif backend == "codex":
+        else:
             CONVERSATIONS.update_codex_state(
                 conversation_id,
                 {
@@ -3850,6 +4508,29 @@ class CodexRunManager:
                     "last_run_status": status,
                 },
             )
+
+        paper_summary_target = normalize_paper_context(run.get("_paper_summary_target"))
+        if paper_summary_target is not None:
+            if status == "completed":
+                PAPERS.store_summary_result(
+                    paper_summary_target["source"],
+                    paper_summary_target["paper_id"],
+                    canonical_url=paper_summary_target.get("canonical_url", ""),
+                    title=paper_summary_target.get("title", ""),
+                    conversation_id=conversation_id,
+                    paper_version=paper_summary_target.get("paper_version", ""),
+                    summary=assistant_text,
+                )
+            elif status in {"failed", "cancelled", "blocked_for_review"}:
+                PAPERS.store_summary_result(
+                    paper_summary_target["source"],
+                    paper_summary_target["paper_id"],
+                    canonical_url=paper_summary_target.get("canonical_url", ""),
+                    title=paper_summary_target.get("title", ""),
+                    conversation_id=conversation_id,
+                    paper_version=paper_summary_target.get("paper_version", ""),
+                    error=assistant_text or emit_message,
+                )
 
     def _wait_for_approval(self, run: dict[str, Any]) -> str:
         with self._condition:
@@ -3965,6 +4646,7 @@ class CodexRunManager:
             request_prompt_suffix = str(run.get("_request_prompt_suffix", ""))
             page_context = run.get("_page_context")
             force_browser_action = bool(run.get("_force_browser_action"))
+            persist_backend_session = bool(run.get("_persist_backend_session", True))
             page_context_text = format_page_context(page_context)
             suspicious_page = scan_untrusted_instruction(page_context_text)
             if suspicious_page:
@@ -3977,7 +4659,8 @@ class CodexRunManager:
         stored_message_count = int(codex_state.get("last_response_message_count", 0) or 0)
         current_message_count = len(conversation.get("messages", []))
         use_previous_response_id = bool(
-            stored_response_id
+            persist_backend_session
+            and stored_response_id
             and current_message_count == stored_message_count + 1
             and should_reuse_session_page_context(
                 codex_state,
@@ -4134,20 +4817,13 @@ class CodexRunManager:
             reasoning_budget = llama_options.get("reasoning_budget")
         conversation = CONVERSATIONS.get(run["conversation_id"])
         page_context_text = format_page_context(page_context)
-        codex_state = conversation.get("codex", {})
-        current_message_count = len(conversation.get("messages", []))
-        use_previous_session_context = should_reuse_session_page_context(
-            codex_state,
-            run,
-            current_message_count,
-        )
         model_prompt = compose_request_prompt(
             prompt,
             request_prompt_suffix,
-            "" if use_previous_session_context else page_context_text,
+            page_context_text,
         )
         messages = build_model_context(conversation)
-        if request_prompt_suffix or (not use_previous_session_context and page_context_text):
+        if request_prompt_suffix or page_context_text:
             messages = inject_page_context(messages, model_prompt)
         if force_browser_action:
             if int(EXTENSION_RELAY.health().get("connected_clients", 0)) <= 0:
@@ -4191,20 +4867,13 @@ class CodexRunManager:
             force_browser_action = bool(run.get("_force_browser_action"))
         conversation = CONVERSATIONS.get(run["conversation_id"])
         page_context_text = format_page_context(page_context)
-        codex_state = conversation.get("codex", {})
-        current_message_count = len(conversation.get("messages", []))
-        use_previous_session_context = should_reuse_session_page_context(
-            codex_state,
-            run,
-            current_message_count,
-        )
         model_prompt = compose_request_prompt(
             prompt,
             request_prompt_suffix,
-            "" if use_previous_session_context else page_context_text,
+            page_context_text,
         )
         messages = build_model_context(conversation)
-        if request_prompt_suffix or (not use_previous_session_context and page_context_text):
+        if request_prompt_suffix or page_context_text:
             messages = inject_page_context(messages, model_prompt)
         if force_browser_action:
             if int(EXTENSION_RELAY.health().get("connected_clients", 0)) <= 0:
@@ -4242,12 +4911,16 @@ class CodexRunManager:
             page_context = run.get("_page_context")
             allowed_hosts = list(run.get("_allowed_hosts", []))
             force_browser_action = bool(run.get("_force_browser_action"))
+            persist_backend_session = bool(run.get("_persist_backend_session", True))
         page_context_text = format_page_context(page_context)
         conversation = CONVERSATIONS.get(run["conversation_id"])
         messages = build_model_context(conversation)
         codex_state = conversation.get("codex", {})
         current_message_count = len(conversation.get("messages", []))
-        use_previous_session_context = should_reuse_session_page_context(
+        cli_session_id = ""
+        if persist_backend_session and isinstance(codex_state, dict):
+            cli_session_id = str(codex_state.get("cli_session_id", "") or "")
+        use_previous_session_context = bool(cli_session_id) and should_reuse_session_page_context(
             codex_state,
             run,
             current_message_count,
@@ -4259,9 +4932,6 @@ class CodexRunManager:
         )
         if request_prompt_suffix or (not use_previous_session_context and page_context_text):
             messages = inject_page_context(messages, model_prompt)
-        cli_session_id = ""
-        if isinstance(codex_state, dict):
-            cli_session_id = str(codex_state.get("cli_session_id", "") or "")
         extension_clients = int(EXTENSION_RELAY.health().get("connected_clients", 0))
         enable_cli_browser_mcp = extension_clients > 0 and bool(allowed_hosts)
         if force_browser_action:
@@ -4287,7 +4957,11 @@ class CodexRunManager:
                 "active_run_id": run_id,
                 "last_run_id": run_id,
                 "last_run_status": "thinking",
-                "cli_session_id": resolved_cli_session_id or cli_session_id,
+                **(
+                    {"cli_session_id": resolved_cli_session_id or cli_session_id}
+                    if persist_backend_session
+                    else {}
+                ),
             },
         )
         return split_stream_text(answer)
@@ -4419,6 +5093,7 @@ class CodexRunManager:
 
 CONFIG = load_config()
 CONVERSATIONS = ConversationStore(CONFIG.data_dir)
+PAPERS = PaperStateStore(CONFIG.data_dir)
 BROWSER_CONFIG = BrowserConfigManager(CONFIG.data_dir)
 EXTENSION_RELAY = ExtensionCommandRelay(CONFIG.extension_client_stale_sec)
 BROWSER_AUTOMATION = BrowserAutomationManager(CONFIG.browser_default_domain_allowlist)
@@ -4467,6 +5142,96 @@ def compact_text_block(value: Any, limit: int) -> str:
     cleaned = "\n\n".join(paragraphs)
     return cleaned[:limit]
 
+
+def normalize_highlight_capture(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    kind = str(value.get("kind", "") or "").strip().lower()
+    if kind != "explain_selection":
+        return None
+    selection = compact_text_block(value.get("selection", ""), 1600)
+    if not selection:
+        return None
+    return {
+        "kind": "explain_selection",
+        "selection": selection,
+        "prompt": compact_text_block(value.get("prompt", ""), 600),
+        "response": compact_text_block(value.get("response", ""), 4000),
+        "paper_version": normalize_paper_version(value.get("paper_version", value.get("paperVersion"))),
+        "conversation_id": str(
+            value.get("conversation_id", value.get("conversationId")) or ""
+        ).strip()[:120],
+        "created_at": str(value.get("created_at", value.get("createdAt")) or "").strip()[:80],
+    }
+
+
+def highlight_capture_signature(value: Any) -> tuple[str, str, str, str, str]:
+    capture = normalize_highlight_capture(value)
+    if capture is None:
+        return ("", "", "", "", "")
+    return (
+        capture["kind"],
+        capture["selection"],
+        capture["prompt"],
+        capture["response"],
+        capture.get("paper_version", ""),
+    )
+
+
+def normalize_highlight_capture_list(value: Any, *, limit: int = 24) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    captures: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str, str]] = set()
+    for item in value:
+        capture = normalize_highlight_capture(item)
+        if capture is None:
+            continue
+        signature = highlight_capture_signature(capture)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        captures.append(capture)
+        if len(captures) >= limit:
+            break
+    return captures
+
+
+def normalize_paper_highlight_entry(value: Any) -> Any:
+    capture = normalize_highlight_capture(value)
+    if capture is not None:
+        if not capture.get("response", ""):
+            return None
+        return capture
+    text = compact_text_block(value, 400)
+    return text or None
+
+
+def paper_highlight_signature(value: Any) -> tuple[str, str, str, str, str, str]:
+    capture = normalize_highlight_capture(value)
+    if capture is not None and capture.get("response", ""):
+        kind, selection, prompt, response, paper_version = highlight_capture_signature(capture)
+        return ("structured", kind, selection, prompt, response, paper_version)
+    return ("legacy", compact_text_block(value, 400), "", "", "", "")
+
+
+def normalize_paper_highlights(value: Any, *, limit: int = 64) -> list[Any]:
+    if not isinstance(value, list):
+        return []
+    highlights: list[Any] = []
+    seen: set[tuple[str, str, str, str, str, str]] = set()
+    for item in value:
+        normalized = normalize_paper_highlight_entry(item)
+        if normalized is None:
+            continue
+        signature = paper_highlight_signature(normalized)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        highlights.append(normalized)
+        if len(highlights) >= limit:
+            break
+    return highlights
 
 
 def normalize_page_context(value: Any) -> dict[str, Any] | None:
@@ -4532,9 +5297,9 @@ def ensure_rewrite_message_index(value: Any) -> int | None:
     return index
 
 
-def ensure_boolean_flag(value: Any, field_name: str) -> bool:
+def ensure_boolean_flag(value: Any, field_name: str, *, default: bool = False) -> bool:
     if value is None:
-        return False
+        return default
     if isinstance(value, bool):
         return value
     raise ValueError(f"{field_name} must be a boolean when provided.")
@@ -6190,6 +6955,226 @@ def handle_browser_tool_call(data: dict[str, Any]) -> dict[str, Any]:
     return browser_tool_result(envelope)
 
 
+def build_paper_workspace(source: str, paper_id: str) -> dict[str, Any]:
+    normalized_source = normalize_paper_source(source)
+    normalized_paper_id = normalize_paper_id(
+        canonicalize_arxiv_identifier(paper_id) if normalized_source == "arxiv" else paper_id
+    )
+    conversations = CONVERSATIONS.list_metadata(
+        paper_source=normalized_source,
+        paper_id=normalized_paper_id,
+    )
+    record = PAPERS.get_or_create(normalized_source, normalized_paper_id)
+
+    updated = False
+    if not record.get("canonical_url") and normalized_source == "arxiv":
+        record["canonical_url"] = f"https://arxiv.org/abs/{normalized_paper_id}"
+        updated = True
+    if conversations:
+        observed_versions = normalize_paper_versions(record.get("observed_versions"))
+        observed_versions = normalize_paper_versions(
+            [*observed_versions, *collect_paper_versions_from_conversations(conversations)]
+        )
+        if observed_versions != normalize_paper_versions(record.get("observed_versions")):
+            record["observed_versions"] = observed_versions
+            updated = True
+        latest_paper = conversations[0].get("paper")
+        if isinstance(latest_paper, dict):
+            latest_url = str(latest_paper.get("canonical_url", "") or "")
+            latest_title = str(latest_paper.get("title", "") or "")
+            if latest_url and record.get("canonical_url") != latest_url:
+                record["canonical_url"] = latest_url
+                updated = True
+            if latest_title and not record.get("title"):
+                record["title"] = latest_title
+                updated = True
+    if updated:
+        record = PAPERS.save(record)
+    return {"paper": record, "conversations": conversations}
+
+
+def handle_paper_lookup(params: dict[str, list[str]]) -> dict[str, Any]:
+    source = (params.get("source") or [""])[0]
+    paper_id = (params.get("paper_id") or [""])[0]
+    return build_paper_workspace(source, paper_id)
+
+
+def handle_paper_summary_request(data: dict[str, Any]) -> dict[str, Any]:
+    candidate = data.get("paper") if isinstance(data.get("paper"), dict) else data
+    paper_context = normalize_paper_context(candidate)
+    if paper_context is None:
+        raise ValueError("paper is required.")
+    PAPERS.mark_summary_requested(
+        paper_context["source"],
+        paper_context["paper_id"],
+        canonical_url=paper_context.get("canonical_url", ""),
+        title=paper_context.get("title", ""),
+        conversation_id=str(data.get("conversation_id", data.get("conversationId")) or "").strip(),
+        paper_version=paper_context.get("paper_version", ""),
+    )
+    return build_paper_workspace(paper_context["source"], paper_context["paper_id"])
+
+
+def build_conversation_highlight(conversation: dict[str, Any]) -> str:
+    if not isinstance(conversation, dict):
+        return ""
+    messages = conversation.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return ""
+
+    title = compact_whitespace(conversation.get("title", ""), 120)
+    if title == "New Chat":
+        title = ""
+
+    assistant_preview = ""
+    user_preview = ""
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "") or "").strip()
+        content = compact_text_block(message.get("content", ""), 280)
+        if not content:
+            continue
+        if role == "assistant" and not assistant_preview:
+            assistant_preview = content
+        elif role == "user" and not user_preview:
+            user_preview = content
+        if assistant_preview and user_preview:
+            break
+
+    preview = assistant_preview or user_preview
+    if title and preview:
+        combined = f"{title}: {preview}"
+        if combined.startswith(f"{title}: {title}"):
+            return truncate_text(title, 400)
+        return truncate_text(combined, 400)
+    return truncate_text(title or preview, 400)
+
+
+def collect_paper_versions_from_conversations(conversations: list[dict[str, Any]]) -> list[str]:
+    versions: list[str] = []
+    for conversation in conversations:
+        if not isinstance(conversation, dict):
+            continue
+        paper = conversation.get("paper")
+        if not isinstance(paper, dict):
+            continue
+        version = normalize_paper_version(paper.get("paper_version", ""))
+        if version:
+            versions.append(version)
+    return normalize_paper_versions(versions)
+
+
+def handle_paper_highlights_capture(data: dict[str, Any]) -> dict[str, Any]:
+    candidate = data.get("paper") if isinstance(data.get("paper"), dict) else data
+    paper_context = normalize_paper_context(candidate)
+    if paper_context is None:
+        raise ValueError("paper is required.")
+
+    conversation_id = str(data.get("conversation_id", data.get("conversationId")) or "").strip()
+    if not conversation_id:
+        raise ValueError("conversation_id is required.")
+
+    conversation = CONVERSATIONS.get(conversation_id)
+    conversation_paper = conversation_paper_context(conversation)
+    if (
+        conversation_paper is not None
+        and (
+            conversation_paper["source"] != paper_context["source"]
+            or conversation_paper["paper_id"] != paper_context["paper_id"]
+        )
+    ):
+        raise ValueError("conversation does not match the requested paper.")
+
+    record = PAPERS.get_or_create(
+        paper_context["source"],
+        paper_context["paper_id"],
+        canonical_url=paper_context.get("canonical_url", ""),
+        title=paper_context.get("title", ""),
+    )
+    codex = conversation.get("codex", {})
+    captured_highlights = normalize_highlight_capture_list(codex.get("highlight_captures"))
+    paper_highlights = normalize_paper_highlights(captured_highlights)
+    for highlight in reversed(paper_highlights):
+        record = PAPERS.add_highlight(
+            paper_context["source"],
+            paper_context["paper_id"],
+            canonical_url=paper_context.get("canonical_url", ""),
+            title=paper_context.get("title", ""),
+            highlight=highlight,
+        )
+    workspace = build_paper_workspace(paper_context["source"], paper_context["paper_id"])
+    return {
+        **workspace,
+        "paper": record if paper_highlights else workspace["paper"],
+        "saved": bool(paper_highlights),
+        "highlight": paper_highlights[0] if paper_highlights else None,
+        "highlights": paper_highlights,
+    }
+
+
+def handle_paper_summary_generate(data: dict[str, Any]) -> dict[str, Any]:
+    candidate = data.get("paper") if isinstance(data.get("paper"), dict) else data
+    paper_context = normalize_paper_context(candidate)
+    if paper_context is None:
+        raise ValueError("paper is required.")
+
+    page_context = normalize_page_context(data.get("page_context", data.get("pageContext")))
+    if page_context is None:
+        raise ValueError("page_context is required.")
+
+    derived_page_paper = None
+    try:
+        derived_page_paper = normalize_paper_context(
+            {
+                "url": page_context.get("url", ""),
+                "title": page_context.get("title", ""),
+            }
+        )
+    except ValueError:
+        derived_page_paper = None
+    if (
+        derived_page_paper is not None
+        and (
+            derived_page_paper["source"] != paper_context["source"]
+            or derived_page_paper["paper_id"] != paper_context["paper_id"]
+        )
+    ):
+        raise ValueError("page_context does not match the requested paper.")
+    if derived_page_paper is not None:
+        paper_context = merge_paper_contexts(paper_context, derived_page_paper)
+
+    session_id = str(data.get("session_id", data.get("sessionId")) or "").strip()
+    if not session_id:
+        raise ValueError("session_id is required.")
+
+    prompt = load_paper_summary_prompt()
+    run_result = CODEX_RUNS.start_run(
+        {
+            "session_id": session_id,
+            "backend": data.get("backend", "codex"),
+            "prompt": prompt,
+            "confirmed": True,
+            "include_page_context": True,
+            "page_context": page_context,
+            "paper_context": paper_context,
+            "paper_summary_target": paper_context,
+            "store_user_message": False,
+            "append_assistant_message": False,
+        }
+    )
+    PAPERS.mark_summary_requested(
+        paper_context["source"],
+        paper_context["paper_id"],
+        canonical_url=paper_context.get("canonical_url", ""),
+        title=paper_context.get("title", ""),
+        conversation_id=session_id,
+        paper_version=paper_context.get("paper_version", ""),
+    )
+    workspace = build_paper_workspace(paper_context["source"], paper_context["paper_id"])
+    return {**run_result, **workspace}
+
+
 class BrokerHandler(BaseHTTPRequestHandler):
     server_version = "LocalBroker/0.1.0"
 
@@ -6235,6 +7220,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
         if path == "/browser/config":
             self._send_json(HTTPStatus.OK, handle_browser_config_get())
+            return
+        if path == "/papers/lookup":
+            self._send_json(HTTPStatus.OK, handle_paper_lookup(self._query_params()))
             return
         run_id, run_action = self._run_parts(path)
         if run_id and run_action == "events":
@@ -6308,6 +7296,12 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 result = handle_browser_tool_call(data)
             elif path == "/browser/config":
                 result = handle_browser_config_post(data)
+            elif path == "/papers/summary_request":
+                result = handle_paper_summary_request(data)
+            elif path == "/papers/highlights_capture":
+                result = handle_paper_highlights_capture(data)
+            elif path == "/papers/summary_generate":
+                result = handle_paper_summary_generate(data)
             else:
                 job_cancel_id = self._job_cancel_id_from_path(path)
                 if job_cancel_id:
@@ -6422,7 +7416,7 @@ def main() -> int:
     server = ThreadingHTTPServer((CONFIG.host, CONFIG.port), BrokerHandler)
     print(f"local broker listening on http://{CONFIG.host}:{CONFIG.port}")
     print(f"llama endpoint: {CONFIG.llama_url}")
-    print(f"mlx endpoint: {CONFIG.mlx_url or "(unset MLX_URL)"}")
+    print(f"mlx endpoint: {CONFIG.mlx_url or '(unset MLX_URL)'}")
     print(f"codex backend: {codex_backend_mode()}")
     print(f"conversation store: {CONFIG.data_dir / 'conversations'}")
     try:

@@ -60,7 +60,17 @@ Chrome Side Panel (UI + user actions)
 4. Extension executes Chrome APIs on allowlisted hosts only.
 5. Results return through broker and into the run stream.
 
-### 4) Async jobs flow
+### 4) Paper workspace flow
+
+1. Opening an arXiv page or restoring a paper-linked chat resolves a paper context in the side panel.
+2. arXiv paper state is grouped by versionless paper id, while optional version metadata (`v1`, `v2`, etc.) is preserved for badges, history labels, highlights, and summaries.
+3. The side panel loads per-paper state through `assistant.paper.get` and broker paper routes. The `This Paper` history section is filtered by base paper id and auto-restore prefers an exact version match before falling back to the newest same-paper session.
+4. The Summary tab uses a dedicated hidden run to generate and persist a paper-summary artifact in `broker/.data/papers/*.json`, including summary provenance metadata such as the paper version used for the last saved summary.
+5. `Explain Selection` chats stay in the normal chat transcript, but completed explain-selection runs are auto-saved immediately into the paper Highlights artifact. The Highlights tab briefly glows to indicate a successful save.
+6. `POST /papers/highlights_capture` remains as an idempotent backfill path for older conversations, but normal explain-selection saving no longer depends on starting a new chat.
+7. Paper summary and paper highlights are separate artifacts from the chat transcript, but they are loaded together when the same paper comes back into focus.
+
+### 5) Async jobs flow
 
 - Experiments and MLX training jobs are async: `POST /experiments/jobs`, `POST /mlx/training/jobs`, etc.
 - Jobs appear under `/jobs` and can be cancelled by `POST /jobs/<job_id>/cancel`.
@@ -86,6 +96,10 @@ Chrome Side Panel (UI + user actions)
 - `GET /conversations`
 - `GET /conversations/<conversation_id>`
 - `DELETE /conversations/<conversation_id>`
+- `GET /papers?source=<source>&paper_id=<paper_id>`
+- `POST /papers/summary_request`
+- `POST /papers/highlights_capture`
+- `POST /papers/summary_generate`
 - `POST /experiments/jobs`
 - `GET /experiments/jobs/<job_id>`
 - `GET /experiments`
@@ -130,7 +144,10 @@ Chrome Side Panel (UI + user actions)
 ### MLX local data
 
 - Conversations (all backends): `broker/.data/conversations/*.json`
+  - Conversation `codex` state may include paper-session metadata such as `paper_version`, `paper_version_url`, `paper_chat_kind`, `paper_history_label`, and `paper_focus_text`.
 - Run state: `broker/.data/codex_runs/*.json`
+- Paper workspace state: `broker/.data/papers/*.json`
+  - Paper records may include `observed_versions`, `last_summary_version`, `summary`, and saved highlight artifacts.
 - MLX generation settings: `broker/.data/mlx_config.json`
 - MLX adapter registry: `broker/.data/mlx_adapters.json`
 - Browser policy config: `broker/.data/browser_config.json`
@@ -147,7 +164,7 @@ Chrome Side Panel (UI + user actions)
 
 - `IMPROVEMENTS.md` notes reflected retired paper endpoints and are now folded in here.
 - The legacy paper route family (`/papers/inspect`, `/papers/jobs`) is not present in the broker now.
-- The active first-party content-reading path is read-assistant capture (`assistant.read.context.capture`) + prompt context on `/runs`.
+- The active first-party content-reading path is read-assistant capture (`assistant.read.context.capture`) plus paper workspace state and prompt context on `/runs`.
 
 ## Security model
 

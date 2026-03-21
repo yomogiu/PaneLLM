@@ -93,6 +93,18 @@ async function handleMessage(message) {
   if (message.type === "assistant.history.delete") {
     return await deleteConversation(message);
   }
+  if (message.type === "assistant.paper.get") {
+    return await getPaperWorkspace(message);
+  }
+  if (message.type === "assistant.paper.summary_request") {
+    return await requestPaperSummary(message);
+  }
+  if (message.type === "assistant.paper.highlights_capture") {
+    return await capturePaperHighlights(message);
+  }
+  if (message.type === "assistant.paper.summary_generate") {
+    return await generatePaperSummary(message);
+  }
   if (message.type === "assistant.models.get") {
     return await getModels();
   }
@@ -211,6 +223,7 @@ async function handleMessage(message) {
       active_tab: {
         host,
         url: String(activeTab.url),
+        title: String(activeTab.title || ""),
         allowed: isHostAllowed(activeTab.url, snapshot.effective_allowed_hosts)
       }
     };
@@ -252,6 +265,7 @@ async function captureReadAssistantContext(_message) {
   const activeInfo = {
     host,
     url: String(activeTab.url),
+    title: String(activeTab.title || ""),
     allowed: isHostAllowed(activeTab.url, snapshot.effective_allowed_hosts)
   };
   if (!activeInfo.allowed) {
@@ -301,6 +315,18 @@ async function buildAssistantBrokerPayload(message) {
     message.reasoningBudget !== undefined
       ? message.reasoningBudget
       : message.reasoning_budget;
+  const paperContext =
+    message.paperContext && typeof message.paperContext === "object"
+      ? message.paperContext
+      : message.paper_context && typeof message.paper_context === "object"
+        ? message.paper_context
+        : null;
+  const highlightContext =
+    message.highlightContext && typeof message.highlightContext === "object"
+      ? message.highlightContext
+      : message.highlight_context && typeof message.highlight_context === "object"
+        ? message.highlight_context
+        : null;
 
   const payload = {
     session_id: message.sessionId,
@@ -315,6 +341,12 @@ async function buildAssistantBrokerPayload(message) {
     confirmed: message.confirmed === true,
     risk_signals: riskSignals
   };
+  if (paperContext) {
+    payload.paper_context = paperContext;
+  }
+  if (highlightContext) {
+    payload.highlight_context = highlightContext;
+  }
   if (chatTemplateKwargs) {
     payload.chat_template_kwargs = chatTemplateKwargs;
   }
@@ -387,6 +419,87 @@ async function deleteConversation(message) {
   }
   const path = `/conversations/${encodeURIComponent(message.sessionId)}`;
   return await brokerRequest("DELETE", path);
+}
+
+async function getPaperWorkspace(message) {
+  const source = String(message?.source || "").trim();
+  const paperId = String(message?.paperId || message?.paper_id || "").trim();
+  if (!source) {
+    throw new Error("source is required.");
+  }
+  if (!paperId) {
+    throw new Error("paperId is required.");
+  }
+  const params = new URLSearchParams({
+    source,
+    paper_id: paperId
+  });
+  return await brokerRequest("GET", `/papers/lookup?${params.toString()}`);
+}
+
+async function requestPaperSummary(message) {
+  const paper = message?.paper && typeof message.paper === "object" ? message.paper : null;
+  if (!paper) {
+    throw new Error("paper is required.");
+  }
+  return await brokerRequest("POST", "/papers/summary_request", {
+    paper,
+    conversation_id:
+      typeof message.conversationId === "string"
+        ? message.conversationId
+        : typeof message.conversation_id === "string"
+          ? message.conversation_id
+          : ""
+  });
+}
+
+async function capturePaperHighlights(message) {
+  const paper = message?.paper && typeof message.paper === "object" ? message.paper : null;
+  if (!paper) {
+    throw new Error("paper is required.");
+  }
+  return await brokerRequest("POST", "/papers/highlights_capture", {
+    paper,
+    conversation_id:
+      typeof message.conversationId === "string"
+        ? message.conversationId
+        : typeof message.conversation_id === "string"
+          ? message.conversation_id
+          : ""
+  });
+}
+
+async function generatePaperSummary(message) {
+  const paper = message?.paper && typeof message.paper === "object" ? message.paper : null;
+  if (!paper) {
+    throw new Error("paper is required.");
+  }
+  const sessionId =
+    typeof message?.sessionId === "string"
+      ? message.sessionId
+      : typeof message?.session_id === "string"
+        ? message.session_id
+        : "";
+  if (!sessionId) {
+    throw new Error("sessionId is required.");
+  }
+  const capture = await captureReadAssistantContext(message);
+  if (capture?.ok === false) {
+    throw new Error(
+      typeof capture.error === "string"
+        ? capture.error
+        : capture.error?.message || "Unable to capture the current page context."
+    );
+  }
+  if (!capture?.context || typeof capture.context !== "object") {
+    throw new Error("Page context is unavailable for the active tab.");
+  }
+  return await brokerRequest("POST", "/papers/summary_generate", {
+    paper,
+    session_id: sessionId,
+    backend: typeof message?.backend === "string" ? message.backend : "codex",
+    page_context: capture.context
+  });
 }
 
 async function getModels() {
@@ -576,11 +689,13 @@ async function brokerRequest(method, path, body = null, options = {}) {
       throw error;
     }
     const detail = String(error?.message || error || "unknown fetch failure");
-    console.error("[secure-panel] broker request failed to reach local broker:", {
-      method,
-      path,
-      detail
-    });
+    if (!options.suppressConnectionError) {
+      console.error("[secure-panel] broker request failed to reach local broker:", {
+        method,
+        path,
+        detail
+      });
+    }
     const message =
       `Could not reach the local broker at ${BROKER_URL}${path}. `
       + "Make sure broker/local_broker.py is running and the extension can access localhost.";
@@ -1548,6 +1663,7 @@ async function startBrokerCommandLoop() {
     return;
   }
   relayLoopStarted = true;
+  const relayRequestOptions = { suppressConnectionError: true };
 
   while (true) {
     try {
@@ -1555,11 +1671,13 @@ async function startBrokerCommandLoop() {
         client_id: relayClientId,
         version: RELAY_COMMAND_LOOP_VERSION,
         platform: "chrome-sidepanel"
-      });
+      }, relayRequestOptions);
 
       const next = await brokerRequest(
         "GET",
-        `/extension/next?client_id=${encodeURIComponent(relayClientId)}&timeout_ms=${RELAY_POLL_TIMEOUT_MS}`
+        `/extension/next?client_id=${encodeURIComponent(relayClientId)}&timeout_ms=${RELAY_POLL_TIMEOUT_MS}`,
+        null,
+        relayRequestOptions
       );
 
       if (next?.command) {
@@ -1568,7 +1686,9 @@ async function startBrokerCommandLoop() {
 
       relayBackoffMs = RELAY_INITIAL_BACKOFF_MS;
     } catch (error) {
-      console.warn("[secure-panel] broker command loop error:", String(error?.message || error));
+      if (error?.code !== "broker_unreachable") {
+        console.warn("[secure-panel] broker command loop error:", String(error?.message || error));
+      }
       await delay(relayBackoffMs);
       relayBackoffMs = Math.min(relayBackoffMs * 2, RELAY_MAX_BACKOFF_MS);
     }
@@ -1600,6 +1720,8 @@ async function executeAndReportBrokerCommand(command) {
     success,
     data,
     error
+  }, {
+    suppressConnectionError: true
   });
 }
 

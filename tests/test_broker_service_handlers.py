@@ -45,6 +45,30 @@ def _load_browser_use_server():
 
 
 class ReadAssistantBrokerTest(unittest.TestCase):
+    def test_discover_new_codex_session_id_requires_a_fresh_index_entry(self) -> None:
+        previous = {"id": "session-old", "updated_at": "2026-03-21T00:00:00Z"}
+        with patch.object(local_broker, "read_codex_session_index", return_value=[previous]):
+            self.assertEqual("", local_broker.discover_new_codex_session_id(previous))
+
+        fresh = {"id": "session-new", "updated_at": "2026-03-21T00:00:01Z"}
+        with patch.object(local_broker, "read_codex_session_index", return_value=[previous, fresh]):
+            self.assertEqual("session-new", local_broker.discover_new_codex_session_id(previous))
+
+    def test_extract_arxiv_paper_normalizes_abs_pdf_and_versioned_urls(self) -> None:
+        cases = [
+            "https://arxiv.org/abs/1706.03762v7",
+            "https://arxiv.org/pdf/1706.03762v7.pdf",
+            "https://www.arxiv.org/html/1706.03762v7",
+        ]
+
+        for url in cases:
+            with self.subTest(url=url):
+                paper = local_broker.extract_arxiv_paper(url, "Attention Is All You Need")
+                self.assertIsNotNone(paper)
+                self.assertEqual("arxiv", paper["source"])
+                self.assertEqual("1706.03762", paper["paper_id"])
+                self.assertEqual("https://arxiv.org/abs/1706.03762", paper["canonical_url"])
+
     def test_normalize_page_context_accepts_rich_read_context(self) -> None:
         normalized = local_broker.normalize_page_context(
             {
@@ -94,6 +118,314 @@ class ReadAssistantBrokerTest(unittest.TestCase):
         self.assertIn("browser.highlight", local_broker.CODEX_AUTO_APPROVE_TOOLS)
         tool_names = [tool["function"]["name"] for tool in local_broker.LLAMA_BROWSER_TOOLS]
         self.assertIn("browser.highlight", tool_names)
+
+    def test_conversation_paper_context_keeps_saved_paper_when_page_payload_mismatches(self) -> None:
+        paper = local_broker.conversation_paper_context(
+            {
+                "codex": {
+                    "paper_source": "arxiv",
+                    "paper_id": "2601.20245",
+                    "paper_url": "https://arxiv.org/abs/2601.20245",
+                    "paper_title": "How AI Impacts Skill Formation",
+                    "page_context_payload": {
+                        "url": "https://arxiv.org/html/2507.20534#S2.SS3",
+                        "title": "Kimi K2: Open Agentic Intelligence",
+                    },
+                }
+            }
+        )
+        self.assertIsNotNone(paper)
+        self.assertEqual("arxiv", paper["source"])
+        self.assertEqual("2601.20245", paper["paper_id"])
+        self.assertEqual("How AI Impacts Skill Formation", paper["title"])
+
+    def test_paper_workspace_links_related_conversations_and_summary_requests(self) -> None:
+        conversation_id = "paper_workspace_test"
+        local_broker.CONVERSATIONS.append_message(conversation_id, "user", "Summarize the transformer paper.")
+        local_broker.CONVERSATIONS.update_codex_state(
+            conversation_id,
+            {
+                "paper_source": "arxiv",
+                "paper_id": "1706.03762",
+                "paper_url": "https://arxiv.org/abs/1706.03762",
+                "paper_title": "Attention Is All You Need",
+            },
+        )
+
+        workspace = local_broker.build_paper_workspace("arxiv", "1706.03762")
+        conversation_ids = [item["id"] for item in workspace["conversations"]]
+        self.assertIn(conversation_id, conversation_ids)
+        self.assertEqual("Attention Is All You Need", workspace["paper"]["title"])
+
+        requested = local_broker.handle_paper_summary_request(
+            {
+                "paper": {
+                    "source": "arxiv",
+                    "paper_id": "1706.03762",
+                    "canonical_url": "https://arxiv.org/abs/1706.03762",
+                    "title": "Attention Is All You Need",
+                },
+                "conversation_id": conversation_id,
+            }
+        )
+        self.assertEqual("requested", requested["paper"]["summary_status"])
+        self.assertEqual(conversation_id, requested["paper"]["last_summary_conversation_id"])
+
+    def test_explain_selection_run_persists_highlight_capture_on_conversation(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="paper-highlight-run-", dir=IMPORT_DATA_DIR))
+        manager = local_broker.CodexRunManager(root)
+        conversations = local_broker.ConversationStore(root)
+        config = replace(
+            local_broker.CONFIG,
+            data_dir=root,
+            openai_api_key="test-key",
+            codex_cli_path=None,
+            codex_cli_logged_in=False,
+        )
+
+        with patch.object(local_broker, "CONFIG", config):
+            with patch.object(local_broker, "CONVERSATIONS", conversations):
+                with patch.object(local_broker.threading, "Thread", return_value=_FakeThread()):
+                    result = manager.start_run(
+                        {
+                            "session_id": "paper_highlight_run",
+                            "backend": "codex",
+                            "prompt": "Explain why this paragraph matters.",
+                            "confirmed": True,
+                            "include_page_context": True,
+                            "page_context": {
+                                "title": "Kimi K2: Open Agentic Intelligence",
+                                "url": "https://arxiv.org/html/2507.20534#S2.SS3",
+                                "selection": "Kimi K2 uses sparse expert routing.",
+                                "text_excerpt": "Kimi K2 uses sparse expert routing to scale compute and capacity.",
+                            },
+                            "paper_context": {
+                                "source": "arxiv",
+                                "paper_id": "2507.20534",
+                                "canonical_url": "https://arxiv.org/abs/2507.20534",
+                                "title": "Kimi K2: Open Agentic Intelligence",
+                            },
+                            "highlight_context": {
+                                "kind": "explain_selection",
+                                "selection": "Kimi K2 uses sparse expert routing.",
+                                "prompt": "Explain why this paragraph matters.",
+                            },
+                        }
+                    )
+
+                    run = manager._runs[result["run_id"]]
+                    with manager._condition:
+                        manager._finish_run_locked(
+                            run,
+                            "completed",
+                            assistant_text="It explains how the model scales capacity without activating the full network on every token.",
+                            emit_type="completed",
+                            emit_message="Run completed.",
+                        )
+
+        conversation = conversations.get("paper_highlight_run")
+        highlight_captures = conversation["codex"]["highlight_captures"]
+        self.assertEqual(1, len(highlight_captures))
+        self.assertEqual("explain_selection", highlight_captures[0]["kind"])
+        self.assertEqual(
+            "Kimi K2 uses sparse expert routing.",
+            highlight_captures[0]["selection"],
+        )
+        self.assertEqual(
+            "Explain why this paragraph matters.",
+            highlight_captures[0]["prompt"],
+        )
+        self.assertIn(
+            "scale",
+            highlight_captures[0]["response"],
+        )
+
+    def test_paper_highlights_capture_saves_explain_selection_pairs_to_paper_record(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="paper-highlights-capture-", dir=IMPORT_DATA_DIR))
+        conversations = local_broker.ConversationStore(root)
+        papers = local_broker.PaperStateStore(root)
+
+        conversation_id = "paper_highlight_test"
+        conversations.append_message(conversation_id, "user", "Explain the selected passage.")
+        conversations.append_message(
+            conversation_id,
+            "assistant",
+            "The authors are emphasizing the sparse expert routing mechanism and why it matters for scaling.",
+        )
+        conversations.update_codex_state(
+            conversation_id,
+            {
+                "paper_source": "arxiv",
+                "paper_id": "2507.20534",
+                "paper_url": "https://arxiv.org/abs/2507.20534",
+                "paper_title": "Kimi K2: Open Agentic Intelligence",
+                "highlight_captures": [
+                    {
+                        "kind": "explain_selection",
+                        "selection": "Kimi K2 uses sparse expert routing to scale capacity.",
+                        "prompt": "Explain the selected passage.",
+                        "response": "The authors are emphasizing the sparse expert routing mechanism and why it matters for scaling.",
+                    }
+                ],
+            },
+        )
+
+        with patch.object(local_broker, "CONVERSATIONS", conversations):
+            with patch.object(local_broker, "PAPERS", papers):
+                result = local_broker.handle_paper_highlights_capture(
+                    {
+                        "paper": {
+                            "source": "arxiv",
+                            "paper_id": "2507.20534",
+                            "canonical_url": "https://arxiv.org/abs/2507.20534",
+                            "title": "Kimi K2: Open Agentic Intelligence",
+                        },
+                        "conversation_id": conversation_id,
+                    }
+                )
+
+        self.assertTrue(result["saved"])
+        self.assertEqual("explain_selection", result["highlight"]["kind"])
+        self.assertEqual(
+            "Kimi K2 uses sparse expert routing to scale capacity.",
+            result["paper"]["highlights"][0]["selection"],
+        )
+        self.assertIn(
+            "sparse expert routing mechanism",
+            result["paper"]["highlights"][0]["response"],
+        )
+
+    def test_paper_summary_generate_uses_hidden_run_and_persists_summary(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="paper-summary-generate-", dir=IMPORT_DATA_DIR))
+        manager = local_broker.CodexRunManager(root)
+        conversations = local_broker.ConversationStore(root)
+        papers = local_broker.PaperStateStore(root)
+        config = replace(
+            local_broker.CONFIG,
+            data_dir=root,
+            openai_api_key="test-key",
+            codex_cli_path=None,
+            codex_cli_logged_in=False,
+        )
+
+        with patch.object(local_broker, "CONFIG", config):
+            with patch.object(local_broker, "CODEX_RUNS", manager):
+                with patch.object(local_broker, "CONVERSATIONS", conversations):
+                    with patch.object(local_broker, "PAPERS", papers):
+                        with patch.object(local_broker.threading, "Thread", return_value=_FakeThread()):
+                            result = local_broker.handle_paper_summary_generate(
+                                {
+                                    "session_id": "paper_summary_hidden",
+                                    "backend": "codex",
+                                    "paper": {
+                                        "source": "arxiv",
+                                        "paper_id": "1706.03762",
+                                        "canonical_url": "https://arxiv.org/abs/1706.03762",
+                                        "title": "Attention Is All You Need",
+                                    },
+                                    "page_context": {
+                                        "title": "Attention Is All You Need",
+                                        "url": "https://arxiv.org/html/1706.03762v7",
+                                        "text_excerpt": "Transformers replace recurrence with attention.",
+                                    },
+                                }
+                            )
+
+                        self.assertTrue(result["run_id"].startswith("run_"))
+                        self.assertEqual("requested", result["paper"]["summary_status"])
+                        run = manager._runs[result["run_id"]]
+                        self.assertFalse(run["_append_assistant_message"])
+                        self.assertFalse(run["_persist_backend_session"])
+                        self.assertEqual("1706.03762", run["_paper_summary_target"]["paper_id"])
+
+                        conversation = conversations.get_or_create("paper_summary_hidden")
+                        self.assertEqual([], conversation["messages"])
+                        self.assertEqual([], conversations.list_metadata())
+
+                        with manager._condition:
+                            manager._finish_run_locked(
+                                run,
+                                "completed",
+                                assistant_text="Short paper summary",
+                                emit_type="completed",
+                                emit_message="Run completed.",
+                            )
+
+                        updated_workspace = local_broker.build_paper_workspace("arxiv", "1706.03762")
+                        self.assertEqual("ready", updated_workspace["paper"]["summary_status"])
+                        self.assertEqual("Short paper summary", updated_workspace["paper"]["summary"])
+                        self.assertEqual("paper_summary_hidden", updated_workspace["paper"]["last_summary_conversation_id"])
+
+    def test_hidden_summary_run_does_not_resume_or_persist_cli_session_state(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="paper-summary-cli-isolation-", dir=IMPORT_DATA_DIR))
+        manager = local_broker.CodexRunManager(root)
+        conversations = local_broker.ConversationStore(root)
+        config = replace(
+            local_broker.CONFIG,
+            data_dir=root,
+            openai_api_key=None,
+            codex_cli_path="/usr/bin/codex",
+            codex_cli_logged_in=True,
+        )
+
+        session_id = "paper_summary_hidden_cli"
+        conversations.update_codex_state(
+            session_id,
+            {
+                "cli_session_id": "stale-cli-session",
+                "last_response_message_count": 7,
+                "last_page_context_fingerprint": "existing-fingerprint",
+            },
+        )
+
+        with patch.object(local_broker, "CONFIG", config):
+            with patch.object(local_broker, "CONVERSATIONS", conversations):
+                with patch.object(local_broker.threading, "Thread", return_value=_FakeThread()):
+                    result = manager.start_run(
+                        {
+                            "session_id": session_id,
+                            "backend": "codex",
+                            "prompt": "Summarize this paper.",
+                            "confirmed": True,
+                            "include_page_context": True,
+                            "page_context": {
+                                "title": "Attention Is All You Need",
+                                "url": "https://arxiv.org/html/1706.03762v7",
+                                "text_excerpt": "Transformers replace recurrence with attention.",
+                            },
+                            "paper_context": {
+                                "source": "arxiv",
+                                "paper_id": "1706.03762",
+                                "canonical_url": "https://arxiv.org/abs/1706.03762",
+                                "title": "Attention Is All You Need",
+                            },
+                            "store_user_message": False,
+                            "append_assistant_message": False,
+                        }
+                    )
+
+                    run = manager._runs[result["run_id"]]
+                    self.assertFalse(run["_persist_backend_session"])
+
+                    captured: dict[str, str] = {}
+
+                    def _fake_call_codex_cli(prompt, messages, cli_session_id="", **kwargs):
+                        captured["cli_session_id"] = cli_session_id
+                        captured["prompt"] = prompt
+                        captured["message_count"] = str(len(messages))
+                        return "Hidden summary", "new-cli-session"
+
+                    with patch.object(local_broker, "call_codex_cli", side_effect=_fake_call_codex_cli):
+                        answer, reasoning = manager._run_codex_cli_loop(result["run_id"])
+
+                    self.assertEqual("Hidden summary", answer)
+                    self.assertEqual("", reasoning)
+                    self.assertEqual("", captured["cli_session_id"])
+
+                    conversation = conversations.get(session_id)
+                    self.assertEqual("stale-cli-session", conversation["codex"]["cli_session_id"])
+                    self.assertEqual(7, conversation["codex"]["last_response_message_count"])
+                    self.assertEqual("existing-fingerprint", conversation["codex"]["last_page_context_fingerprint"])
 
 
 class BrokerContractTest(unittest.TestCase):
@@ -184,13 +516,15 @@ class BrokerContractTest(unittest.TestCase):
                 with patch.object(local_broker, "CONFIG", config):
                     with patch.object(local_broker, "CODEX_RUNS", manager):
                         with patch.object(local_broker.threading, "Thread", return_value=_FakeThread()):
-                            result = local_broker.handle_run_start(
-                                {
-                                    "session_id": f"run_backend_{backend}",
-                                    "backend": backend,
-                                    "prompt": "hello",
-                                }
-                            )
+                            with patch.object(local_broker, "ensure_llama_backend_available", return_value=None):
+                                with patch.object(local_broker, "ensure_mlx_backend_available", return_value=None):
+                                    result = local_broker.handle_run_start(
+                                        {
+                                            "session_id": f"run_backend_{backend}",
+                                            "backend": backend,
+                                            "prompt": "hello",
+                                        }
+                                    )
 
                 self.assertEqual(backend, result["backend"])
                 self.assertEqual("thinking", result["status"])

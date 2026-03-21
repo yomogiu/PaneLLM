@@ -306,15 +306,16 @@ class ThinkingParsingTest(unittest.TestCase):
         manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
 
         with patch.object(local_broker.threading, "Thread", return_value=_FakeThread()):
-            result = manager.start_run(
-                {
-                    "session_id": "run_llama_controls",
-                    "backend": "llama",
-                    "prompt": "hello",
-                    "chat_template_kwargs": "{\"enable_thinking\":false,\"clear_thinking\":false}",
-                    "reasoning_budget": -1,
-                }
-            )
+            with patch.object(local_broker, "ensure_llama_backend_available", return_value=None):
+                result = manager.start_run(
+                    {
+                        "session_id": "run_llama_controls",
+                        "backend": "llama",
+                        "prompt": "hello",
+                        "chat_template_kwargs": "{\"enable_thinking\":false,\"clear_thinking\":false}",
+                        "reasoning_budget": -1,
+                    }
+                )
 
         run = manager._runs[result["run_id"]]
         self.assertEqual(

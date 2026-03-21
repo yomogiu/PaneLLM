@@ -125,6 +125,59 @@
           <div id="history-list" class="history-list"></div>
         </aside>
 
+        <section class="paper-context-card" aria-live="polite">
+          <div class="paper-context-copy">
+            <p id="paper-context-kicker" class="paper-context-kicker">Paper Focus</p>
+            <h2 id="paper-context-title" class="paper-context-title">No active arXiv paper.</h2>
+            <p id="paper-context-meta" class="paper-context-meta">
+              Open an arXiv paper or load a paper-linked chat to bring back related sessions.
+            </p>
+          </div>
+          <span id="paper-context-badge" class="status-badge hidden">Paper</span>
+        </section>
+
+        <nav class="paper-tabs" role="tablist" aria-label="Paper tabs">
+          <button
+            id="paper-chat-tab-btn"
+            class="tab-btn active"
+            role="tab"
+            aria-selected="true"
+            aria-controls="messages"
+          >
+            Chat
+          </button>
+          <button
+            id="paper-highlights-tab-btn"
+            class="tab-btn"
+            role="tab"
+            aria-selected="false"
+            aria-controls="paper-highlights-view"
+          >
+            Highlights
+          </button>
+          <button
+            id="paper-summary-tab-btn"
+            class="tab-btn"
+            role="tab"
+            aria-selected="false"
+            aria-controls="paper-summary-view"
+          >
+            Summary
+          </button>
+        </nav>
+
+        <section id="paper-summary-view" class="paper-panel hidden" aria-hidden="true">
+          <div id="paper-summary-body" class="paper-panel-body">
+            <p class="empty-state">No paper summary yet.</p>
+          </div>
+        </section>
+
+        <section id="paper-highlights-view" class="paper-panel hidden" aria-hidden="true">
+          <div id="paper-highlights-body" class="paper-panel-body">
+            <p class="empty-state">No paper highlights yet.</p>
+          </div>
+        </section>
+
         <section id="messages" class="messages" aria-live="polite">
           <p id="empty-state" class="empty-state">Ask anything to start the chat.</p>
         </section>
