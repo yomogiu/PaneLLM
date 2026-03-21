@@ -5,6 +5,11 @@ const JOB_POLL_INTERVAL_MS = 4_000;
 const DETAIL_ITEM_LIMIT = 3;
 const EXPLAIN_SELECTION_DEFAULT_PROMPT = "Explain the selected passage in plain language.";
 const HIGHLIGHTS_TAB_GLOW_MS = 1_600;
+const FONT_SCALE_STORAGE_KEY = "ui_font_scale";
+const DEFAULT_FONT_SCALE = 1;
+const MIN_FONT_SCALE = 0.9;
+const MAX_FONT_SCALE = 1.3;
+const FONT_SCALE_STEP = 0.1;
 const GUIDE_PAGE_CONTEXT_FOLLOWUP = [
   "Treat the current page as the subject of the user's request.",
   "Interpret references like 'it', 'this', and 'the paper' as the current page unless the user explicitly says otherwise.",
@@ -53,6 +58,7 @@ const state = {
   composerGuidePageContext: false,
   activeMainTab: "chat",
   activePaperTab: "chat",
+  fontScale: DEFAULT_FONT_SCALE,
   currentConversationPaper: null,
   activeBrowserPaper: null,
   pendingPaperConversationRestoreKey: "",
@@ -83,6 +89,8 @@ const state = {
 const appEl = document.querySelector(".app");
 const brokerStatusEl = $("broker-status");
 const contextUsageEl = $("context-usage");
+const fontScaleDownBtn = $("font-scale-down-btn");
+const fontScaleUpBtn = $("font-scale-up-btn");
 const messagesEl = $("messages");
 const emptyStateEl = $("empty-state");
 const historyToggleBtn = $("history-toggle-btn");
@@ -5395,3 +5403,64 @@ function sendRuntimeMessage(message) {
     });
   });
 }
+
+function clampFontScale(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return DEFAULT_FONT_SCALE;
+  }
+  const rounded = Math.round(numeric * 100) / 100;
+  return Math.min(MAX_FONT_SCALE, Math.max(MIN_FONT_SCALE, rounded));
+}
+
+function applyFontScale(scale) {
+  const next = clampFontScale(scale);
+  state.fontScale = next;
+  document.documentElement.style.setProperty("--font-scale", String(next));
+  if (fontScaleDownBtn) {
+    fontScaleDownBtn.disabled = next <= MIN_FONT_SCALE;
+  }
+  if (fontScaleUpBtn) {
+    fontScaleUpBtn.disabled = next >= MAX_FONT_SCALE;
+  }
+}
+
+function persistFontScalePreference(scale) {
+  if (!chrome?.storage?.local) {
+    return;
+  }
+  chrome.storage.local.set({ [FONT_SCALE_STORAGE_KEY]: clampFontScale(scale) });
+}
+
+function restoreFontScalePreference() {
+  applyFontScale(DEFAULT_FONT_SCALE);
+  if (!chrome?.storage?.local) {
+    return;
+  }
+  chrome.storage.local.get([FONT_SCALE_STORAGE_KEY], (stored) => {
+    if (chrome.runtime?.lastError) {
+      return;
+    }
+    applyFontScale(stored?.[FONT_SCALE_STORAGE_KEY]);
+  });
+}
+
+function adjustFontScale(direction) {
+  const delta = direction > 0 ? FONT_SCALE_STEP : -FONT_SCALE_STEP;
+  const next = clampFontScale(state.fontScale + delta);
+  if (next === state.fontScale) {
+    return;
+  }
+  applyFontScale(next);
+  persistFontScalePreference(next);
+}
+
+fontScaleDownBtn?.addEventListener("click", () => {
+  adjustFontScale(-1);
+});
+
+fontScaleUpBtn?.addEventListener("click", () => {
+  adjustFontScale(1);
+});
+
+restoreFontScalePreference();
