@@ -750,6 +750,68 @@ body::before {
   background: rgba(7, 12, 24, 0.86);
 }
 
+.browser-profile-item {
+  border-color: rgba(157, 78, 211, 0.28);
+}
+
+.browser-profile-item.is-selected {
+  border-color: rgba(117, 240, 188, 0.52);
+  box-shadow: inset 0 0 0 1px rgba(117, 240, 188, 0.12);
+}
+
+.browser-profile-item.is-attached {
+  border-color: rgba(255, 209, 140, 0.58);
+  box-shadow: inset 0 0 0 1px rgba(255, 209, 140, 0.16);
+}
+
+.browser-profile-item.is-recording {
+  border-color: rgba(255, 95, 200, 0.65);
+  box-shadow: inset 0 0 0 1px rgba(255, 95, 200, 0.18);
+}
+
+.browser-profile-step-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.browser-profile-step-line {
+  font-size: calc(11px * var(--font-scale));
+  line-height: 1.45;
+  color: #d7e0fb;
+  word-break: break-word;
+}
+
+.browser-profile-step-line em {
+  color: #ffd8ab;
+  font-style: normal;
+}
+
+.browser-profile-step-line.error {
+  color: #ffd9e6;
+}
+
+.browser-profile-chip {
+  border-color: rgba(157, 78, 211, 0.45);
+  color: #e4bcff;
+}
+
+.browser-profile-chip.recording {
+  border-color: rgba(255, 95, 200, 0.65);
+  color: #ffd0eb;
+}
+
+.browser-profile-chip.attached {
+  border-color: rgba(255, 209, 140, 0.55);
+  color: #ffe0b4;
+}
+
+.browser-profile-chip.selected {
+  border-color: rgba(117, 240, 188, 0.5);
+  color: #dfffee;
+}
+
 .tools-item-meta {
   min-width: 0;
   display: flex;

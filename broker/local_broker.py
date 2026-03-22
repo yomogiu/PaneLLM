@@ -78,6 +78,18 @@ BROWSER_RUNTIME_CONTEXT_FIELD_LIMITS = {
     "url": 2000,
     "host": 255,
 }
+BROWSER_PROFILE_LIMITS = {
+    "profiles": 64,
+    "steps_per_profile": 24,
+    "id": 128,
+    "name": 160,
+    "title": 180,
+    "url": 2000,
+    "host": 255,
+    "attached_element": 220,
+    "summary": 320,
+    "timestamp": 64,
+}
 PAPER_SOURCE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 PAPER_ID_RE = re.compile(r"^[A-Za-z0-9._/-]{1,128}$")
 PAPER_STATUS_VALUES = {"idle", "requested", "ready", "error"}
@@ -1921,6 +1933,175 @@ class BrowserConfigManager:
                 self._agent_max_steps = self._normalize_agent_max_steps(raw_steps)
                 self._save_persisted_config_locked()
             return self._config_payload_locked()
+
+
+class BrowserProfileStore:
+    def __init__(self, data_dir: Path) -> None:
+        self._lock = threading.Lock()
+        self._state_path = data_dir / "browser_profiles" / "state.json"
+
+    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _load_json(self, path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _normalize_id(self, value: Any) -> str:
+        candidate = compact_whitespace(value, BROWSER_PROFILE_LIMITS["id"])
+        if not candidate or not CONVERSATION_ID_RE.match(candidate):
+            return ""
+        return candidate
+
+    def _normalize_timestamp(self, value: Any) -> str:
+        candidate = compact_whitespace(value, BROWSER_PROFILE_LIMITS["timestamp"])
+        return candidate or now_iso()
+
+    def _normalize_step(self, value: Any, profile_id: str) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        raw_url = value.get("url", value.get("page_url", value.get("pageUrl", "")))
+        url = str(raw_url or "").strip()[: BROWSER_PROFILE_LIMITS["url"]]
+        if not url:
+            return None
+        step_id = self._normalize_id(value.get("id", value.get("step_id", "")))
+        if not step_id:
+            return None
+        return {
+            "id": step_id,
+            "profile_id": profile_id,
+            "title": compact_whitespace(
+                value.get("title", value.get("page_title", value.get("pageTitle", ""))),
+                BROWSER_PROFILE_LIMITS["title"],
+            ),
+            "url": url,
+            "host": compact_whitespace(value.get("host", ""), BROWSER_PROFILE_LIMITS["host"]),
+            "attached_element": compact_whitespace(
+                value.get(
+                    "attached_element",
+                    value.get("attachedElement", value.get("element", value.get("selector", ""))),
+                ),
+                BROWSER_PROFILE_LIMITS["attached_element"],
+            ),
+            "summary": compact_whitespace(
+                value.get("summary", ""),
+                BROWSER_PROFILE_LIMITS["summary"],
+            ),
+            "created_at": self._normalize_timestamp(
+                value.get("created_at", value.get("createdAt", "")),
+            ),
+        }
+
+    def _normalize_profile(self, value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        profile_id = self._normalize_id(value.get("id", value.get("profile_id", value.get("profileId", ""))))
+        name = compact_whitespace(
+            value.get("name", value.get("label", value.get("title", ""))),
+            BROWSER_PROFILE_LIMITS["name"],
+        )
+        if not profile_id or not name:
+            return None
+        steps: list[dict[str, Any]] = []
+        seen_step_ids: set[str] = set()
+        raw_steps = value.get("steps")
+        if isinstance(raw_steps, list):
+            for raw_step in raw_steps[-BROWSER_PROFILE_LIMITS["steps_per_profile"] :]:
+                normalized_step = self._normalize_step(raw_step, profile_id)
+                if not normalized_step:
+                    continue
+                step_id = str(normalized_step.get("id", ""))
+                if step_id in seen_step_ids:
+                    continue
+                seen_step_ids.add(step_id)
+                steps.append(normalized_step)
+        return {
+            "id": profile_id,
+            "name": name,
+            "created_at": self._normalize_timestamp(
+                value.get("created_at", value.get("createdAt", "")),
+            ),
+            "updated_at": self._normalize_timestamp(
+                value.get("updated_at", value.get("updatedAt", "")),
+            ),
+            "steps": steps,
+        }
+
+    def _normalize_attachment(
+        self, value: Any, profiles: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        profile_id = self._normalize_id(value.get("profile_id", value.get("profileId", "")))
+        if not profile_id:
+            return None
+        profile = next((entry for entry in profiles if entry.get("id") == profile_id), None)
+        if not profile:
+            return None
+        step_id = self._normalize_id(value.get("step_id", value.get("stepId", "")))
+        if step_id and not any(str(step.get("id")) == step_id for step in profile.get("steps", [])):
+            step_id = ""
+        return {
+            "profile_id": profile_id,
+            "step_id": step_id,
+        }
+
+    def _normalize_state(self, value: Any) -> dict[str, Any]:
+        raw = value if isinstance(value, dict) else {}
+        raw_profiles = raw.get("profiles")
+        if not isinstance(raw_profiles, list):
+            raw_profiles = raw if isinstance(raw, list) else []
+
+        profiles: list[dict[str, Any]] = []
+        seen_profile_ids: set[str] = set()
+        for raw_profile in raw_profiles[: BROWSER_PROFILE_LIMITS["profiles"]]:
+            normalized_profile = self._normalize_profile(raw_profile)
+            if not normalized_profile:
+                continue
+            profile_id = str(normalized_profile.get("id", ""))
+            if profile_id in seen_profile_ids:
+                continue
+            seen_profile_ids.add(profile_id)
+            profiles.append(normalized_profile)
+
+        selected_profile_id = self._normalize_id(
+            raw.get("selected_profile_id", raw.get("selectedProfileId", "")),
+        )
+        if selected_profile_id and not any(
+            str(profile.get("id")) == selected_profile_id for profile in profiles
+        ):
+            selected_profile_id = ""
+        if not selected_profile_id and profiles:
+            selected_profile_id = str(profiles[0].get("id", ""))
+
+        attached_profile = self._normalize_attachment(
+            raw.get("attached_profile", raw.get("attachedProfile")),
+            profiles,
+        )
+
+        return {
+            "profiles": profiles,
+            "selected_profile_id": selected_profile_id,
+            "attached_profile": attached_profile,
+        }
+
+    def state(self) -> dict[str, Any]:
+        with self._lock:
+            return self._normalize_state(self._load_json(self._state_path))
+
+    def replace_state(self, updates: dict[str, Any]) -> dict[str, Any]:
+        payload = self._normalize_state(updates)
+        with self._lock:
+            self._write_json(self._state_path, payload)
+            return payload
 
 class AsyncJobStore:
     def __init__(self, data_dir: Path, kind: str) -> None:
@@ -4278,6 +4459,7 @@ CONFIG = load_config()
 CONVERSATIONS = ConversationStore(CONFIG.data_dir)
 PAPERS = PaperStateStore(CONFIG.data_dir)
 BROWSER_CONFIG = BrowserConfigManager(CONFIG.data_dir)
+BROWSER_PROFILES = BrowserProfileStore(CONFIG.data_dir)
 EXTENSION_RELAY = ExtensionCommandRelay(CONFIG.extension_client_stale_sec)
 BROWSER_AUTOMATION = BrowserAutomationManager(CONFIG.browser_default_domain_allowlist)
 CODEX_RUNS = CodexRunManager(CONFIG.data_dir)
@@ -6181,6 +6363,16 @@ def handle_browser_config_post(data: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "browser": payload}
 
 
+def handle_browser_profiles_get() -> dict[str, Any]:
+    return {"ok": True, "browser_profiles": BROWSER_PROFILES.state()}
+
+
+def handle_browser_profiles_post(data: dict[str, Any]) -> dict[str, Any]:
+    updates = dict(data) if isinstance(data, dict) else {}
+    payload = BROWSER_PROFILES.replace_state(updates)
+    return {"ok": True, "browser_profiles": payload}
+
+
 def handle_browser_tool_call(data: dict[str, Any]) -> dict[str, Any]:
     tool_name = str(data.get("name", "")).strip()
     args = data.get("arguments", {})
@@ -6814,6 +7006,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if path == "/browser/config":
             self._send_json(HTTPStatus.OK, handle_browser_config_get())
             return
+        if path == "/browser/profiles":
+            self._send_json(HTTPStatus.OK, handle_browser_profiles_get())
+            return
         if path == "/papers/lookup":
             self._send_json(HTTPStatus.OK, handle_paper_lookup(self._query_params()))
             return
@@ -6889,6 +7084,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 result = handle_browser_tool_call(data)
             elif path == "/browser/config":
                 result = handle_browser_config_post(data)
+            elif path == "/browser/profiles":
+                result = handle_browser_profiles_post(data)
             elif path == "/papers/summary_request":
                 result = handle_paper_summary_request(data)
             elif path == "/papers/highlights_capture":

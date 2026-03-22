@@ -45,6 +45,79 @@ def _load_browser_use_server():
 
 
 class ReadAssistantBrokerTest(unittest.TestCase):
+    def test_browser_profile_store_persists_state_under_browser_profiles_folder(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="browser-profiles-store-", dir=IMPORT_DATA_DIR))
+        store = local_broker.BrowserProfileStore(root)
+
+        payload = store.replace_state(
+            {
+                "profiles": [
+                    {
+                        "id": "profile_checkout",
+                        "name": "Checkout flow",
+                        "steps": [
+                            {
+                                "id": "step_start",
+                                "url": "https://example.com/start?email=test@example.com",
+                                "title": "Start page",
+                            }
+                        ],
+                    }
+                ],
+                "selected_profile_id": "profile_checkout",
+                "attached_profile": {
+                    "profile_id": "profile_checkout",
+                    "step_id": "step_start",
+                },
+            }
+        )
+
+        self.assertEqual("profile_checkout", payload["selected_profile_id"])
+        self.assertEqual("step_start", payload["attached_profile"]["step_id"])
+        self.assertTrue((root / "browser_profiles" / "state.json").exists())
+
+        reloaded = local_broker.BrowserProfileStore(root)
+        self.assertEqual("profile_checkout", reloaded.state()["selected_profile_id"])
+
+    def test_handle_browser_profiles_post_normalizes_invalid_attachment(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="browser-profiles-handler-", dir=IMPORT_DATA_DIR))
+        store = local_broker.BrowserProfileStore(root)
+
+        with patch.object(local_broker, "BROWSER_PROFILES", store):
+            result = local_broker.handle_browser_profiles_post(
+                {
+                    "profiles": [
+                        {
+                            "id": "profile_signup",
+                            "name": "Signup",
+                            "steps": [
+                                {
+                                    "id": "step_create",
+                                    "url": "https://example.com/signup?campaign=spring",
+                                    "title": "Create account",
+                                },
+                                {
+                                    "id": "step_create",
+                                    "url": "https://example.com/signup/duplicate",
+                                    "title": "Duplicate step id",
+                                },
+                            ],
+                        }
+                    ],
+                    "selected_profile_id": "profile_signup",
+                    "attached_profile": {
+                        "profile_id": "profile_signup",
+                        "step_id": "step_missing",
+                    },
+                }
+            )
+
+        profiles = result["browser_profiles"]["profiles"]
+        self.assertTrue(result["ok"])
+        self.assertEqual(1, len(profiles))
+        self.assertEqual(1, len(profiles[0]["steps"]))
+        self.assertEqual("", result["browser_profiles"]["attached_profile"]["step_id"])
+
     def test_discover_new_codex_session_id_requires_a_fresh_index_entry(self) -> None:
         previous = {"id": "session-old", "updated_at": "2026-03-21T00:00:00Z"}
         with patch.object(local_broker, "read_codex_session_index", return_value=[previous]):

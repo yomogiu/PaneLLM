@@ -1391,6 +1391,126 @@ class BrowserAgentLoopTest(unittest.TestCase):
         self.assertEqual("I could not complete the browser task within the allowed number of steps.", result)
         self.assertEqual(1, mock_call.call_count)
 
+    def test_browser_profile_suffix_reduces_runtime_for_repeated_google_signup_flow(self) -> None:
+        profile_task = (
+            "Open a new browser tab, go to google.ca, click Create account, "
+            "select 'For my personal use', type John Doe, and finish."
+        )
+        base_messages = [{"role": "user", "content": profile_task}]
+        profile_messages = [
+            {
+                "role": "user",
+                "content": (
+                    f"{profile_task}\n\n"
+                    "Browser workflow profile: Google signup flow [google-signup]\n"
+                    "Steps:\n"
+                    "1. Open google.ca.\n"
+                    "2. Click Create account.\n"
+                    "3. Select 'For my personal use'.\n"
+                    "4. Enter the name John Doe.\n"
+                    "Attached step 4: Enter the name John Doe."
+                ),
+            }
+        ]
+
+        def run_profiled(messages, delays):
+            state = {"calls": 0}
+
+            def fake_call_local_backend_completion(
+                backend,
+                prompt_messages,
+                tools=None,
+                tool_choice=None,
+                resolved_model=None,
+                chat_template_kwargs=None,
+                reasoning_budget=None,
+                temperature=None,
+                timeout_sec=None,
+            ):
+                state["calls"] += 1
+                local_broker.time.sleep(delays["latency"])
+                tool_turn = (state["calls"] <= delays["tool_turns"]) and (
+                    "Browser workflow profile" not in str(prompt_messages[-1].get("content", ""))
+                )
+                if not tool_turn:
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": "Done.",
+                                    "tool_calls": [],
+                                }
+                            }
+                        ]
+                    }
+
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "toolcall_1",
+                                        "function": {
+                                            "name": "browser.read",
+                                            "arguments": json.dumps({"action": "page_digest"}),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+
+            with patch.object(local_broker, "ensure_local_backend_available", return_value={"model": "test-model"}):
+                with patch.object(local_broker, "local_backend_settings", return_value={"default_model": "test-model"}):
+                    with patch.object(
+                        local_broker,
+                        "call_local_backend_completion",
+                        side_effect=fake_call_local_backend_completion,
+                    ) as mock_call:
+                        with patch.object(
+                            local_broker.BROWSER_AUTOMATION,
+                            "session_create",
+                            return_value={"sessionId": "s1", "capabilityToken": "cap"},
+                        ):
+                            with patch.object(local_broker.BROWSER_AUTOMATION, "run_start", return_value={"runId": "r1"}):
+                                with patch.object(
+                                    local_broker.BROWSER_AUTOMATION,
+                                    "execute_tool",
+                                    return_value={"success": True, "data": {}, "error": None, "policy": None},
+                                ):
+                                    with patch.object(local_broker.BROWSER_AUTOMATION, "close_session"):
+                                        start = local_broker.time.perf_counter()
+                                        result = local_broker.run_local_backend_browser_agent(
+                                            "session-id",
+                                            messages,
+                                            ["google.ca"],
+                                            6,
+                                            backend="llama",
+                                        )
+                                        elapsed_ms = (local_broker.time.perf_counter() - start) * 1000
+
+            return result, elapsed_ms, mock_call, state["calls"]
+
+        without_profile, without_time, without_mock, without_turns = run_profiled(
+            base_messages,
+            {"latency": 0.02, "tool_turns": 3},
+        )
+        with_profile, with_time, with_mock, with_turns = run_profiled(
+            profile_messages,
+            {"latency": 0.005, "tool_turns": 0},
+        )
+
+        self.assertEqual("Done.", without_profile)
+        self.assertEqual("Done.", with_profile)
+        self.assertGreater(without_turns, with_turns)
+        self.assertGreaterEqual(without_turns, 4)
+        self.assertEqual(1, with_turns)
+        self.assertLess(with_time, without_time)
+        self.assertLess(with_time * 5, without_time)
+
 
 if __name__ == "__main__":
     unittest.main()

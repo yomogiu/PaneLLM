@@ -170,6 +170,12 @@ async function handleMessage(message, sender = null) {
   if (message.type === "assistant.tools.browser_config.update") {
     return await updateBrowserConfig(message);
   }
+  if (message.type === "assistant.tools.browser_profiles.get") {
+    return await getBrowserProfiles();
+  }
+  if (message.type === "assistant.tools.browser_profiles.update") {
+    return await updateBrowserProfiles(message);
+  }
   if (message.type === "assistant.tools.page_hosts.get") {
     return { policy: getHostPolicySnapshot() };
   }
@@ -705,6 +711,31 @@ async function updateBrowserConfig(message) {
     body.agent_max_steps = message.agent_max_steps;
   }
   return await brokerRequest("POST", "/browser/config", body);
+}
+
+async function getBrowserProfiles() {
+  return await brokerRequest("GET", "/browser/profiles");
+}
+
+async function updateBrowserProfiles(message) {
+  const payload = message?.browserProfiles && typeof message.browserProfiles === "object"
+    ? message.browserProfiles
+    : message;
+  const body = {};
+  if (Array.isArray(payload?.profiles)) {
+    body.profiles = payload.profiles;
+  }
+  if (Object.prototype.hasOwnProperty.call(payload || {}, "selectedProfileId")) {
+    body.selected_profile_id = payload.selectedProfileId;
+  } else if (Object.prototype.hasOwnProperty.call(payload || {}, "selected_profile_id")) {
+    body.selected_profile_id = payload.selected_profile_id;
+  }
+  if (Object.prototype.hasOwnProperty.call(payload || {}, "attachedProfile")) {
+    body.attached_profile = payload.attachedProfile;
+  } else if (Object.prototype.hasOwnProperty.call(payload || {}, "attached_profile")) {
+    body.attached_profile = payload.attached_profile;
+  }
+  return await brokerRequest("POST", "/browser/profiles", body);
 }
 
 async function brokerRequest(method, path, body = null, options = {}) {

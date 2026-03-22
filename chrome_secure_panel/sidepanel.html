@@ -282,6 +282,31 @@
           <div id="browser-picked-history" class="tools-list"></div>
         </section>
 
+        <section class="tools-card browser-profile-card">
+          <div class="tools-head">
+            <h3>Browser Profiles</h3>
+          </div>
+          <p id="browser-profile-status" class="tools-status">No profiles available.</p>
+
+          <label class="tools-field">
+            <span>Selected Profile</span>
+            <select id="browser-profile-select"></select>
+          </label>
+          <label class="tools-field">
+            <span>Profile Name</span>
+            <input id="browser-profile-name" type="text" placeholder="Profile name" />
+          </label>
+
+          <div class="button-row tools-actions">
+            <button id="browser-profile-record-btn" type="button">Record</button>
+            <button id="browser-profile-save-latest-btn" type="button">Save Latest Step</button>
+            <button id="browser-profile-use-btn" class="ghost" type="button">Use Profile</button>
+            <button id="browser-profile-delete-btn" class="ghost" type="button">Delete Profile</button>
+          </div>
+
+          <div id="browser-profile-list" class="tools-list"></div>
+        </section>
+
         <section class="tools-card">
           <div class="tools-head">
             <h3>Automation</h3>
