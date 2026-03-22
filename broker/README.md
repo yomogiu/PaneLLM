@@ -40,11 +40,6 @@ python3 broker/local_broker.py
 - `MLX_URL` optional local OpenAI-compatible MLX endpoint
 - `MLX_MODEL` optional preferred MLX model id
 - `MLX_API_KEY` optional bearer token for the MLX server
-- `BROKER_EXPERIMENT_WORKER_PYTHON` default `python3`
-- `BROKER_EXPERIMENT_WORKER_PATH` default `broker/experiment_worker.py`
-- `BROKER_EXPERIMENT_JOB_TIMEOUT_SEC` default `900`
-- `BROKER_TRAINING_WORKER_PYTHON` default `python3`
-- `BROKER_TRAINING_JOB_TIMEOUT_SEC` default `7200`
 
 ## Health
 
@@ -61,7 +56,7 @@ python3 broker/local_broker.py
   "browser_automation": {},
   "codex_runs": {},
   "llama": {},
-  "experiments": {},
+  "mlx": {}
 }
 ```
 

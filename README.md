@@ -18,20 +18,12 @@ Chrome Side Panel (UI + user actions)
 
 - `broker/local_broker.py`
   - Single-process HTTP control plane and API entrypoint.
-  - Owns run lifecycle, browser tool policy, extension relay, async jobs, and persistence orchestration.
+  - Owns run lifecycle, browser tool policy, extension relay, and persistence orchestration.
 - `broker/browser_tools.py`
   - Canonical browser tool catalog used by broker-native and MCP-exposed tool calls.
-- `broker/services/mlx_runtime.py`
-  - MLX runtime control and status primitives.
-- `broker/mlx_worker.py`
-  - MLX backend process entrypoint.
-- `broker/experiment_worker.py`
-  - Async experiment executor.
-- `broker/training_worker.py`
-  - Async LoRA training/checkpoint executor.
 - `chrome_secure_panel/`
   - MV3 side panel extension (`sidepanel.js`, `background.js`, `manifest.json`).
-  - Polls broker state, submits runs, manages the relay loop, and renders Models/Tools/History UI.
+  - Polls broker state, submits runs, manages the relay loop, and renders Chat/Tools/History UI.
 - `tools/mcp-servers/browser-use/server.py`
   - MCP wrapper over broker browser tools (`/browser/tools/call`).
 
@@ -70,12 +62,6 @@ Chrome Side Panel (UI + user actions)
 6. `POST /papers/highlights_capture` remains as an idempotent backfill path for older conversations, but normal explain-selection saving no longer depends on starting a new chat.
 7. Paper summary and paper highlights are separate artifacts from the chat transcript, but they are loaded together when the same paper comes back into focus.
 
-### 5) Async jobs flow
-
-- Experiments and MLX training jobs are async: `POST /experiments/jobs`, `POST /mlx/training/jobs`, etc.
-- Jobs appear under `/jobs` and can be cancelled by `POST /jobs/<job_id>/cancel`.
-- Side panel tools surfaces job/run state across experiments and training flows.
-
 ## API surface (implemented now)
 
 - `GET /health`
@@ -91,8 +77,6 @@ Chrome Side Panel (UI + user actions)
 - `POST /extension/register`
 - `GET /extension/next`
 - `POST /extension/result`
-- `GET /jobs?kind=<experiment|training>&status=<queued|running|completed|failed|cancelled>`
-- `POST /jobs/<job_id>/cancel`
 - `GET /conversations`
 - `GET /conversations/<conversation_id>`
 - `DELETE /conversations/<conversation_id>`
@@ -100,46 +84,15 @@ Chrome Side Panel (UI + user actions)
 - `POST /papers/summary_request`
 - `POST /papers/highlights_capture`
 - `POST /papers/summary_generate`
-- `POST /experiments/jobs`
-- `GET /experiments/jobs/<job_id>`
-- `GET /experiments`
-- `GET /experiments/<experiment_id>`
-- `GET /experiments/<experiment_id>/compare/<other_experiment_id>`
-- `POST /mlx/training/datasets/import`
-- `GET /mlx/training/datasets`
-- `GET /mlx/training/datasets/<dataset_id>`
-- `DELETE /mlx/training/datasets/<dataset_id>`
-- `POST /mlx/training/jobs`
-- `GET /mlx/training/jobs/<job_id>`
-- `GET /mlx/training/runs`
-- `GET /mlx/training/runs/<run_id>`
-- `POST /mlx/training/checkpoints/promote`
-- `POST /mlx/config`
-- `GET /mlx/status`
-- `POST /mlx/session/start`
-- `POST /mlx/session/stop`
-- `POST /mlx/session/restart`
-- `GET /mlx/adapters`
-- `POST /mlx/adapters/load`
-- `POST /mlx/adapters/unload`
 
 ## MLX backend
 
-### Runtime architecture
+MLX is now treated the same way as `llama.cpp`: an OpenAI-compatible endpoint selected through the normal run path.
 
-- MLX runs as a broker-managed worker process in [broker/mlx_worker.py](broker/mlx_worker.py).
-- Broker owns runtime lifecycle (`start`/`stop`/`restart`), generation settings, adapter registry, and telemetry.
-- Side panel `Models` tab controls MLX runtime.
-
-### Stable MLX contract (v1)
-
-- Versioned schema: `schema_version: mlx_chat_v1`.
-- Message shape: OpenAI-style chat messages (`role`, `content`).
-- Tool calls: disabled in v1 (`tool_call_format: none_v1`).
-- Context behavior: tail truncation by char budget (`max_context_behavior: tail_truncate_chars_v1`).
-- Llama/Codex use `BROKER_MAX_CONTEXT_CHARS` (default `24000` chars).
-- MLX uses `BROKER_MLX_MAX_CONTEXT_CHARS` (default `56000`, capped at `56000`).
-- Contract metadata is exposed from `/health` and `/mlx/status` payloads.
+- Configure `MLX_URL` to point at a local chat completions endpoint.
+- Optionally set `MLX_MODEL` to pin the preferred model id.
+- Optionally set `MLX_API_KEY` for bearer-token auth.
+- Use `backend: "mlx"` on `POST /runs` for chat completions and broker-mediated browser tool calls.
 
 ### MLX local data
 
@@ -148,17 +101,7 @@ Chrome Side Panel (UI + user actions)
 - Run state: `broker/.data/codex_runs/*.json`
 - Paper workspace state: `broker/.data/papers/*.json`
   - Paper records may include `observed_versions`, `last_summary_version`, `summary`, and saved highlight artifacts.
-- MLX generation settings: `broker/.data/mlx_config.json`
-- MLX adapter registry: `broker/.data/mlx_adapters.json`
 - Browser policy config: `broker/.data/browser_config.json`
-- Jobs:
-  - `broker/.data/jobs/experiment/*.json`
-  - `broker/.data/jobs/training/*.json`
-- Experiments/training metadata:
-  - `broker/.data/experiments/`
-  - `broker/.data/mlx_training/datasets/<dataset_id>/`
-  - `broker/.data/mlx_training/runs/<run_id>/`
-- MLX reasoning mode: runtime toggle via Models tab (`generation.enable_thinking`)
 
 ## Legacy workflow status
 
@@ -217,12 +160,12 @@ python3 broker/local_broker.py
 MLX:
 
 ```bash
-python3 -m pip install mlx-lm
-export BROKER_MLX_MODEL_PATH="$HOME/models/mlx/<your-model-folder>"
+export MLX_URL="http://127.0.0.1:8080/v1/chat/completions"
+export MLX_MODEL="<your-mlx-model-id>"
 python3 broker/local_broker.py
 ```
 
-If you use MLX, install `mlx-lm` in the same interpreter as `BROKER_MLX_WORKER_PYTHON`/worker if needed.
+If your MLX server requires auth, also set `MLX_API_KEY`.
 
 ### 3) Verify broker health
 

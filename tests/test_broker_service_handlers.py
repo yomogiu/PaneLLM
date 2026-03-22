@@ -477,10 +477,7 @@ class BrokerContractTest(unittest.TestCase):
                 with patch.object(local_broker.BROWSER_AUTOMATION, "health", return_value={"sessions": 0}):
                     with patch.object(local_broker.CODEX_RUNS, "health", return_value={"active_runs": 0}):
                         with patch.object(local_broker, "llama_backend_health", return_value={"available": False}):
-                            with patch.object(local_broker.MLX_RUNTIME, "health", return_value={"available": False}):
-                                with patch.object(local_broker.EXPERIMENTS, "health", return_value={"jobs": 0}):
-                                    with patch.object(local_broker.TRAININGS, "health", return_value={"jobs": 0}):
-                                        payload = local_broker.build_health_payload()
+                            payload = local_broker.build_health_payload()
 
         self.assertEqual("responses_ready", payload["codex_backend"])
         self.assertNotIn(removed_backend_key, payload)

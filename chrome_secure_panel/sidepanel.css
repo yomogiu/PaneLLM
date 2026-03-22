@@ -668,27 +668,12 @@ body::before {
   overflow: hidden;
 }
 
-.models-view {
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding-right: 2px;
-}
-
 .tools-view {
   overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 10px;
   padding-right: 2px;
-}
-
-.models-card {
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: rgba(12, 19, 36, 0.92);
-  padding: 10px;
 }
 
 .tools-card {
@@ -698,13 +683,6 @@ body::before {
   padding: 10px;
 }
 
-.models-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-
 .tools-head {
   display: flex;
   align-items: center;
@@ -712,29 +690,10 @@ body::before {
   gap: 10px;
 }
 
-.models-head h2,
-.models-card h3 {
-  margin: 0;
-  font-size: calc(13px * var(--font-scale));
-}
-
 .tools-head h2,
 .tools-card h3 {
   margin: 0;
   font-size: calc(13px * var(--font-scale));
-}
-
-.models-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.models-field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-top: 8px;
 }
 
 .tools-field {
@@ -744,58 +703,14 @@ body::before {
   margin-top: 8px;
 }
 
-.models-field span {
-  font-size: calc(11px * var(--font-scale));
-  color: var(--muted);
-}
-
 .tools-field span {
   font-size: calc(11px * var(--font-scale));
   color: var(--muted);
 }
 
-.models-field input,
-.models-field select,
-.models-field textarea {
-  padding: 8px 9px;
-  border-radius: 9px;
-}
-
 .tools-field input {
   padding: 8px 9px;
   border-radius: 9px;
-}
-
-.models-field textarea {
-  resize: vertical;
-  min-height: 88px;
-}
-
-.models-field-full {
-  grid-column: 1 / -1;
-}
-
-.checkbox-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  color: #d9dff6;
-  font-size: calc(12px * var(--font-scale));
-}
-
-.checkbox-label span {
-  color: #d9dff6;
-  font-size: calc(12px * var(--font-scale));
-}
-
-.checkbox-label input[type="checkbox"] {
-  margin: 0;
-}
-
-.models-status {
-  margin: 10px 0 0;
-  font-size: calc(12px * var(--font-scale));
-  color: #d9dff6;
 }
 
 .tools-status {
@@ -804,90 +719,8 @@ body::before {
   color: #d9dff6;
 }
 
-.models-session-actions {
-  flex-wrap: wrap;
-}
-
 .tools-actions {
   flex-wrap: wrap;
-}
-
-.models-adapter-list {
-  margin-top: 8px;
-  padding: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 10px;
-  background: rgba(7, 12, 24, 0.86);
-  min-height: 36px;
-  font-size: calc(12px * var(--font-scale));
-  color: var(--muted);
-  white-space: pre-line;
-}
-
-.models-adapter-item {
-  margin: 0;
-  padding: 0;
-}
-
-.models-adapter-list.structured {
-  white-space: normal;
-  padding: 0;
-  border: 0;
-  background: transparent;
-}
-
-.models-details {
-  margin-top: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 10px;
-  background: rgba(7, 12, 24, 0.72);
-  padding: 8px 10px;
-}
-
-.models-details summary {
-  cursor: pointer;
-  color: var(--text);
-  font-size: calc(12px * var(--font-scale));
-}
-
-.models-details[open] summary {
-  margin-bottom: 10px;
-}
-
-.models-progress {
-  margin-top: 8px;
-  height: 8px;
-  border-radius: 999px;
-  overflow: hidden;
-  background: rgba(255, 255, 255, 0.08);
-}
-
-.models-progress-bar {
-  height: 100%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, rgba(49, 212, 255, 0.88), rgba(117, 240, 188, 0.86));
-}
-
-.models-job-meta {
-  margin: 6px 0 0;
-  font-size: calc(12px * var(--font-scale));
-  color: var(--muted);
-}
-
-.models-trend {
-  margin: 6px 0 0;
-  font-size: calc(12px * var(--font-scale));
-  color: var(--muted);
-  font-family: "IBM Plex Mono", "Consolas", monospace;
-}
-
-.models-contract {
-  margin: 6px 0 0;
-  font-size: calc(12px * var(--font-scale));
-  color: var(--muted);
-  font-family: "IBM Plex Mono", "Consolas", monospace;
-  white-space: pre-wrap;
-  word-break: break-word;
 }
 
 .tools-list {
@@ -984,8 +817,7 @@ button {
   background: #0c1324;
 }
 
-.topbar-select,
-.models-field select {
+.topbar-select {
   -webkit-appearance: none;
   appearance: none;
   border: 1px solid rgba(255, 255, 255, 0.22);
@@ -1001,10 +833,6 @@ button {
 .topbar-select {
   min-width: 124px;
   padding: 8px 30px 8px 10px;
-}
-
-.models-field select {
-  padding-right: 30px;
 }
 
 .toggle {
@@ -1592,10 +1420,6 @@ button:focus {
 }
 
 @media (max-width: 720px) {
-  .models-grid {
-    grid-template-columns: 1fr;
-  }
-
   .app.history-pinned > .topbar,
   .app.history-pinned > .main-tabs,
   .app.history-pinned > .chat-view {

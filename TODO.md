@@ -1,73 +1,21 @@
-# TODO: Local MLX Backend + Models Tab Architecture
+# TODO: Backend Endpoint Parity
 
 ## Goal
 
-Add a local MLX backend that appears in the extension backend dropdown, with broker-managed runtime controls, a top-level Models tab for configuration, checkpoint-based LoRA adapter reloads (no weight merge), and simple runtime graphs.
+Keep `mlx` as a peer of `llama.cpp`: a selectable OpenAI-compatible endpoint used through the unified `/runs` surface for chat and broker-mediated browser tool calls.
 
-## Delivery Plan
+## Current guardrails
 
-### 1) Runtime + routing
+- [x] Extension backend selector exposes `codex`, `llama`, and `mlx`.
+- [x] Extension does not manage MLX runtime lifecycle, adapters, training, or experiments.
+- [x] Broker treats MLX as another local backend discovered from `MLX_URL` / `MLX_MODEL` / `MLX_API_KEY`.
+- [x] Browser tools continue to route through the shared broker relay regardless of selected backend.
 
-- [x] Extend backend routing from `{llama,codex}` to `{llama,codex,mlx}` across extension + broker contracts.
-- [x] Add broker-managed MLX worker lifecycle (`start`, `stop`, `restart`, `status`) with health/readiness checks.
-- [x] Keep the unified `/runs` surface as the primary inference path; support `backend=mlx`.
-- [x] Add model discovery/state endpoint so extension can populate backend/model selectors.
+## Follow-up ideas
 
-### 2) Extension Models tab
-
-- [x] Add top-level tabs in the side panel: `Chat` and `Models` (history panel behavior unchanged).
-- [x] Add backend/model selector in Models tab including `MLX Local`.
-- [x] Add editable hyperparameters for MLX (temperature, top_p, top_k, max_tokens, repetition penalty, seed).
-- [x] Add apply/save controls and clear runtime status messages.
-- [x] Add explicit `Restart MLX Session` action from the Models tab.
-
-### 3) LoRA checkpoints (reload only, no merge)
-
-- [x] Add broker-side adapter checkpoint registry persisted under broker data dir.
-- [x] Support external training artifact import (metadata + filesystem path), not broker-run training.
-- [x] Support adapter load/unload/reload for the active MLX runtime.
-- [x] Enforce checkpoint-based updates only; do not merge adapter weights into base model in v1.
-
-### 4) Broker API surface
-
-- [x] Add `GET /models`.
-- [x] Add `GET /mlx/status`.
-- [x] Add `POST /mlx/config`.
-- [x] Add `POST /mlx/session/restart`.
-- [x] Add adapter endpoints:
-  - `GET /mlx/adapters`
-  - `POST /mlx/adapters/load`
-  - `POST /mlx/adapters/unload`
-- [x] Add matching extension background message types and sidepanel call sites.
-
-### 5) Simple graphs
-
-- [x] Add lightweight graphs in Models tab (no heavy chart dependency):
-  - latency trend (rolling window)
-  - tokens/sec trend (rolling window)
-  - restart success/failure counts
-- [x] Source graph data from broker MLX telemetry/status payloads.
-
-### 6) Future loop hooks (deferred)
-
-- [ ] Add TODO placeholders + data hooks for task/feedback/golden-example storage.
-- [ ] Defer full task -> teacher -> golden-example loop automation to a later phase.
-- [ ] Defer worker-subagent auto-detection/retry orchestration to a later phase.
-
-## Verification Checklist
-
-1. `MLX Local` appears in extension backend/model controls and requests route with `backend=mlx`.
-2. Hyperparameter updates affect subsequent MLX responses without extension reload.
-3. `Restart MLX Session` succeeds/fails with clear UI status and broker diagnostics.
-4. Adapter checkpoint load/unload works and reload behavior is deterministic across restarts.
-5. Graphs render empty state first, then update from broker runtime metrics.
-6. Existing llama/codex flows, risk confirmation, allowlist gating, and history remain functional.
-
-## Assumptions
-
-- MLX runs as a broker-managed local worker process.
-- LoRA training is external; broker handles checkpoint registry + reload only.
-- Models tab is a top-level tab in the sidepanel UI.
+- [ ] Keep backend capability metadata (`GET /models`) focused on selector/runtime compatibility only.
+- [ ] Preserve parity between `llama` and `mlx` request options where the shared local-backend path supports it.
+- [ ] Continue removing stale docs or notes if older runtime-management language resurfaces.
 
 # TODO: Codex Session-Scoped MCP Bridge Plan
 

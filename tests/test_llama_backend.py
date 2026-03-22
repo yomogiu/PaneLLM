@@ -1,4 +1,5 @@
 import atexit
+import io
 import json
 import os
 import re
@@ -6,7 +7,7 @@ import shutil
 import tempfile
 import unittest
 from dataclasses import replace
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from unittest.mock import patch
 
 
@@ -77,6 +78,14 @@ class _FakeThread:
         self.started = True
 
 
+def _http_error(url: str, status: int, payload: dict[str, object] | str) -> HTTPError:
+    if isinstance(payload, str):
+        body = payload.encode("utf-8")
+    else:
+        body = json.dumps(payload).encode("utf-8")
+    return HTTPError(url, status, "error", hdrs=None, fp=io.BytesIO(body))
+
+
 class LlamaBackendHealthTest(unittest.TestCase):
     def setUp(self) -> None:
         self.config = replace(
@@ -106,14 +115,19 @@ class LlamaBackendHealthTest(unittest.TestCase):
         self.assertIn("Connection refused", health["last_error"])
 
     def test_models_payload_disables_unreachable_llama_backend(self) -> None:
-        manager = local_broker.MlxRuntimeManager(replace(self.config, mlx_model_path=""))
+        mlx_config = replace(
+            self.config,
+            mlx_url="http://127.0.0.1:18001/v1/chat/completions",
+            mlx_model="test-mlx-model",
+        )
 
-        with patch.object(
-            local_broker.socket,
-            "create_connection",
-            side_effect=ConnectionRefusedError(61, "Connection refused"),
-        ):
-            payload = manager.models_payload()
+        with patch.object(local_broker, "CONFIG", mlx_config):
+            with patch.object(
+                local_broker.socket,
+                "create_connection",
+                side_effect=ConnectionRefusedError(61, "Connection refused"),
+            ):
+                payload = local_broker.build_models_payload()
 
         backends = {str(item["id"]): item for item in payload["backends"]}
         self.assertFalse(backends["llama"]["available"])
@@ -142,6 +156,65 @@ class LlamaBackendHealthTest(unittest.TestCase):
         self.assertEqual(local_broker.DEFAULT_LLAMA_MODEL, health["configured_model"])
         self.assertEqual(["qwen3.5-35b-a3b-q3_k_m"], health["advertised_models"])
         self.assertEqual("auto_detected", health["model_source"])
+
+    def test_llama_backend_health_retries_model_discovery_without_auth_for_loopback_invalid_api_key(self) -> None:
+        config = replace(
+            self.config,
+            llama_model=local_broker.DEFAULT_LLAMA_MODEL,
+            llama_api_key="bad-key",
+        )
+        auth_headers: list[str | None] = []
+
+        def fake_urlopen(request, timeout=120):
+            auth_headers.append(request.get_header("Authorization"))
+            if request.get_header("Authorization"):
+                raise _http_error(
+                    request.full_url,
+                    401,
+                    {"error": {"message": "Invalid API Key"}},
+                )
+            return _FakeJsonResponse({"data": [{"id": "qwen3.5-35b-a3b-q3_k_m"}]})
+
+        with patch.object(
+            local_broker.socket,
+            "create_connection",
+            return_value=_FakeSocketConnection(),
+        ):
+            with patch.object(local_broker, "urlopen", side_effect=fake_urlopen):
+                health = local_broker.llama_backend_health(config)
+
+        self.assertTrue(health["available"])
+        self.assertEqual("ready", health["status"])
+        self.assertEqual("qwen3.5-35b-a3b-q3_k_m", health["model"])
+        self.assertEqual([f"Bearer bad-key", None], auth_headers)
+        self.assertEqual("", health["last_error"])
+
+    def test_llama_backend_health_reports_auth_error_when_invalid_key_persists(self) -> None:
+        config = replace(
+            self.config,
+            llama_model=local_broker.DEFAULT_LLAMA_MODEL,
+            llama_api_key="bad-key",
+        )
+
+        def fake_urlopen(request, timeout=120):
+            raise _http_error(
+                request.full_url,
+                401,
+                {"error": {"message": "Invalid API Key"}},
+            )
+
+        with patch.object(
+            local_broker.socket,
+            "create_connection",
+            return_value=_FakeSocketConnection(),
+        ):
+            with patch.object(local_broker, "urlopen", side_effect=fake_urlopen):
+                health = local_broker.llama_backend_health(config)
+
+        self.assertFalse(health["available"])
+        self.assertEqual("auth_error", health["status"])
+        self.assertIn("Invalid API Key", health["last_error"])
+        self.assertIn("Clear LLAMA_API_KEY", health["last_error"])
 
     def test_call_llama_completion_includes_target_url_in_errors(self) -> None:
         with patch.object(local_broker, "CONFIG", self.config):
@@ -212,6 +285,63 @@ class LlamaBackendHealthTest(unittest.TestCase):
         payload = captured["payload"]
         self.assertIsInstance(payload, dict)
         self.assertEqual("qwen3.5-35b-a3b-q3_k_m", payload["model"])
+
+    def test_call_llama_completion_retries_without_auth_for_loopback_invalid_api_key(self) -> None:
+        captured_auth_headers: list[str | None] = []
+
+        def fake_urlopen(request, timeout=120):
+            captured_auth_headers.append(request.get_header("Authorization"))
+            if request.get_header("Authorization"):
+                raise _http_error(
+                    request.full_url,
+                    401,
+                    {"error": {"message": "Invalid API Key"}},
+                )
+            return _FakeJsonResponse({"choices": [{"message": {"content": "ok"}}]})
+
+        config = replace(self.config, llama_api_key="bad-key")
+
+        with patch.object(local_broker, "CONFIG", config):
+            with patch.object(local_broker, "urlopen", side_effect=fake_urlopen):
+                parsed = local_broker.call_llama_completion(
+                    [{"role": "user", "content": "hello"}],
+                    resolved_model=self.config.llama_model,
+                )
+
+        self.assertEqual("ok", parsed["choices"][0]["message"]["content"])
+        self.assertEqual([f"Bearer bad-key", None], captured_auth_headers)
+
+    def test_call_llama_completion_stream_retries_without_auth_for_loopback_invalid_api_key(self) -> None:
+        captured_auth_headers: list[str | None] = []
+
+        def fake_urlopen(request, timeout=120):
+            captured_auth_headers.append(request.get_header("Authorization"))
+            if request.get_header("Authorization"):
+                raise _http_error(
+                    request.full_url,
+                    401,
+                    {"error": {"message": "Invalid API Key"}},
+                )
+            return _FakeSseResponse(
+                [
+                    {"choices": [{"delta": {"content": "Final "}}]},
+                    {"choices": [{"delta": {"content": "answer."}}]},
+                    "[DONE]",
+                ]
+            )
+
+        config = replace(self.config, llama_api_key="bad-key")
+
+        with patch.object(local_broker, "CONFIG", config):
+            with patch.object(local_broker, "urlopen", side_effect=fake_urlopen):
+                answer, reasoning = local_broker.call_llama_completion_stream(
+                    [{"role": "user", "content": "hello"}],
+                    resolved_model=self.config.llama_model,
+                )
+
+        self.assertEqual("Final answer.", answer)
+        self.assertEqual("", reasoning)
+        self.assertEqual([f"Bearer bad-key", None], captured_auth_headers)
 
 
 class ThinkingParsingTest(unittest.TestCase):
