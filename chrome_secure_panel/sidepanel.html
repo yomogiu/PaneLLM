@@ -176,6 +176,15 @@
             Highlights
           </button>
           <button
+            id="paper-memory-tab-btn"
+            class="tab-btn"
+            role="tab"
+            aria-selected="false"
+            aria-controls="paper-memory-view"
+          >
+            Memory
+          </button>
+          <button
             id="paper-summary-tab-btn"
             class="tab-btn"
             role="tab"
@@ -195,6 +204,23 @@
         <section id="paper-highlights-view" class="paper-panel hidden" aria-hidden="true">
           <div id="paper-highlights-body" class="paper-panel-body">
             <p class="empty-state">No paper highlights yet.</p>
+          </div>
+        </section>
+
+        <section id="paper-memory-view" class="paper-panel hidden" aria-hidden="true">
+          <div class="paper-panel-body paper-memory-body">
+            <div class="paper-memory-search">
+              <input
+                id="paper-memory-search"
+                type="search"
+                autocomplete="off"
+                placeholder="Search memory for this paper"
+              />
+              <button id="paper-memory-search-btn" class="ghost small" type="button">Search</button>
+            </div>
+            <div id="paper-memory-results" class="paper-memory-results">
+              <p class="empty-state">No paper memory yet.</p>
+            </div>
           </div>
         </section>
 

@@ -69,6 +69,9 @@ PAPER_STATUS_VALUES = {"idle", "requested", "ready", "error"}
 ARXIV_HOSTS = {"arxiv.org", "www.arxiv.org"}
 ARXIV_ROUTE_PREFIXES = {"abs", "pdf", "html"}
 PAPER_SUMMARY_PROMPT_PATH = REPO_ROOT / "broker" / "prompts" / "paper_summary.md"
+PAPER_MEMORY_QUERY_DEFAULT_LIMIT = 8
+PAPER_MEMORY_QUERY_MAX_LIMIT = 16
+PAPER_MEMORY_AUTO_LIMIT = 4
 PAGE_CONTEXT_PROMPT_CHAR_BUDGET = 7200
 CODEX_TOOL_OUTPUT_CHAR_BUDGET = 12000
 CODEX_APPROVAL_TEXT_PREVIEW_CHARS = 120
@@ -1495,6 +1498,7 @@ class ConversationStore:
                 "updated_at": payload.get("updated_at"),
                 "message_count": len(messages),
                 "preview": build_conversation_highlight(payload),
+                "summary": str(payload.get("summary", "") or ""),
                 "paper_chat_kind": str(codex.get("paper_chat_kind", "") or ""),
                 "paper_history_label": str(codex.get("paper_history_label", "") or ""),
                 "paper_focus_text": str(codex.get("paper_focus_text", "") or ""),
@@ -4147,6 +4151,30 @@ class CodexRunManager:
                 paper_context = merge_paper_contexts(paper_context, page_paper_context)
         if paper_summary_target is not None and paper_context is not None and papers_equal(paper_summary_target, paper_context):
             paper_summary_target = merge_paper_contexts(paper_context, paper_summary_target)
+        if (
+            paper_context is not None
+            and normalize_paper_version(paper_context.get("paper_version", ""))
+            and store_user_message
+            and append_assistant_message
+            and paper_summary_target is None
+        ):
+            try:
+                paper_memory_block = format_paper_memory_prompt_block(
+                    query_paper_memory(
+                        paper_context,
+                        query=prompt,
+                        limit=PAPER_MEMORY_AUTO_LIMIT,
+                        exclude_conversation_id=session_id,
+                    )
+                )
+            except Exception:
+                paper_memory_block = ""
+            if paper_memory_block:
+                request_prompt_suffix = (
+                    f"{request_prompt_suffix}\n\n{paper_memory_block}"
+                    if request_prompt_suffix
+                    else paper_memory_block
+                )
         allowed_hosts = resolve_route_allowlist(requested_allowed_hosts, page_context)
         if force_browser_action and not allowed_hosts:
             raise RuntimeError("Browser action mode requires at least one allowlisted host.")
@@ -6990,7 +7018,11 @@ def build_paper_workspace(source: str, paper_id: str) -> dict[str, Any]:
                 updated = True
     if updated:
         record = PAPERS.save(record)
-    return {"paper": record, "conversations": conversations}
+    return {
+        "paper": record,
+        "conversations": conversations,
+        "memory": build_paper_memory_metadata(record, conversations),
+    }
 
 
 def handle_paper_lookup(params: dict[str, list[str]]) -> dict[str, Any]:
@@ -7013,6 +7045,21 @@ def handle_paper_summary_request(data: dict[str, Any]) -> dict[str, Any]:
         paper_version=paper_context.get("paper_version", ""),
     )
     return build_paper_workspace(paper_context["source"], paper_context["paper_id"])
+
+
+def handle_paper_memory_query(data: dict[str, Any]) -> dict[str, Any]:
+    candidate = data.get("paper") if isinstance(data.get("paper"), dict) else data
+    paper_context = normalize_paper_context(candidate)
+    if paper_context is None:
+        raise ValueError("paper is required.")
+    return query_paper_memory(
+        paper_context,
+        query=str(data.get("query", "") or ""),
+        limit=data.get("limit", PAPER_MEMORY_QUERY_DEFAULT_LIMIT),
+        exclude_conversation_id=str(
+            data.get("exclude_conversation_id", data.get("excludeConversationId")) or ""
+        ).strip(),
+    )
 
 
 def build_conversation_highlight(conversation: dict[str, Any]) -> str:
@@ -7063,6 +7110,322 @@ def collect_paper_versions_from_conversations(conversations: list[dict[str, Any]
         if version:
             versions.append(version)
     return normalize_paper_versions(versions)
+
+
+def normalize_paper_memory_limit(value: Any, default: int = PAPER_MEMORY_QUERY_DEFAULT_LIMIT) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = default
+    return max(1, min(PAPER_MEMORY_QUERY_MAX_LIMIT, limit))
+
+
+def paper_memory_kind_rank(kind: str) -> int:
+    normalized = str(kind or "").strip().lower()
+    if normalized == "summary":
+        return 0
+    if normalized == "highlight":
+        return 1
+    return 2
+
+
+def build_paper_memory_metadata(record: dict[str, Any], conversations: list[dict[str, Any]]) -> dict[str, Any]:
+    counts_by_version: dict[str, int] = {}
+    latest_updated_at = str(record.get("updated_at", "") or "")
+    has_unversioned = False
+
+    summary_text = str(record.get("summary", "") or "").strip()
+    summary_version = normalize_paper_version(record.get("last_summary_version", ""))
+    if summary_text and summary_version:
+        counts_by_version[summary_version] = counts_by_version.get(summary_version, 0) + 1
+
+    for highlight in normalize_paper_highlights(record.get("highlights")):
+        version = normalize_paper_version(highlight.get("paper_version", ""))
+        created_at = str(highlight.get("created_at", "") or "")
+        if created_at > latest_updated_at:
+            latest_updated_at = created_at
+        if version:
+            counts_by_version[version] = counts_by_version.get(version, 0) + 1
+        else:
+            has_unversioned = True
+
+    for conversation in conversations:
+        updated_at = str(conversation.get("updated_at", "") or "")
+        if updated_at > latest_updated_at:
+            latest_updated_at = updated_at
+        paper = conversation.get("paper") if isinstance(conversation.get("paper"), dict) else {}
+        version = normalize_paper_version(paper.get("paper_version", ""))
+        if version:
+            counts_by_version[version] = counts_by_version.get(version, 0) + 1
+        else:
+            has_unversioned = True
+
+    ordered_versions = normalize_paper_versions(
+        [*normalize_paper_versions(record.get("observed_versions")), *counts_by_version.keys()]
+    )
+    ordered_counts = {
+        version: int(counts_by_version.get(version, 0))
+        for version in ordered_versions
+        if int(counts_by_version.get(version, 0)) > 0
+    }
+    default_version = ordered_versions[0] if ordered_versions else ""
+    return {
+        "default_version": default_version,
+        "counts_by_version": ordered_counts,
+        "has_unversioned": bool(has_unversioned),
+        "latest_updated_at": latest_updated_at,
+    }
+
+
+def build_paper_memory_candidates(
+    record: dict[str, Any],
+    conversations: list[dict[str, Any]],
+    *,
+    requested_version: str,
+    exclude_conversation_id: str = "",
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    exact_candidates: list[dict[str, Any]] = []
+    fallback_candidates: list[dict[str, Any]] = []
+    source = str(record.get("source", "") or "")
+    paper_id = str(record.get("paper_id", "") or "")
+    normalized_requested_version = normalize_paper_version(requested_version)
+    excluded_id = str(exclude_conversation_id or "").strip()
+
+    summary_text = compact_text_block(str(record.get("summary", "") or ""), 560)
+    summary_version = normalize_paper_version(record.get("last_summary_version", ""))
+    if normalized_requested_version and summary_text and summary_version == normalized_requested_version:
+        exact_candidates.append(
+            {
+                "entry": {
+                    "id": f"summary:{source}:{paper_id}:{normalized_requested_version}",
+                    "kind": "summary",
+                    "paper_version": normalized_requested_version,
+                    "title": compact_whitespace(
+                        str(record.get("title", "") or f"arXiv:{paper_id}"),
+                        120,
+                    ),
+                    "snippet": summary_text,
+                    "conversation_id": str(record.get("last_summary_conversation_id", "") or ""),
+                    "updated_at": str(record.get("updated_at", "") or ""),
+                    "source_label": "Summary",
+                },
+                "search_text": " ".join(
+                    [
+                        str(record.get("title", "") or ""),
+                        summary_text,
+                        "summary",
+                        normalized_requested_version,
+                    ]
+                ).lower(),
+                "exact": True,
+            }
+        )
+
+    for highlight in normalize_paper_highlights(record.get("highlights")):
+        highlight_version = normalize_paper_version(highlight.get("paper_version", ""))
+        if not highlight_version or highlight_version != normalized_requested_version:
+            continue
+        selection = compact_whitespace(str(highlight.get("selection", "") or ""), 220)
+        response = compact_text_block(str(highlight.get("response", "") or ""), 340)
+        snippet = response or selection
+        if selection and response and selection.lower() not in response.lower():
+            snippet = compact_text_block(f"{selection} {response}", 420)
+        exact_candidates.append(
+            {
+                "entry": {
+                    "id": f"highlight:{source}:{paper_id}:{highlight_version}:{sha1(json.dumps(highlight, sort_keys=True).encode('utf-8')).hexdigest()[:12]}",
+                    "kind": "highlight",
+                    "paper_version": highlight_version,
+                    "title": compact_whitespace(
+                        str(highlight.get("prompt", "") or highlight.get("selection", "") or "Saved highlight"),
+                        120,
+                    ),
+                    "snippet": snippet,
+                    "conversation_id": str(highlight.get("conversation_id", "") or ""),
+                    "updated_at": str(highlight.get("created_at", "") or ""),
+                    "source_label": "Highlight",
+                },
+                "search_text": " ".join(
+                    [
+                        str(highlight.get("prompt", "") or ""),
+                        str(highlight.get("selection", "") or ""),
+                        str(highlight.get("response", "") or ""),
+                        "highlight",
+                        highlight_version,
+                    ]
+                ).lower(),
+                "exact": True,
+            }
+        )
+
+    for conversation in conversations:
+        conversation_id = str(conversation.get("id", "") or "").strip()
+        if not conversation_id or (excluded_id and conversation_id == excluded_id):
+            continue
+        paper = conversation.get("paper") if isinstance(conversation.get("paper"), dict) else {}
+        conversation_version = normalize_paper_version(paper.get("paper_version", ""))
+        if normalized_requested_version:
+            if conversation_version == normalized_requested_version:
+                target = exact_candidates
+                is_exact = True
+            elif not conversation_version:
+                target = fallback_candidates
+                is_exact = False
+            else:
+                continue
+        else:
+            if conversation_version:
+                continue
+            target = fallback_candidates
+            is_exact = False
+        title = compact_whitespace(
+            str(conversation.get("paper_history_label", "") or conversation.get("title", "") or "Prior chat"),
+            120,
+        )
+        preview = compact_text_block(str(conversation.get("preview", "") or ""), 320)
+        summary = compact_text_block(str(conversation.get("summary", "") or ""), 320)
+        focus_text = compact_whitespace(str(conversation.get("paper_focus_text", "") or ""), 220)
+        snippet = summary or preview or focus_text or title
+        target.append(
+            {
+                "entry": {
+                    "id": f"conversation:{conversation_id}",
+                    "kind": "conversation",
+                    "paper_version": conversation_version,
+                    "title": title,
+                    "snippet": snippet,
+                    "conversation_id": conversation_id,
+                    "updated_at": str(conversation.get("updated_at", "") or ""),
+                    "source_label": "Prior chat",
+                },
+                "search_text": " ".join(
+                    [
+                        title,
+                        summary,
+                        preview,
+                        focus_text,
+                        str(conversation.get("paper_history_label", "") or ""),
+                        "conversation prior chat",
+                    ]
+                ).lower(),
+                "exact": is_exact,
+            }
+        )
+
+    return exact_candidates, fallback_candidates
+
+
+def rank_paper_memory_candidates(
+    exact_candidates: list[dict[str, Any]],
+    fallback_candidates: list[dict[str, Any]],
+    *,
+    query: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    normalized_query = compact_whitespace(query, 240).lower()
+    if not normalized_query:
+        ordered_exact = list(exact_candidates)
+        ordered_fallback = list(fallback_candidates)
+        ordered_exact.sort(key=lambda item: str(item["entry"].get("id", "") or ""))
+        ordered_exact.sort(key=lambda item: str(item["entry"].get("updated_at", "") or ""), reverse=True)
+        ordered_exact.sort(key=lambda item: paper_memory_kind_rank(item["entry"].get("kind", "")))
+        ordered_fallback.sort(key=lambda item: str(item["entry"].get("id", "") or ""))
+        ordered_fallback.sort(key=lambda item: str(item["entry"].get("updated_at", "") or ""), reverse=True)
+        ordered_fallback.sort(key=lambda item: paper_memory_kind_rank(item["entry"].get("kind", "")))
+        return [item["entry"] for item in [*ordered_exact, *ordered_fallback][:limit]]
+
+    tokens = [token for token in re.split(r"[^a-z0-9]+", normalized_query) if token]
+
+    def _score(item: dict[str, Any]) -> int:
+        entry = item["entry"]
+        haystack = str(item.get("search_text", "") or "")
+        title = str(entry.get("title", "") or "").lower()
+        score = 0
+        if normalized_query in haystack:
+            score += 120
+        for token in tokens:
+            if token in haystack:
+                score += 18
+            if token in title:
+                score += 6
+        if item.get("exact"):
+            score += 40
+        elif not str(entry.get("paper_version", "") or "").strip():
+            score += 8
+        kind = str(entry.get("kind", "") or "")
+        if kind == "summary":
+            score += 24
+        elif kind == "highlight":
+            score += 16
+        else:
+            score += 8
+        return score
+
+    ranked = [*exact_candidates, *fallback_candidates]
+    ranked.sort(key=lambda item: str(item["entry"].get("id", "") or ""))
+    ranked.sort(key=lambda item: str(item["entry"].get("updated_at", "") or ""), reverse=True)
+    ranked.sort(key=lambda item: _score(item), reverse=True)
+    return [item["entry"] for item in ranked[:limit]]
+
+
+def query_paper_memory(
+    paper_context: dict[str, Any],
+    *,
+    query: str = "",
+    limit: int = PAPER_MEMORY_QUERY_DEFAULT_LIMIT,
+    exclude_conversation_id: str = "",
+) -> dict[str, Any]:
+    workspace = build_paper_workspace(paper_context["source"], paper_context["paper_id"])
+    requested_version = normalize_paper_version(
+        paper_context.get("paper_version", "") or workspace.get("memory", {}).get("default_version", "")
+    )
+    normalized_limit = normalize_paper_memory_limit(limit)
+    exact_candidates, fallback_candidates = build_paper_memory_candidates(
+        workspace["paper"],
+        workspace["conversations"],
+        requested_version=requested_version,
+        exclude_conversation_id=exclude_conversation_id,
+    )
+    results = rank_paper_memory_candidates(
+        exact_candidates,
+        fallback_candidates,
+        query=query,
+        limit=normalized_limit,
+    )
+    return {
+        "paper": workspace["paper"],
+        "memory_version": requested_version,
+        "results": results,
+        "counts": {
+            "exact_version_count": len(exact_candidates),
+            "unversioned_fallback_count": len(fallback_candidates),
+        },
+    }
+
+
+def format_paper_memory_prompt_block(memory_result: dict[str, Any]) -> str:
+    results = memory_result.get("results") if isinstance(memory_result, dict) else None
+    if not isinstance(results, list) or not results:
+        return ""
+    version = normalize_paper_version(memory_result.get("memory_version", ""))
+    lines = ["[Paper Memory]"]
+    if version:
+        lines.append(f"Version: {version}")
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("source_label", "") or "").strip() or str(entry.get("kind", "") or "Memory").title()
+        title = compact_whitespace(str(entry.get("title", "") or ""), 120)
+        snippet = compact_text_block(str(entry.get("snippet", "") or ""), 280)
+        entry_version = normalize_paper_version(entry.get("paper_version", ""))
+        version_suffix = f" ({entry_version})" if entry_version else ""
+        if title and snippet and title.lower() not in snippet.lower():
+            lines.append(f"- {label}{version_suffix}: {title}: {snippet}")
+        elif snippet:
+            lines.append(f"- {label}{version_suffix}: {snippet}")
+        elif title:
+            lines.append(f"- {label}{version_suffix}: {title}")
+    return "\n".join(lines) if len(lines) > 1 else ""
 
 
 def handle_paper_highlights_capture(data: dict[str, Any]) -> dict[str, Any]:
@@ -7300,6 +7663,8 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 result = handle_paper_summary_request(data)
             elif path == "/papers/highlights_capture":
                 result = handle_paper_highlights_capture(data)
+            elif path == "/papers/memory_query":
+                result = handle_paper_memory_query(data)
             elif path == "/papers/summary_generate":
                 result = handle_paper_summary_generate(data)
             else:

@@ -266,6 +266,229 @@ class PaperHistoryMetadataBrokerTest(unittest.TestCase):
         self.assertEqual(["v2", "v1"], workspace["paper"]["observed_versions"])
         self.assertEqual("2507.20534", workspace["paper"]["paper_id"])
         self.assertEqual("Kimi K2: Open Agentic Intelligence", workspace["paper"]["title"])
+        self.assertIn("memory", workspace)
+
+    def test_paper_workspace_exposes_memory_metadata_by_version(self) -> None:
+        root = self._make_root("paper-memory-metadata-")
+        conversations = local_broker.ConversationStore(root)
+        papers = local_broker.PaperStateStore(root)
+        config = replace(local_broker.CONFIG, data_dir=root)
+
+        with patch.object(local_broker, "CONFIG", config):
+            with patch.object(local_broker, "CONVERSATIONS", conversations):
+                with patch.object(local_broker, "PAPERS", papers):
+                    with patch.object(local_broker, "now_iso", side_effect=self._monotonic_now_iso()):
+                        self._seed_versioned_conversation(conversations, "paper_v1", "2507.20534", "v1")
+                        self._seed_versioned_conversation(conversations, "paper_v2", "2507.20534", "v2")
+                        self._seed_versioned_conversation(conversations, "paper_unversioned", "2507.20534", "")
+                        papers.store_summary_result(
+                            "arxiv",
+                            "2507.20534",
+                            canonical_url="https://arxiv.org/abs/2507.20534",
+                            title="Kimi K2: Open Agentic Intelligence",
+                            conversation_id="paper_v2",
+                            paper_version="v2",
+                            summary="Sparse expert routing drives the main scaling story.",
+                        )
+                        papers.add_highlight(
+                            "arxiv",
+                            "2507.20534",
+                            canonical_url="https://arxiv.org/abs/2507.20534",
+                            title="Kimi K2: Open Agentic Intelligence",
+                            highlight={
+                                "kind": "explain_selection",
+                                "selection": "Kimi K2 uses sparse expert routing to scale capacity.",
+                                "prompt": "Explain the selected passage.",
+                                "response": "The routing mechanism preserves capacity without activating the full network.",
+                                "paper_version": "v2",
+                                "conversation_id": "paper_v2",
+                                "created_at": local_broker.now_iso(),
+                            },
+                        )
+
+                        workspace = local_broker.build_paper_workspace("arxiv", "2507.20534")
+
+        self.assertEqual("v2", workspace["memory"]["default_version"])
+        self.assertTrue(workspace["memory"]["has_unversioned"])
+        self.assertGreaterEqual(workspace["memory"]["counts_by_version"]["v2"], 3)
+        self.assertTrue(workspace["memory"]["latest_updated_at"])
+
+    def test_paper_memory_query_filters_versions_and_orders_results(self) -> None:
+        root = self._make_root("paper-memory-query-")
+        conversations = local_broker.ConversationStore(root)
+        papers = local_broker.PaperStateStore(root)
+        config = replace(local_broker.CONFIG, data_dir=root)
+
+        with patch.object(local_broker, "CONFIG", config):
+            with patch.object(local_broker, "CONVERSATIONS", conversations):
+                with patch.object(local_broker, "PAPERS", papers):
+                    with patch.object(local_broker, "now_iso", side_effect=self._monotonic_now_iso()):
+                        self._seed_versioned_conversation(
+                            conversations,
+                            "paper_v1",
+                            "2507.20534",
+                            "v1",
+                            focus_text="Legacy dense routing baseline.",
+                        )
+                        self._seed_versioned_conversation(
+                            conversations,
+                            "paper_v2",
+                            "2507.20534",
+                            "v2",
+                            focus_text="Sparse expert routing keeps compute efficient.",
+                        )
+                        self._seed_versioned_conversation(
+                            conversations,
+                            "paper_unversioned",
+                            "2507.20534",
+                            "",
+                            focus_text="General note about Kimi K2 routing.",
+                        )
+                        papers.store_summary_result(
+                            "arxiv",
+                            "2507.20534",
+                            canonical_url="https://arxiv.org/abs/2507.20534",
+                            title="Kimi K2: Open Agentic Intelligence",
+                            conversation_id="paper_v2",
+                            paper_version="v2",
+                            summary="Sparse expert routing is the key scaling mechanism in v2.",
+                        )
+                        papers.add_highlight(
+                            "arxiv",
+                            "2507.20534",
+                            canonical_url="https://arxiv.org/abs/2507.20534",
+                            title="Kimi K2: Open Agentic Intelligence",
+                            highlight={
+                                "kind": "explain_selection",
+                                "selection": "Sparse expert routing keeps compute efficient.",
+                                "prompt": "Why does sparse expert routing matter?",
+                                "response": "It routes tokens through a smaller active subset of the network.",
+                                "paper_version": "v2",
+                                "conversation_id": "paper_v2",
+                                "created_at": local_broker.now_iso(),
+                            },
+                        )
+
+                        result = local_broker.handle_paper_memory_query(
+                            {
+                                "paper": {
+                                    "source": "arxiv",
+                                    "paper_id": "2507.20534",
+                                    "canonical_url": "https://arxiv.org/abs/2507.20534",
+                                    "title": "Kimi K2: Open Agentic Intelligence",
+                                    "paper_version": "v2",
+                                    "versioned_url": "https://arxiv.org/abs/2507.20534v2",
+                                },
+                                "query": "sparse expert routing",
+                                "limit": 10,
+                            }
+                        )
+
+        self.assertEqual("v2", result["memory_version"])
+        self.assertEqual("summary", result["results"][0]["kind"])
+        self.assertEqual("highlight", result["results"][1]["kind"])
+        self.assertEqual(3, result["counts"]["exact_version_count"])
+        self.assertEqual(1, result["counts"]["unversioned_fallback_count"])
+        conversation_ids = [item["conversation_id"] for item in result["results"] if item["kind"] == "conversation"]
+        self.assertIn("paper_v2", conversation_ids)
+        self.assertIn("paper_unversioned", conversation_ids)
+        self.assertNotIn("paper_v1", conversation_ids)
+
+    def test_paper_memory_query_excludes_requested_conversation(self) -> None:
+        root = self._make_root("paper-memory-exclude-")
+        conversations = local_broker.ConversationStore(root)
+        papers = local_broker.PaperStateStore(root)
+        config = replace(local_broker.CONFIG, data_dir=root)
+
+        with patch.object(local_broker, "CONFIG", config):
+            with patch.object(local_broker, "CONVERSATIONS", conversations):
+                with patch.object(local_broker, "PAPERS", papers):
+                    with patch.object(local_broker, "now_iso", side_effect=self._monotonic_now_iso()):
+                        self._seed_versioned_conversation(conversations, "paper_v2_a", "2507.20534", "v2")
+                        self._seed_versioned_conversation(conversations, "paper_v2_b", "2507.20534", "v2")
+
+                        result = local_broker.handle_paper_memory_query(
+                            {
+                                "paper": {
+                                    "source": "arxiv",
+                                    "paper_id": "2507.20534",
+                                    "canonical_url": "https://arxiv.org/abs/2507.20534",
+                                    "title": "Kimi K2: Open Agentic Intelligence",
+                                    "paper_version": "v2",
+                                },
+                                "exclude_conversation_id": "paper_v2_b",
+                            }
+                        )
+
+        conversation_ids = [item["conversation_id"] for item in result["results"] if item["kind"] == "conversation"]
+        self.assertIn("paper_v2_a", conversation_ids)
+        self.assertNotIn("paper_v2_b", conversation_ids)
+
+    def test_run_start_injects_same_version_paper_memory_only(self) -> None:
+        root = self._make_root("paper-memory-run-")
+        manager = local_broker.CodexRunManager(root)
+        conversations = local_broker.ConversationStore(root)
+        papers = local_broker.PaperStateStore(root)
+        config = replace(
+            local_broker.CONFIG,
+            data_dir=root,
+            openai_api_key="test-key",
+            codex_cli_path=None,
+            codex_cli_logged_in=False,
+        )
+
+        with patch.object(local_broker, "CONFIG", config):
+            with patch.object(local_broker, "CONVERSATIONS", conversations):
+                with patch.object(local_broker, "PAPERS", papers):
+                    with patch.object(local_broker.EXTENSION_RELAY, "health", return_value={"connected_clients": 0}):
+                        with patch.object(local_broker.threading, "Thread", return_value=_FakeThread()):
+                            with patch.object(local_broker, "now_iso", side_effect=self._monotonic_now_iso()):
+                                self._seed_versioned_conversation(
+                                    conversations,
+                                    "paper_v1",
+                                    "2507.20534",
+                                    "v1",
+                                    focus_text="Legacy dense routing baseline.",
+                                )
+                                self._seed_versioned_conversation(
+                                    conversations,
+                                    "paper_v2",
+                                    "2507.20534",
+                                    "v2",
+                                    focus_text="Sparse expert routing keeps compute efficient.",
+                                )
+                                papers.store_summary_result(
+                                    "arxiv",
+                                    "2507.20534",
+                                    canonical_url="https://arxiv.org/abs/2507.20534",
+                                    title="Kimi K2: Open Agentic Intelligence",
+                                    conversation_id="paper_v2",
+                                    paper_version="v2",
+                                    summary="Sparse expert routing drives efficient scaling in v2.",
+                                )
+
+                                result = manager.start_run(
+                                    {
+                                        "session_id": "paper_memory_new_chat",
+                                        "backend": "codex",
+                                        "prompt": "How does sparse expert routing work?",
+                                        "confirmed": True,
+                                        "paper_context": {
+                                            "source": "arxiv",
+                                            "paper_id": "2507.20534",
+                                            "canonical_url": "https://arxiv.org/abs/2507.20534",
+                                            "title": "Kimi K2: Open Agentic Intelligence",
+                                            "paper_version": "v2",
+                                            "versioned_url": "https://arxiv.org/abs/2507.20534v2",
+                                        },
+                                    }
+                                )
+
+        run = manager._runs[result["run_id"]]
+        suffix = run["_request_prompt_suffix"]
+        self.assertIn("[Paper Memory]", suffix)
+        self.assertIn("Sparse expert routing", suffix)
+        self.assertNotIn("Legacy dense routing baseline.", suffix)
 
     def test_paper_highlights_capture_remains_idempotent_after_immediate_persistence(self) -> None:
         root = self._make_root("paper-history-highlights-")

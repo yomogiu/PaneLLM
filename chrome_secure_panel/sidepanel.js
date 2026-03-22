@@ -64,6 +64,12 @@ const state = {
   pendingPaperConversationRestoreKey: "",
   restoringPaperConversation: false,
   paperState: null,
+  paperMemoryResults: [],
+  paperMemoryQuery: "",
+  paperMemoryVersion: "",
+  paperMemoryLoading: false,
+  paperMemoryError: "",
+  paperMemoryRequestKey: "",
   modelsBusy: false,
   toolsBusy: false,
   toolsPolicy: null,
@@ -127,6 +133,7 @@ const modelsTabBtn = $("models-tab-btn");
 const toolsTabBtn = $("tools-tab-btn");
 const paperSummaryTabBtn = $("paper-summary-tab-btn");
 const paperHighlightsTabBtn = $("paper-highlights-tab-btn");
+const paperMemoryTabBtn = $("paper-memory-tab-btn");
 const paperChatTabBtn = $("paper-chat-tab-btn");
 const chatViewEl = $("chat-view");
 const modelsViewEl = $("models-view");
@@ -136,8 +143,12 @@ const paperContextMetaEl = $("paper-context-meta");
 const paperContextBadgeEl = $("paper-context-badge");
 const paperSummaryViewEl = $("paper-summary-view");
 const paperHighlightsViewEl = $("paper-highlights-view");
+const paperMemoryViewEl = $("paper-memory-view");
 const paperSummaryBodyEl = $("paper-summary-body");
 const paperHighlightsBodyEl = $("paper-highlights-body");
+const paperMemorySearchEl = $("paper-memory-search");
+const paperMemorySearchBtn = $("paper-memory-search-btn");
+const paperMemoryResultsEl = $("paper-memory-results");
 const mlxRefreshBtn = $("mlx-refresh-btn");
 const modelsBackendEl = $("models-backend");
 const mlxModelPathEl = $("mlx-model-path");
@@ -400,6 +411,55 @@ function normalizePaperPayload(value) {
   return null;
 }
 
+function normalizePaperMemoryMetadata(value) {
+  const raw = value && typeof value === "object" ? value : {};
+  const countsRaw = raw.counts_by_version && typeof raw.counts_by_version === "object"
+    ? raw.counts_by_version
+    : raw.countsByVersion && typeof raw.countsByVersion === "object"
+      ? raw.countsByVersion
+      : {};
+  const countsByVersion = {};
+  for (const [key, count] of Object.entries(countsRaw)) {
+    const version = normalizePaperVersionLabel(key);
+    const numericCount = Number(count);
+    if (version && Number.isFinite(numericCount) && numericCount > 0) {
+      countsByVersion[version] = Math.max(0, Math.trunc(numericCount));
+    }
+  }
+  return {
+    default_version: normalizePaperVersionLabel(raw.default_version || raw.defaultVersion || ""),
+    counts_by_version: countsByVersion,
+    has_unversioned: Boolean(raw.has_unversioned ?? raw.hasUnversioned),
+    latest_updated_at: String(raw.latest_updated_at || raw.latestUpdatedAt || "").trim()
+  };
+}
+
+function normalizePaperMemoryResultPayload(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const raw = value;
+  const kind = String(raw.kind || "").trim().toLowerCase();
+  if (!["summary", "highlight", "conversation"].includes(kind)) {
+    return null;
+  }
+  const title = String(raw.title || "").trim();
+  const snippet = String(raw.snippet || "").trim();
+  if (!title && !snippet) {
+    return null;
+  }
+  return {
+    id: String(raw.id || "").trim(),
+    kind,
+    paper_version: normalizePaperVersionLabel(raw.paper_version || raw.paperVersion || ""),
+    title,
+    snippet,
+    conversation_id: String(raw.conversation_id || raw.conversationId || "").trim(),
+    updated_at: String(raw.updated_at || raw.updatedAt || "").trim(),
+    source_label: String(raw.source_label || raw.sourceLabel || "").trim()
+  };
+}
+
 function papersEqual(left, right) {
   const leftPaper = normalizePaperPayload(left);
   const rightPaper = normalizePaperPayload(right);
@@ -418,6 +478,30 @@ function getPaperKey(paper) {
     return "";
   }
   return `${normalized.source}:${normalized.paper_id}`;
+}
+
+function getPaperMemoryVersion(paper = getEffectivePaper(), paperState = state.paperState) {
+  const normalized = normalizePaperPayload(paper);
+  const memory = normalizePaperMemoryMetadata(paperState?.memory);
+  return normalizePaperVersionLabel(normalized?.paper_version || memory.default_version || "");
+}
+
+function getPaperMemoryCountForVersion(paper, paperState = state.paperState) {
+  const version = getPaperMemoryVersion(paper, paperState);
+  if (!version) {
+    return 0;
+  }
+  const memory = normalizePaperMemoryMetadata(paperState?.memory);
+  return Number(memory.counts_by_version?.[version] || 0);
+}
+
+function resetPaperMemoryState() {
+  state.paperMemoryResults = [];
+  state.paperMemoryQuery = "";
+  state.paperMemoryVersion = "";
+  state.paperMemoryLoading = false;
+  state.paperMemoryError = "";
+  state.paperMemoryRequestKey = "";
 }
 
 function hasResolvedActiveTab() {
@@ -482,14 +566,137 @@ function getPaperMetaText(paper, paperState = state.paperState) {
   }
   const workspace = paperState && typeof paperState === "object" ? paperState : null;
   const relatedCount = Array.isArray(workspace?.conversations) ? workspace.conversations.length : 0;
+  const memoryCount = getPaperMemoryCountForVersion(normalized, workspace);
+  const memoryVersion = getPaperMemoryVersion(normalized, workspace);
   const summaryStatus = String(workspace?.paper?.summary_status || normalized.summary_status || "idle").trim().toLowerCase();
   if (summaryStatus === "requested") {
-    return `Summary requested. ${relatedCount} related chat${relatedCount === 1 ? "" : "s"} linked to this paper.`;
+    return memoryCount > 0 && memoryVersion
+      ? `Summary requested. ${relatedCount} related chat${relatedCount === 1 ? "" : "s"} linked to this paper. ${memoryCount} memory item${memoryCount === 1 ? "" : "s"} available for ${memoryVersion}.`
+      : `Summary requested. ${relatedCount} related chat${relatedCount === 1 ? "" : "s"} linked to this paper.`;
   }
-  if (relatedCount > 0) {
+  if (relatedCount > 0 || memoryCount > 0) {
+    if (memoryCount > 0 && memoryVersion) {
+      return `${relatedCount} related chat${relatedCount === 1 ? "" : "s"} found for this paper. ${memoryCount} memory item${memoryCount === 1 ? "" : "s"} ready for ${memoryVersion}.`;
+    }
     return `${relatedCount} related chat${relatedCount === 1 ? "" : "s"} found for this paper.`;
   }
   return "This paper is ready for a focused workspace. Start chatting to create the first linked session.";
+}
+
+function renderPaperMemoryPanel() {
+  if (paperMemorySearchEl) {
+    paperMemorySearchEl.value = state.paperMemoryQuery;
+  }
+  if (!paperMemoryResultsEl) {
+    return;
+  }
+  paperMemoryResultsEl.textContent = "";
+
+  const paper = getEffectivePaper();
+  const version = getPaperMemoryVersion(paper);
+  if (paperMemorySearchEl) {
+    paperMemorySearchEl.disabled = state.paperMemoryLoading || !paper;
+  }
+  if (paperMemorySearchBtn) {
+    paperMemorySearchBtn.disabled = state.paperMemoryLoading || !paper;
+  }
+
+  if (!paper) {
+    const empty = document.createElement("p");
+    empty.className = "paper-body-copy";
+    empty.textContent = "Open an arXiv paper to search paper memory.";
+    paperMemoryResultsEl.appendChild(empty);
+    return;
+  }
+  if (!version) {
+    const empty = document.createElement("p");
+    empty.className = "paper-body-copy";
+    empty.textContent = "No version-specific memory is available for this paper yet.";
+    paperMemoryResultsEl.appendChild(empty);
+    return;
+  }
+  if (state.paperMemoryLoading) {
+    const loading = document.createElement("p");
+    loading.className = "paper-body-copy";
+    loading.textContent = `Loading paper memory for ${version}...`;
+    paperMemoryResultsEl.appendChild(loading);
+    return;
+  }
+  if (state.paperMemoryError) {
+    const error = document.createElement("p");
+    error.className = "paper-body-copy";
+    error.textContent = state.paperMemoryError;
+    paperMemoryResultsEl.appendChild(error);
+    return;
+  }
+  if (!state.paperMemoryResults.length) {
+    const empty = document.createElement("p");
+    empty.className = "paper-body-copy";
+    empty.textContent = state.paperMemoryQuery
+      ? "No paper memory matched that query."
+      : `No version-specific memory stored yet for ${version}.`;
+    paperMemoryResultsEl.appendChild(empty);
+    return;
+  }
+
+  const list = document.createElement("div");
+  list.className = "paper-memory-results";
+  for (const item of state.paperMemoryResults) {
+    const card = document.createElement("article");
+    card.className = "paper-memory-card";
+
+    const header = document.createElement("div");
+    header.className = "paper-memory-card-header";
+
+    const copy = document.createElement("div");
+    copy.className = "paper-memory-card-copy";
+
+    const title = document.createElement("p");
+    title.className = "paper-memory-card-title";
+    title.textContent = item.title || item.source_label || "Paper memory";
+    copy.appendChild(title);
+
+    const badges = document.createElement("div");
+    badges.className = "paper-memory-badges";
+
+    const kindBadge = document.createElement("span");
+    kindBadge.className = "status-badge paper-memory-kind-badge";
+    kindBadge.textContent = item.source_label || item.kind;
+    badges.appendChild(kindBadge);
+
+    if (item.paper_version) {
+      const versionBadge = document.createElement("span");
+      versionBadge.className = "status-badge paper-highlight-version-badge";
+      versionBadge.textContent = item.paper_version;
+      badges.appendChild(versionBadge);
+    }
+
+    header.appendChild(copy);
+    header.appendChild(badges);
+    card.appendChild(header);
+
+    const snippet = document.createElement("p");
+    snippet.className = "paper-memory-card-snippet";
+    snippet.textContent = item.snippet;
+    card.appendChild(snippet);
+
+    if (item.kind === "conversation" && item.conversation_id) {
+      const actions = document.createElement("div");
+      actions.className = "button-row";
+      const openBtn = document.createElement("button");
+      openBtn.type = "button";
+      openBtn.className = "ghost small";
+      openBtn.textContent = "Open Chat";
+      openBtn.addEventListener("click", async () => {
+        await loadConversation(item.conversation_id);
+      });
+      actions.appendChild(openBtn);
+      card.appendChild(actions);
+    }
+
+    list.appendChild(card);
+  }
+  paperMemoryResultsEl.appendChild(list);
 }
 
 function renderPaperWorkspace() {
@@ -648,15 +855,18 @@ function renderPaperWorkspace() {
       paperHighlightsBodyEl.appendChild(body);
     }
   }
+
+  renderPaperMemoryPanel();
 }
 
 function setPaperTab(tab) {
-  const next = tab === "summary" || tab === "highlights" ? tab : "chat";
+  const next = tab === "summary" || tab === "highlights" || tab === "memory" ? tab : "chat";
   state.activePaperTab = next;
 
   const tabConfig = [
     { key: "chat", button: paperChatTabBtn, panel: null },
     { key: "highlights", button: paperHighlightsTabBtn, panel: paperHighlightsViewEl },
+    { key: "memory", button: paperMemoryTabBtn, panel: paperMemoryViewEl },
     { key: "summary", button: paperSummaryTabBtn, panel: paperSummaryViewEl }
   ];
 
@@ -677,6 +887,9 @@ function setPaperTab(tab) {
   confirmWrap?.setAttribute("aria-hidden", String(!chatVisible || !state.pendingConfirmation));
   composerEl?.classList.toggle("hidden", !chatVisible);
   composerEl?.setAttribute("aria-hidden", String(!chatVisible));
+  if (next === "memory") {
+    void refreshPaperMemory(false);
+  }
 }
 
 function triggerHighlightsTabGlow() {
@@ -847,6 +1060,7 @@ async function refreshPaperState() {
   const paper = getEffectivePaper();
   if (!paper) {
     state.paperState = null;
+    resetPaperMemoryState();
     renderPaperWorkspace();
     renderHistory(state.sessionId);
     return;
@@ -862,12 +1076,14 @@ async function refreshPaperState() {
     }
     state.paperState = {
       paper: normalizePaperPayload(result.paper),
-      conversations: Array.isArray(result.conversations) ? result.conversations : []
+      conversations: Array.isArray(result.conversations) ? result.conversations : [],
+      memory: normalizePaperMemoryMetadata(result.memory)
     };
   } catch (error) {
     state.paperState = {
       paper,
       conversations: [],
+      memory: normalizePaperMemoryMetadata(null),
       error: String(error.message || error)
     };
   }
@@ -876,6 +1092,9 @@ async function refreshPaperState() {
   }
   renderPaperWorkspace();
   renderHistory(state.sessionId);
+  if (state.activePaperTab === "memory") {
+    void refreshPaperMemory(true);
+  }
 }
 
 async function syncPaperContext() {
@@ -1483,8 +1702,24 @@ paperHighlightsTabBtn?.addEventListener("click", () => {
   setPaperTab("highlights");
 });
 
+paperMemoryTabBtn?.addEventListener("click", () => {
+  setPaperTab("memory");
+});
+
 paperChatTabBtn?.addEventListener("click", () => {
   setPaperTab("chat");
+});
+
+paperMemorySearchBtn?.addEventListener("click", async () => {
+  await refreshPaperMemory(true);
+});
+
+paperMemorySearchEl?.addEventListener("keydown", async (event) => {
+  if (event.key !== "Enter") {
+    return;
+  }
+  event.preventDefault();
+  await refreshPaperMemory(true);
 });
 
 confirmBtn.addEventListener("click", async () => {
@@ -1716,6 +1951,77 @@ async function refreshHistory(selectedId = null) {
     renderHistory(selectedId ?? state.sessionId);
   } catch (error) {
     appendMessage("system", `History load failed: ${String(error.message || error)}`);
+  }
+}
+
+async function refreshPaperMemory(force = false) {
+  const paper = getEffectivePaper();
+  const version = getPaperMemoryVersion(paper);
+  const query = String(paperMemorySearchEl?.value ?? state.paperMemoryQuery ?? "").trim();
+  const requestKey = paper ? `${getPaperKey(paper)}:${version}:${query}` : "";
+
+  if (!paper) {
+    resetPaperMemoryState();
+    renderPaperMemoryPanel();
+    return;
+  }
+  if (!version) {
+    state.paperMemoryResults = [];
+    state.paperMemoryQuery = query;
+    state.paperMemoryVersion = "";
+    state.paperMemoryLoading = false;
+    state.paperMemoryError = "";
+    state.paperMemoryRequestKey = requestKey;
+    renderPaperMemoryPanel();
+    return;
+  }
+  if (!force && requestKey && requestKey === state.paperMemoryRequestKey && !state.paperMemoryError) {
+    renderPaperMemoryPanel();
+    return;
+  }
+
+  state.paperMemoryLoading = true;
+  state.paperMemoryError = "";
+  state.paperMemoryResults = [];
+  state.paperMemoryQuery = query;
+  state.paperMemoryVersion = version;
+  state.paperMemoryRequestKey = requestKey;
+  renderPaperMemoryPanel();
+
+  const requestPaper = {
+    ...paper,
+    paper_version: version,
+    versioned_url: paper.versioned_url || (paper.paper_id ? `https://arxiv.org/abs/${paper.paper_id}${version}` : "")
+  };
+
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.paper.memory_query",
+      paper: requestPaper,
+      query,
+      limit: 8,
+      excludeConversationId: state.sessionId
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Failed to load paper memory.");
+    }
+    if (state.paperMemoryRequestKey !== requestKey) {
+      return;
+    }
+    state.paperMemoryVersion = normalizePaperVersionLabel(result.memory_version || version);
+    state.paperMemoryResults = Array.isArray(result.results)
+      ? result.results.map((item) => normalizePaperMemoryResultPayload(item)).filter(Boolean)
+      : [];
+  } catch (error) {
+    if (state.paperMemoryRequestKey !== requestKey) {
+      return;
+    }
+    state.paperMemoryError = `Paper memory load failed: ${String(error.message || error)}`;
+  } finally {
+    if (state.paperMemoryRequestKey === requestKey) {
+      state.paperMemoryLoading = false;
+      renderPaperMemoryPanel();
+    }
   }
 }
 
@@ -3650,6 +3956,7 @@ function renderHistory(selectedId) {
   const relatedPaperChats = Array.isArray(visibleWorkspace?.conversations) ? visibleWorkspace.conversations : [];
   const relatedIds = new Set(relatedPaperChats.map((conversation) => String(conversation?.id || "")));
   const remainingChats = state.conversationList.filter((conversation) => !relatedIds.has(String(conversation?.id || "")));
+  const activeVersion = normalizePaperVersionLabel(getEffectivePaper()?.paper_version || "");
 
   if (!relatedPaperChats.length && !state.conversationList.length) {
     const empty = document.createElement("p");
@@ -3659,7 +3966,21 @@ function renderHistory(selectedId) {
     return;
   }
 
-  appendHistorySection("This Paper", relatedPaperChats, selectedId);
+  if (activeVersion) {
+    const sameVersionChats = relatedPaperChats.filter((conversation) => {
+      const paper = getConversationPaperSnapshot(conversation);
+      return normalizePaperVersionLabel(paper?.paper_version || "") === activeVersion;
+    });
+    const samePaperOtherVersionChats = relatedPaperChats.filter((conversation) => {
+      const paper = getConversationPaperSnapshot(conversation);
+      const version = normalizePaperVersionLabel(paper?.paper_version || "");
+      return version !== activeVersion;
+    });
+    appendHistorySection("This Version", sameVersionChats, selectedId);
+    appendHistorySection("Same Paper", samePaperOtherVersionChats, selectedId);
+  } else {
+    appendHistorySection("This Paper", relatedPaperChats, selectedId);
+  }
   appendHistorySection(relatedPaperChats.length ? "All Chats" : "Chats", remainingChats.length ? remainingChats : state.conversationList, selectedId);
 }
 
@@ -3769,7 +4090,8 @@ async function maybeRequestPaperSummaryBeforeNewChat() {
   }
   state.paperState = {
     paper: normalizePaperPayload(result.paper),
-    conversations: Array.isArray(result.conversations) ? result.conversations : []
+    conversations: Array.isArray(result.conversations) ? result.conversations : [],
+    memory: normalizePaperMemoryMetadata(result.memory)
   };
   renderPaperWorkspace();
   renderHistory(state.sessionId);
@@ -3802,7 +4124,8 @@ async function requestPaperSummaryGeneration() {
 
     state.paperState = {
       paper: normalizePaperPayload(result.paper),
-      conversations: Array.isArray(result.conversations) ? result.conversations : []
+      conversations: Array.isArray(result.conversations) ? result.conversations : [],
+      memory: normalizePaperMemoryMetadata(result.memory)
     };
     renderPaperWorkspace();
     renderHistory(state.sessionId);

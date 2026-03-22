@@ -229,6 +229,77 @@ body::before {
   color: #b7c9f8;
 }
 
+.paper-memory-body {
+  gap: 14px;
+}
+
+.paper-memory-search {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.paper-memory-search input {
+  flex: 1;
+}
+
+.paper-memory-results {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.paper-memory-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid rgba(49, 212, 255, 0.18);
+  border-radius: 12px;
+  background:
+    linear-gradient(145deg, rgba(49, 212, 255, 0.08), rgba(255, 95, 200, 0.05)),
+    rgba(13, 20, 36, 0.92);
+}
+
+.paper-memory-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.paper-memory-card-copy {
+  min-width: 0;
+}
+
+.paper-memory-card-title {
+  margin: 0;
+  font-size: calc(12px * var(--font-scale));
+  line-height: 1.4;
+  color: var(--text);
+}
+
+.paper-memory-card-snippet {
+  margin: 0;
+  font-size: calc(12px * var(--font-scale));
+  line-height: 1.5;
+  color: var(--muted);
+  white-space: pre-wrap;
+}
+
+.paper-memory-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.paper-memory-kind-badge {
+  border-color: rgba(117, 240, 188, 0.26);
+  color: #dfffee;
+}
+
 .paper-summary-actions {
   margin-top: 4px;
 }

@@ -96,6 +96,9 @@ async function handleMessage(message) {
   if (message.type === "assistant.paper.get") {
     return await getPaperWorkspace(message);
   }
+  if (message.type === "assistant.paper.memory_query") {
+    return await queryPaperMemory(message);
+  }
   if (message.type === "assistant.paper.summary_request") {
     return await requestPaperSummary(message);
   }
@@ -449,6 +452,24 @@ async function requestPaperSummary(message) {
         ? message.conversationId
         : typeof message.conversation_id === "string"
           ? message.conversation_id
+          : ""
+  });
+}
+
+async function queryPaperMemory(message) {
+  const paper = message?.paper && typeof message.paper === "object" ? message.paper : null;
+  if (!paper) {
+    throw new Error("paper is required.");
+  }
+  return await brokerRequest("POST", "/papers/memory_query", {
+    paper,
+    query: typeof message?.query === "string" ? message.query : "",
+    limit: Number.isFinite(Number(message?.limit)) ? Number(message.limit) : 8,
+    exclude_conversation_id:
+      typeof message?.excludeConversationId === "string"
+        ? message.excludeConversationId
+        : typeof message?.exclude_conversation_id === "string"
+          ? message.exclude_conversation_id
           : ""
   });
 }
