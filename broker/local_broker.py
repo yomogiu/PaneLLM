@@ -80,9 +80,10 @@ LLAMA_HEALTHCHECK_TIMEOUT_SEC = 0.35
 from broker.services import read_assistant as read_assistant_service
 
 DEFAULT_LLAMA_MODEL = "glm-4.7-flash-llamacpp"
-BROWSER_AGENT_MAX_STEPS_DEFAULT = 20
+BROWSER_AGENT_MAX_STEPS_DEFAULT = 0
 BROWSER_AGENT_MAX_STEPS_MIN = 1
 BROWSER_AGENT_MAX_STEPS_MAX = 40
+UNLIMITED_BROWSER_AGENT_STEPS = 0
 CODEX_RUN_TERMINAL_STATUSES = {
     "completed",
     "failed",
@@ -1798,7 +1799,7 @@ class BrowserConfigManager:
     def __init__(self, data_dir: Path) -> None:
         self._lock = threading.Lock()
         self._config_path = data_dir / "browser_config.json"
-        self._agent_max_steps = BROWSER_AGENT_MAX_STEPS_DEFAULT
+        self._agent_max_steps = UNLIMITED_BROWSER_AGENT_STEPS
         self._load_persisted_config()
 
     def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
@@ -1821,9 +1822,9 @@ class BrowserConfigManager:
             parsed = int(value)
         except (TypeError, ValueError) as error:
             raise ValueError("agent_max_steps must be an integer.") from error
-        if parsed < BROWSER_AGENT_MAX_STEPS_MIN or parsed > BROWSER_AGENT_MAX_STEPS_MAX:
+        if parsed < UNLIMITED_BROWSER_AGENT_STEPS:
             raise ValueError(
-                f"agent_max_steps must be between {BROWSER_AGENT_MAX_STEPS_MIN} and {BROWSER_AGENT_MAX_STEPS_MAX}."
+                "agent_max_steps must be 0 (unlimited) or a positive integer."
             )
         return parsed
 
@@ -1833,7 +1834,7 @@ class BrowserConfigManager:
             "limits": {
                 "agent_max_steps": {
                     "min": BROWSER_AGENT_MAX_STEPS_MIN,
-                    "max": BROWSER_AGENT_MAX_STEPS_MAX,
+                    "max": None,
                 }
             },
         }
@@ -1846,7 +1847,7 @@ class BrowserConfigManager:
         try:
             self._agent_max_steps = self._normalize_agent_max_steps(raw_steps)
         except ValueError:
-            self._agent_max_steps = BROWSER_AGENT_MAX_STEPS_DEFAULT
+            self._agent_max_steps = UNLIMITED_BROWSER_AGENT_STEPS
 
     def _save_persisted_config_locked(self) -> None:
         self._write_json(
@@ -5115,10 +5116,15 @@ def run_local_backend_browser_agent(
         *messages,
     ]
 
+    remaining_steps = int(max_steps)
+    if remaining_steps < 0:
+        raise ValueError("max_steps must be a non-negative integer.")
+    infinite_mode = remaining_steps == UNLIMITED_BROWSER_AGENT_STEPS
     try:
-        for _ in range(max(1, int(max_steps))):
+        while infinite_mode or remaining_steps > 0:
             if cancel_check and cancel_check():
                 raise RouteRequestCancelledError("Request cancelled by user.")
+
             response = call_local_backend_completion(
                 backend,
                 agent_messages,
@@ -5191,6 +5197,8 @@ def run_local_backend_browser_agent(
                         "content": json.dumps(tool_payload),
                     }
                 )
+            if not infinite_mode:
+                remaining_steps -= 1
     finally:
         BROWSER_AUTOMATION.close_session(session["sessionId"], run["runId"])
 

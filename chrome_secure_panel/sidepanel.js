@@ -1928,10 +1928,13 @@ function normalizeBrowserConfig(config) {
     limitsRaw.agent_max_steps && typeof limitsRaw.agent_max_steps === "object"
       ? limitsRaw.agent_max_steps
       : {};
-  const min = Number.isInteger(Number(stepLimitsRaw.min)) ? Number(stepLimitsRaw.min) : 1;
-  const max = Number.isInteger(Number(stepLimitsRaw.max)) ? Number(stepLimitsRaw.max) : 40;
-  const configured = Number.parseInt(String(raw.agent_max_steps ?? 20), 10);
-  const agentMaxSteps = Number.isInteger(configured) ? configured : 20;
+  const min = Number.isInteger(Number(stepLimitsRaw.min)) && Number(stepLimitsRaw.min) >= 1
+    ? Number(stepLimitsRaw.min)
+    : 1;
+  const parsedMax = Number(stepLimitsRaw.max);
+  const max = Number.isInteger(parsedMax) && parsedMax > 0 ? parsedMax : null;
+  const configured = Number.parseInt(String(raw.agent_max_steps ?? 0), 10);
+  const agentMaxSteps = Number.isInteger(configured) && configured >= 0 ? configured : 0;
   return {
     agent_max_steps: agentMaxSteps,
     limits: {
@@ -1947,8 +1950,12 @@ function renderBrowserConfig(config) {
   const normalized = normalizeBrowserConfig(config);
   state.toolsBrowserConfig = normalized;
   if (toolsAgentMaxStepsEl) {
-    toolsAgentMaxStepsEl.min = String(normalized.limits.agent_max_steps.min);
-    toolsAgentMaxStepsEl.max = String(normalized.limits.agent_max_steps.max);
+    toolsAgentMaxStepsEl.min = "0";
+    if (normalized.limits.agent_max_steps.max === null) {
+      toolsAgentMaxStepsEl.removeAttribute("max");
+    } else {
+      toolsAgentMaxStepsEl.max = String(normalized.limits.agent_max_steps.max);
+    }
     toolsAgentMaxStepsEl.value = String(normalized.agent_max_steps);
   }
 }
@@ -2185,14 +2192,23 @@ async function runHostPolicyAction(message, successStatus) {
 }
 
 async function applyBrowserConfigFromInputs() {
-  const limits = state.toolsBrowserConfig?.limits?.agent_max_steps || { min: 1, max: 40 };
+  const limits = state.toolsBrowserConfig?.limits?.agent_max_steps || { min: 1, max: null };
+  const hasFiniteMax = Number.isInteger(limits.max) && limits.max > 0;
   const parsed = Number.parseInt(String(toolsAgentMaxStepsEl?.value || "").trim(), 10);
   if (!Number.isInteger(parsed)) {
     updateToolsStatus("Agent max steps must be an integer.");
     return;
   }
-  if (parsed < limits.min || parsed > limits.max) {
-    updateToolsStatus(`Agent max steps must be between ${limits.min} and ${limits.max}.`);
+  if (parsed < 0) {
+    updateToolsStatus("Agent max steps must be 0 (unlimited) or a positive integer.");
+    return;
+  }
+  if (parsed > 0 && parsed < limits.min) {
+    updateToolsStatus(`Agent max steps must be at least ${limits.min} or 0 for unlimited.`);
+    return;
+  }
+  if (hasFiniteMax && parsed > limits.max) {
+    updateToolsStatus(`Agent max steps must be at most ${limits.max}.`);
     return;
   }
 

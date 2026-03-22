@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import tempfile
+from pathlib import Path
 import unittest
 from dataclasses import replace
 from urllib.error import HTTPError, URLError
@@ -431,6 +432,38 @@ class ThinkingParsingTest(unittest.TestCase):
         self.assertEqual("Need to compare the options.", reasoning)
         self.assertIn(("", "Need to compare the options."), states)
         self.assertEqual(("Final answer.", "Need to compare the options."), states[-1])
+
+
+class BrowserConfigTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.config_dir = tempfile.mkdtemp(prefix="assist-test-browser-config-")
+        self.addCleanup(shutil.rmtree, self.config_dir, ignore_errors=True)
+        self.manager = local_broker.BrowserConfigManager(Path(self.config_dir))
+
+    def test_default_browser_config_is_unlimited(self) -> None:
+        payload = self.manager.config()
+        self.assertEqual(0, payload["agent_max_steps"])
+        self.assertEqual(1, payload["limits"]["agent_max_steps"]["min"])
+        self.assertIsNone(payload["limits"]["agent_max_steps"]["max"])
+
+    def test_update_browser_agent_steps_accepts_unlimited_and_large_values(self) -> None:
+        unlimited = self.manager.update_config({"agent_max_steps": 0})
+        self.assertEqual(0, unlimited["agent_max_steps"])
+
+        large = self.manager.update_config({"agent_max_steps": 500})
+        self.assertEqual(500, large["agent_max_steps"])
+        reloaded = local_broker.BrowserConfigManager(Path(self.config_dir))
+        self.assertEqual(500, reloaded.agent_max_steps())
+
+    def test_update_browser_agent_steps_rejects_negative_values(self) -> None:
+        with self.assertRaises(ValueError):
+            self.manager.update_config({"agent_max_steps": -1})
+
+    def test_invalid_persisted_browser_config_defaults_to_unlimited(self) -> None:
+        config_path = Path(self.config_dir) / "browser_config.json"
+        config_path.write_text('{"agent_max_steps": -3}', encoding="utf-8")
+        reloaded = local_broker.BrowserConfigManager(Path(self.config_dir))
+        self.assertEqual(0, reloaded.agent_max_steps())
 
     def test_start_run_persists_llama_reasoning_controls(self) -> None:
         manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
