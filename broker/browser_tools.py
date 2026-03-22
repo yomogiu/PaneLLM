@@ -24,7 +24,8 @@ BROWSER_LOCATOR_SCHEMA = {
     "additionalProperties": False,
 }
 
-_TOOL_SPECS: tuple[dict[str, Any], ...] = (
+# TODO: deprecate/remove direct low-level model exposure after compact browser tool rollout.
+INTERNAL_BROWSER_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     {
         "name": "browser.navigate",
         "method": "navigate",
@@ -342,25 +343,138 @@ _TOOL_SPECS: tuple[dict[str, Any], ...] = (
     },
 )
 
+MODEL_BROWSER_TOOL_SPECS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "browser.navigate",
+        "description": "Navigate the current tab to an allowlisted absolute URL. Open a new tab only when the user explicitly asks for one or preserving the current page matters.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "newTab": {"type": "boolean"},
+                "tabId": {"type": "integer"},
+            },
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "browser.tabs",
+        "description": "List, activate, close, or group allowlisted tabs.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "activate", "close", "group"],
+                },
+                "tabId": {"type": "integer"},
+                "tabIds": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                },
+                "groupName": {"type": "string"},
+                "color": {"type": "string"},
+                "collapsed": {"type": "boolean"},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "browser.read",
+        "description": "Read the current page, inspect an element, or find matching elements on the page.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["page_digest", "raw_html", "find", "state"],
+                },
+                "tabId": {"type": "integer"},
+                "selector": {"type": "string"},
+                "locator": BROWSER_LOCATOR_SCHEMA,
+                "limit": {"type": "integer"},
+                "maxChars": {"type": "integer"},
+                "maxItems": {"type": "integer"},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "browser.interact",
+        "description": "Interact with the page by clicking, typing, pressing keys, scrolling, highlighting, waiting, or selecting an option.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "click",
+                        "type",
+                        "press_key",
+                        "scroll",
+                        "highlight",
+                        "wait_for",
+                        "select_option",
+                    ],
+                },
+                "tabId": {"type": "integer"},
+                "selector": {"type": "string"},
+                "locator": BROWSER_LOCATOR_SCHEMA,
+                "text": {"type": "string"},
+                "clear": {"type": "boolean"},
+                "key": {"type": "string"},
+                "modifiers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "repeat": {"type": "integer"},
+                "delayMs": {"type": "integer"},
+                "deltaX": {"type": "number"},
+                "deltaY": {"type": "number"},
+                "condition": {
+                    "type": "string",
+                    "enum": ["present", "visible", "hidden", "gone"],
+                },
+                "timeoutMs": {"type": "integer"},
+                "pollMs": {"type": "integer"},
+                "value": {"type": "string"},
+                "optionIndex": {"type": "integer"},
+                "scroll": {"type": "boolean"},
+                "durationMs": {"type": "integer"},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+    },
+)
+
 
 def _copy(value: Any) -> Any:
     return deepcopy(value)
 
 
 def proxied_browser_tool_specs() -> list[dict[str, Any]]:
-    return [_copy(spec) for spec in _TOOL_SPECS]
+    return [_copy(spec) for spec in INTERNAL_BROWSER_TOOL_SPECS]
 
 
-PROXIED_BROWSER_TOOL_NAMES = {spec["name"] for spec in _TOOL_SPECS}
-BROWSER_COMMAND_METHODS = {spec["name"]: spec["method"] for spec in _TOOL_SPECS}
-CODEX_AUTO_APPROVE_TOOLS = {spec["name"] for spec in _TOOL_SPECS if spec["approval"] == "auto"}
-CODEX_MANUAL_APPROVAL_TOOLS = {spec["name"] for spec in _TOOL_SPECS if spec["approval"] == "manual"}
+PROXIED_BROWSER_TOOL_NAMES = {spec["name"] for spec in INTERNAL_BROWSER_TOOL_SPECS}
+BROWSER_COMMAND_METHODS = {spec["name"]: spec["method"] for spec in INTERNAL_BROWSER_TOOL_SPECS}
+MODEL_BROWSER_TOOL_NAMES = {spec["name"] for spec in MODEL_BROWSER_TOOL_SPECS}
+INTERNAL_AUTO_APPROVE_TOOL_NAMES = {
+    spec["name"] for spec in INTERNAL_BROWSER_TOOL_SPECS if spec["approval"] == "auto"
+}
+INTERNAL_MANUAL_APPROVE_TOOL_NAMES = {
+    spec["name"] for spec in INTERNAL_BROWSER_TOOL_SPECS if spec["approval"] == "manual"
+}
 
 
 def build_openai_function_tools(
     specs: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
 ) -> list[dict[str, Any]]:
-    source = specs or _TOOL_SPECS
+    source = specs or MODEL_BROWSER_TOOL_SPECS
     return [
         {
             "type": "function",
@@ -396,7 +510,7 @@ def build_responses_function_tools(
 def build_mcp_tool_definitions(
     specs: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
 ) -> list[dict[str, Any]]:
-    source = specs or _TOOL_SPECS
+    source = specs or INTERNAL_BROWSER_TOOL_SPECS
     return [
         {
             "name": str(spec["name"]),
@@ -407,6 +521,6 @@ def build_mcp_tool_definitions(
     ]
 
 
-LLAMA_BROWSER_TOOLS = build_openai_function_tools()
+LLAMA_BROWSER_TOOLS = build_openai_function_tools(MODEL_BROWSER_TOOL_SPECS)
 CODEX_BROWSER_TOOLS = build_responses_function_tools(LLAMA_BROWSER_TOOLS)
-PROXIED_TOOL_DEFINITIONS = build_mcp_tool_definitions()
+PROXIED_TOOL_DEFINITIONS = build_mcp_tool_definitions(INTERNAL_BROWSER_TOOL_SPECS)

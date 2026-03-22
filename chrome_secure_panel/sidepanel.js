@@ -50,6 +50,25 @@ const state = {
   paperMemoryLoading: false,
   paperMemoryError: "",
   paperMemoryRequestKey: "",
+  browserActionArmed: false,
+  browserActionArmedReason: "",
+  browserPickerActive: false,
+  browserPickerRequestId: "",
+  browserPickerLatest: null,
+  browserPickerHistory: [],
+  browserPickerError: "",
+  browserElementContextForNextMessage: null,
+  browserAutomationStatus: {
+    label: "Idle",
+    text: "Browser actions are idle.",
+    detail: ""
+  },
+  browserAutomationLastToolSummary: "",
+  browserAutomationLastToolResult: "",
+  browserAutomationLastToolError: "",
+  browserPendingApprovals: new Map(),
+  // TODO: deprecate/remove after Browser tab migration. These names still back the Browser workspace
+  // because they also drive read-assistant and paper-context behavior.
   toolsBusy: false,
   toolsPolicy: null,
   toolsActiveTab: null,
@@ -77,7 +96,6 @@ const promptEl = $("prompt");
 const composerEl = document.querySelector(".composer");
 const backendEl = $("backend");
 const includePageContextEl = $("include-page-context");
-const forceBrowserActionEl = $("force-browser-action");
 const llamaThinkingControlsEl = $("llama-thinking-controls");
 const llamaThinkingToggleEl = $("llama-thinking-toggle");
 const llamaEnableThinkingEl = $("llama-enable-thinking");
@@ -97,13 +115,13 @@ const actionConfirmTextEl = $("action-confirm-text");
 const actionConfirmBtn = $("action-confirm-btn");
 const actionCancelBtn = $("action-cancel-btn");
 const chatTabBtn = $("chat-tab-btn");
-const toolsTabBtn = $("tools-tab-btn");
+const browserTabBtn = $("browser-tab-btn");
 const paperSummaryTabBtn = $("paper-summary-tab-btn");
 const paperHighlightsTabBtn = $("paper-highlights-tab-btn");
 const paperMemoryTabBtn = $("paper-memory-tab-btn");
 const paperChatTabBtn = $("paper-chat-tab-btn");
 const chatViewEl = $("chat-view");
-const toolsViewEl = $("tools-view");
+const browserViewEl = $("browser-view");
 const paperContextTitleEl = $("paper-context-title");
 const paperContextMetaEl = $("paper-context-meta");
 const paperContextBadgeEl = $("paper-context-badge");
@@ -115,6 +133,19 @@ const paperHighlightsBodyEl = $("paper-highlights-body");
 const paperMemorySearchEl = $("paper-memory-search");
 const paperMemorySearchBtn = $("paper-memory-search-btn");
 const paperMemoryResultsEl = $("paper-memory-results");
+const browserNextActionIndicatorEl = $("browser-next-action-indicator");
+const browserCurrentPageTitleEl = $("browser-current-page-title");
+const browserCurrentPageUrlEl = $("browser-current-page-url");
+const browserPickerStatusEl = $("browser-picker-status");
+const browserPickerStartBtn = $("browser-picker-start-btn");
+const browserPickerCancelBtn = $("browser-picker-cancel-btn");
+const browserPickedElementEl = $("browser-picked-element");
+const browserPickedHistoryEl = $("browser-picked-history");
+const browserAutomationStatusEl = $("browser-automation-status");
+const browserAutomationArmBtn = $("browser-arm-next-btn");
+const browserAutomationSummaryEl = $("browser-automation-summary");
+const browserAutomationApprovalsEl = $("browser-automation-approvals");
+// TODO: deprecate/remove after Browser tab migration. These controls now live in the Browser workspace.
 const toolsRefreshBtn = $("tools-refresh-btn");
 const toolsPolicyStatusEl = $("tools-policy-status");
 const toolsHostInputEl = $("tools-host-input");
@@ -152,6 +183,84 @@ function compactInlineText(value, limit = 160) {
     return text;
   }
   return `${text.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
+}
+
+function normalizeComparableUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || "").trim());
+    if (!SAFE_LINK_PROTOCOLS.has(parsed.protocol)) {
+      return "";
+    }
+    return `${parsed.origin}${parsed.pathname}${parsed.search}`;
+  } catch {
+    return "";
+  }
+}
+
+function sameDocumentUrl(left, right) {
+  const leftNormalized = normalizeComparableUrl(left);
+  const rightNormalized = normalizeComparableUrl(right);
+  return Boolean(leftNormalized) && leftNormalized === rightNormalized;
+}
+
+function normalizeBrowserElementPayload(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const raw = value;
+  const tabId = Number(raw.tabId ?? raw.tab_id);
+  const selectorHint = String(raw.selector || "").trim();
+  const xpathHint = compactInlineText(raw.xpath || "", 240);
+  const selector = selectorHint || xpathHint;
+  const rawUrl = String(raw.url || "").trim();
+  const url = normalizeSafeLink(rawUrl) || rawUrl;
+  if (!selector || !url) {
+    return null;
+  }
+  return {
+    tabId: Number.isInteger(tabId) ? tabId : null,
+    url,
+    title: compactInlineText(raw.title || "", 180),
+    selector,
+    xpath: compactInlineText(raw.xpath || "", 240),
+    tagName: compactInlineText(raw.tagName || raw.tag_name || "", 48),
+    role: compactInlineText(raw.role || "", 80),
+    label: compactInlineText(raw.label || "", 160),
+    name: compactInlineText(raw.name || "", 120),
+    placeholder: compactInlineText(raw.placeholder || "", 120),
+    enabled: raw.enabled !== false,
+    editable: raw.editable === true,
+    bounds: {
+      x: Number(raw.x ?? raw.bounds?.x ?? 0) || 0,
+      y: Number(raw.y ?? raw.bounds?.y ?? 0) || 0,
+      width: Number(raw.width ?? raw.bounds?.width ?? 0) || 0,
+      height: Number(raw.height ?? raw.bounds?.height ?? 0) || 0
+    },
+    pickedAt: String(raw.pickedAt || raw.picked_at || "").trim()
+  };
+}
+
+function describeBrowserElementTarget(entry) {
+  const normalized = normalizeBrowserElementPayload(entry);
+  if (!normalized) {
+    return "Selected element";
+  }
+  return (
+    normalized.label
+    || normalized.selector
+    || normalized.role
+    || normalized.tagName
+    || "Selected element"
+  );
+}
+
+function isAllowlistedActiveTab(tab) {
+  return tab?.allowed === true || tab?.allowlisted === true;
+}
+
+function browserElementMatchesCurrentPage(entry) {
+  const normalized = normalizeBrowserElementPayload(entry);
+  return Boolean(normalized && sameDocumentUrl(normalized.url, state.toolsActiveTab?.url || ""));
 }
 
 function canonicalizeArxivIdentifier(value) {
@@ -1042,10 +1151,14 @@ function getComposerExplainSelectionBlock(selection = state.composerExplainSelec
 
 function syncReadAssistantQuickActionState() {
   const explainBtn = $("composer-read-explain-btn");
+  const browserBtn = $("composer-read-browser-btn");
   const guideBtn = $("composer-read-guide-btn");
   const showBtn = $("composer-read-show-btn");
   explainBtn?.classList.toggle("active", Boolean(state.composerExplainSelection));
   explainBtn?.setAttribute("aria-pressed", String(Boolean(state.composerExplainSelection)));
+  const composerBrowserArmed = state.browserActionArmed;
+  browserBtn?.classList.toggle("active", composerBrowserArmed);
+  browserBtn?.setAttribute("aria-pressed", String(composerBrowserArmed));
   guideBtn?.classList.toggle("active", Boolean(state.composerGuidePageContext));
   guideBtn?.setAttribute("aria-pressed", String(Boolean(state.composerGuidePageContext)));
   showBtn?.classList.toggle("active", state.composerShowMeWhere);
@@ -1058,14 +1171,22 @@ function clearComposerExplainSelection() {
 
 function clearComposerShowMeWhere() {
   state.composerShowMeWhere = false;
+  if (state.browserActionArmed && state.browserActionArmedReason === "Show Me Where") {
+    setBrowserActionArmed(false);
+  }
 }
 
 function setComposerGuidePageContext(enabled) {
-  state.composerGuidePageContext = Boolean(enabled);
+  const next = Boolean(enabled);
+  if (!next && state.composerShowMeWhere) {
+    clearComposerShowMeWhere();
+  }
+  state.composerGuidePageContext = next;
   if (includePageContextEl) {
-    includePageContextEl.checked = state.composerGuidePageContext;
+    includePageContextEl.checked = next;
   }
   syncReadAssistantQuickActionState();
+  renderBrowserNextActionIndicator();
 }
 
 function isComposerGuidePageContextEnabled() {
@@ -1137,13 +1258,33 @@ function toggleComposerShowMeWhereMode() {
   state.composerShowMeWhere = !state.composerShowMeWhere;
   if (state.composerShowMeWhere) {
     setComposerGuidePageContext(true);
+    setBrowserActionArmed(true, "Show Me Where");
     updatePapersStatus("Show Me Where is armed. Send a prompt to answer it and navigate to the best section.");
     focusComposerToEnd();
   } else {
+    if (state.browserActionArmedReason === "Show Me Where") {
+      setBrowserActionArmed(false);
+    }
     updatePapersStatus("Show Me Where disabled.");
   }
   syncReadAssistantQuickActionState();
   updateComposerState();
+}
+
+function toggleComposerBrowserActionMode() {
+  if (state.composerShowMeWhere) {
+    updatePapersStatus("Show Me Where already enables browser tools for the next message.");
+    focusComposerToEnd();
+    return;
+  }
+  const next = !(state.browserActionArmed && state.browserActionArmedReason !== "Show Me Where");
+  setBrowserActionArmed(next);
+  updatePapersStatus(
+    next
+      ? "Browser tools enabled for your next message."
+      : "Browser tools disabled for your next message."
+  );
+  focusComposerToEnd();
 }
 
 function buildComposerPromptForSubmit(rawPrompt) {
@@ -1213,7 +1354,7 @@ function updateReadAssistantStatus() {
     updatePapersStatus("Allowlist loaded. Active tab unavailable.");
     return;
   }
-  if (!state.toolsActiveTab.allowed) {
+  if (!isAllowlistedActiveTab(state.toolsActiveTab)) {
     updatePapersStatus("Allow the current host to use the read assistant.");
     return;
   }
@@ -1267,7 +1408,7 @@ async function submitReadAssistantAction(kind) {
       throw new Error("Chat composer is unavailable.");
     }
     setComposerGuidePageContext(true);
-    forceBrowserActionEl.checked = kind === "show_me_where";
+    setBrowserActionArmed(kind === "show_me_where", kind === "show_me_where" ? "Show Me Where" : "");
     promptEl.value = buildReadAssistantPrompt(kind, context);
     updateComposerState();
     sendBtn.click();
@@ -1305,6 +1446,16 @@ function installReadAssistantQuickActions() {
     toggleComposerGuidePageContext();
   });
 
+  const browserBtn = document.createElement("button");
+  browserBtn.id = "composer-read-browser-btn";
+  browserBtn.type = "button";
+  browserBtn.className = "ghost composer-quick-action";
+  browserBtn.textContent = "Use Browser Tools";
+  browserBtn.setAttribute("aria-pressed", "false");
+  browserBtn.addEventListener("click", () => {
+    toggleComposerBrowserActionMode();
+  });
+
   const showBtn = document.createElement("button");
   showBtn.id = "composer-read-show-btn";
   showBtn.type = "button";
@@ -1317,6 +1468,7 @@ function installReadAssistantQuickActions() {
 
   row.appendChild(explainBtn);
   row.appendChild(guideBtn);
+  row.appendChild(browserBtn);
   row.appendChild(showBtn);
   promptEl.insertAdjacentElement("afterend", row);
   syncReadAssistantQuickActionState();
@@ -1465,8 +1617,42 @@ chatTabBtn?.addEventListener("click", () => {
   setMainTab("chat");
 });
 
-toolsTabBtn?.addEventListener("click", () => {
-  setMainTab("tools");
+browserTabBtn?.addEventListener("click", () => {
+  setMainTab("browser");
+});
+
+browserPickerStartBtn?.addEventListener("click", async () => {
+  try {
+    const result = await sendRuntimeMessage({ type: "assistant.browser.element_picker.start" });
+    if (!result?.ok) {
+      throw new Error(result?.error || "Unable to start element picker.");
+    }
+    state.browserPickerActive = true;
+    state.browserPickerRequestId = String(result.requestId || result.request_id || "");
+    state.browserPickerError = "";
+  } catch (error) {
+    state.browserPickerActive = false;
+    state.browserPickerRequestId = "";
+    state.browserPickerError = `Picker error: ${String(error.message || error)}`;
+  } finally {
+    renderBrowserPickerPanel();
+  }
+});
+
+browserPickerCancelBtn?.addEventListener("click", async () => {
+  try {
+    await sendRuntimeMessage({ type: "assistant.browser.element_picker.cancel" });
+  } catch {
+    // Ignore background cancellation failures and clear local UI state.
+  } finally {
+    state.browserPickerActive = false;
+    state.browserPickerRequestId = "";
+    renderBrowserPickerPanel();
+  }
+});
+
+browserAutomationArmBtn?.addEventListener("click", () => {
+  setBrowserActionArmed(!state.browserActionArmed);
 });
 
 paperSummaryTabBtn?.addEventListener("click", () => {
@@ -1588,11 +1774,45 @@ window.addEventListener("focus", () => {
   queueActiveTabRefresh();
 });
 
+chrome.runtime?.onMessage?.addListener((message) => {
+  if (!message || typeof message !== "object") {
+    return;
+  }
+  if (message.type === "assistant.browser.element_picker.result") {
+    state.browserPickerActive = false;
+    state.browserPickerRequestId = "";
+    state.browserPickerError = "";
+    if (!rememberBrowserPickerEntry(message.payload)) {
+      state.browserPickerError = "Picker returned an invalid element.";
+    }
+    renderBrowserPickerPanel();
+    renderBrowserNextActionIndicator();
+    return;
+  }
+  if (message.type === "assistant.browser.element_picker.cancelled") {
+    state.browserPickerActive = false;
+    state.browserPickerRequestId = "";
+    state.browserPickerError = "";
+    renderBrowserPickerPanel();
+    return;
+  }
+  if (message.type === "assistant.browser.element_picker.error") {
+    state.browserPickerActive = false;
+    state.browserPickerRequestId = "";
+    state.browserPickerError = String(message.error || "Element picker failed.");
+    renderBrowserPickerPanel();
+  }
+});
+
 async function initializeApp() {
   setHistoryPanel(false);
   setMainTab("chat");
   setPaperTab("chat");
   renderPaperWorkspace();
+  renderBrowserCurrentPage();
+  renderBrowserPickerPanel();
+  renderBrowserAutomationPanel();
+  renderBrowserNextActionIndicator();
   await refreshBrokerHealth();
   await refreshBackendState(false);
   await refreshToolsState(false);
@@ -1729,12 +1949,12 @@ async function refreshPaperMemory(force = false) {
 }
 
 function setMainTab(tab) {
-  const next = tab === "tools" ? tab : "chat";
+  const next = tab === "browser" ? tab : "chat";
   state.activeMainTab = next;
 
   const tabConfig = [
     { key: "chat", button: chatTabBtn, view: chatViewEl },
-    { key: "tools", button: toolsTabBtn, view: toolsViewEl }
+    { key: "browser", button: browserTabBtn, view: browserViewEl }
   ];
 
   for (const config of tabConfig) {
@@ -1748,7 +1968,7 @@ function setMainTab(tab) {
   if (next !== "chat") {
     closeHistoryPanel();
   }
-  if (next === "tools") {
+  if (next === "browser") {
     void refreshToolsState(false);
   }
 }
@@ -1960,6 +2180,519 @@ function renderBrowserConfig(config) {
   }
 }
 
+function setBrowserActionArmed(armed, reason = "") {
+  state.browserActionArmed = armed === true;
+  state.browserActionArmedReason = state.browserActionArmed ? String(reason || "").trim() : "";
+  syncReadAssistantQuickActionState();
+  renderBrowserAutomationPanel();
+  renderBrowserNextActionIndicator();
+}
+
+function clearBrowserElementAttachment() {
+  state.browserElementContextForNextMessage = null;
+  renderBrowserPickerPanel();
+  renderBrowserNextActionIndicator();
+}
+
+function attachBrowserElementForNextMessage(entry = state.browserPickerLatest) {
+  const normalized = normalizeBrowserElementPayload(entry);
+  if (!normalized || !browserElementMatchesCurrentPage(normalized)) {
+    state.browserPickerError = "Pick an element from the current page before attaching it.";
+    renderBrowserPickerPanel();
+    return false;
+  }
+  state.browserElementContextForNextMessage = normalized;
+  state.browserPickerError = "";
+  renderBrowserPickerPanel();
+  renderBrowserNextActionIndicator();
+  return true;
+}
+
+function rememberBrowserPickerEntry(entry) {
+  const normalized = normalizeBrowserElementPayload(entry);
+  if (!normalized) {
+    return null;
+  }
+  state.browserPickerLatest = normalized;
+  const key = `${normalized.url}::${normalized.selector}`;
+  const deduped = state.browserPickerHistory.filter((item) => `${item.url}::${item.selector}` !== key);
+  state.browserPickerHistory = [normalized, ...deduped].slice(0, 5);
+  return normalized;
+}
+
+function resetBrowserAutomationState() {
+  state.browserAutomationStatus = {
+    label: "Idle",
+    text: "Browser actions are idle.",
+    detail: ""
+  };
+  state.browserAutomationLastToolSummary = "";
+  state.browserAutomationLastToolResult = "";
+  state.browserAutomationLastToolError = "";
+  state.browserPendingApprovals = new Map();
+  renderBrowserAutomationPanel();
+}
+
+function setBrowserAutomationStatus(label, text, detail = "") {
+  state.browserAutomationStatus = {
+    label: String(label || "Idle"),
+    text: String(text || "Browser actions are idle."),
+    detail: String(detail || "")
+  };
+}
+
+function syncBrowserWorkspaceToActiveTab() {
+  if (!browserElementMatchesCurrentPage(state.browserElementContextForNextMessage)) {
+    state.browserElementContextForNextMessage = null;
+  }
+  if (state.browserPickerLatest && !browserElementMatchesCurrentPage(state.browserPickerLatest)) {
+    state.browserPickerError = "";
+  }
+  renderBrowserCurrentPage();
+  renderBrowserPickerPanel();
+  renderBrowserNextActionIndicator();
+  renderBrowserAutomationPanel();
+}
+
+function renderBrowserCurrentPage() {
+  if (!browserCurrentPageTitleEl || !browserCurrentPageUrlEl) {
+    return;
+  }
+  const activeTab = state.toolsActiveTab && typeof state.toolsActiveTab === "object" ? state.toolsActiveTab : null;
+  if (!activeTab?.url) {
+    browserCurrentPageTitleEl.textContent = "No active tab available.";
+    browserCurrentPageUrlEl.textContent = "Bring a browser tab into focus to inspect the current page.";
+    return;
+  }
+  const host = String(activeTab.host || "").trim();
+  const title = String(activeTab.title || "").trim();
+  const marker = isAllowlistedActiveTab(activeTab) ? "allowlisted" : "not allowlisted";
+  browserCurrentPageTitleEl.textContent = title || host || "Current page";
+  browserCurrentPageUrlEl.textContent = `${String(activeTab.url)}${host ? ` · ${host} (${marker})` : ""}`;
+}
+
+function renderBrowserNextActionIndicator() {
+  if (!browserNextActionIndicatorEl) {
+    return;
+  }
+  browserNextActionIndicatorEl.textContent = "";
+  const fragments = [];
+  if (state.browserActionArmed) {
+    fragments.push({
+      key: "armed",
+      label: state.browserActionArmedReason
+        ? `Browser tools enabled: ${state.browserActionArmedReason}`
+        : "Browser tools enabled for next message"
+    });
+  }
+  if (state.composerGuidePageContext) {
+    fragments.push({
+      key: "page-context",
+      label: "Page context shared"
+    });
+  }
+  const attached = normalizeBrowserElementPayload(state.browserElementContextForNextMessage);
+  if (attached && browserElementMatchesCurrentPage(attached)) {
+    fragments.push({
+      key: "element",
+      label: `Element attached: ${describeBrowserElementTarget(attached)}`
+    });
+  }
+
+  if (!fragments.length) {
+    browserNextActionIndicatorEl.classList.add("hidden");
+    return;
+  }
+
+  browserNextActionIndicatorEl.classList.remove("hidden");
+  for (const fragment of fragments) {
+    const chip = document.createElement("div");
+    chip.className = "browser-next-action-chip";
+
+    const label = document.createElement("span");
+    label.textContent = fragment.label;
+    chip.appendChild(label);
+
+    const clearBtn = document.createElement("button");
+    clearBtn.type = "button";
+    clearBtn.className = "ghost small";
+    clearBtn.textContent = "Clear";
+    clearBtn.addEventListener("click", () => {
+      if (fragment.key === "armed") {
+        if (state.browserActionArmedReason === "Show Me Where") {
+          clearComposerShowMeWhere();
+          updatePapersStatus("Show Me Where disabled.");
+        } else {
+          setBrowserActionArmed(false);
+          updatePapersStatus("Browser tools disabled for your next message.");
+        }
+        return;
+      }
+      if (fragment.key === "page-context") {
+        setComposerGuidePageContext(false);
+        updatePapersStatus("Page context disabled.");
+        return;
+      }
+      clearBrowserElementAttachment();
+    });
+    chip.appendChild(clearBtn);
+
+    browserNextActionIndicatorEl.appendChild(chip);
+  }
+}
+
+function renderBrowserPickerPanel() {
+  if (browserPickerStatusEl) {
+    if (state.browserPickerActive) {
+      browserPickerStatusEl.textContent = "Picker active. Click an element on the page or press Escape to cancel.";
+    } else if (state.browserPickerError) {
+      browserPickerStatusEl.textContent = state.browserPickerError;
+    } else if (state.browserPickerLatest) {
+      browserPickerStatusEl.textContent = browserElementMatchesCurrentPage(state.browserPickerLatest)
+        ? "Latest pick is ready to attach to your next message."
+        : "Latest pick was made on a different page. Pick again on the current page to attach it.";
+    } else {
+      browserPickerStatusEl.textContent =
+        "Pick an element on the current allowlisted page to attach browser context to your next message.";
+    }
+  }
+
+  if (browserPickerStartBtn) {
+    browserPickerStartBtn.disabled =
+      state.toolsBusy || Boolean(state.activeRunId) || !state.toolsActiveTab?.url || !isAllowlistedActiveTab(state.toolsActiveTab);
+  }
+  if (browserPickerCancelBtn) {
+    browserPickerCancelBtn.disabled = state.toolsBusy || !state.browserPickerActive;
+  }
+
+  if (browserPickedElementEl) {
+    browserPickedElementEl.textContent = "";
+    const latest = normalizeBrowserElementPayload(state.browserPickerLatest);
+    if (latest) {
+      const card = document.createElement("article");
+      card.className = "browser-picker-card";
+
+      const title = document.createElement("p");
+      title.className = "browser-picker-card-title";
+      title.textContent = describeBrowserElementTarget(latest);
+      card.appendChild(title);
+
+      const selector = document.createElement("p");
+      selector.className = "browser-picker-card-detail";
+      selector.textContent = latest.selector;
+      card.appendChild(selector);
+
+      const meta = document.createElement("p");
+      meta.className = "browser-picker-card-meta";
+      meta.textContent = browserElementMatchesCurrentPage(latest)
+        ? "Current page"
+        : "Different page";
+      card.appendChild(meta);
+
+      const actions = document.createElement("div");
+      actions.className = "button-row";
+
+      const useBtn = document.createElement("button");
+      useBtn.type = "button";
+      useBtn.className = "small";
+      useBtn.textContent = state.browserElementContextForNextMessage?.selector === latest.selector
+        && sameDocumentUrl(state.browserElementContextForNextMessage?.url || "", latest.url)
+        ? "Attached"
+        : "Use In Next Message";
+      useBtn.disabled =
+        state.toolsBusy
+        || Boolean(state.activeRunId)
+        || !browserElementMatchesCurrentPage(latest)
+        || (
+          state.browserElementContextForNextMessage?.selector === latest.selector
+          && sameDocumentUrl(state.browserElementContextForNextMessage?.url || "", latest.url)
+        );
+      useBtn.addEventListener("click", () => {
+        attachBrowserElementForNextMessage(latest);
+      });
+      actions.appendChild(useBtn);
+
+      const clearBtn = document.createElement("button");
+      clearBtn.type = "button";
+      clearBtn.className = "ghost small";
+      clearBtn.textContent = "Clear Pick";
+      clearBtn.addEventListener("click", () => {
+        state.browserPickerLatest = null;
+        if (
+          state.browserElementContextForNextMessage
+          && latest.selector === state.browserElementContextForNextMessage.selector
+          && sameDocumentUrl(latest.url, state.browserElementContextForNextMessage.url)
+        ) {
+          clearBrowserElementAttachment();
+        } else {
+          renderBrowserPickerPanel();
+        }
+      });
+      actions.appendChild(clearBtn);
+
+      card.appendChild(actions);
+      browserPickedElementEl.appendChild(card);
+    } else {
+      const empty = document.createElement("p");
+      empty.className = "tools-empty";
+      empty.textContent = "No picked element yet.";
+      browserPickedElementEl.appendChild(empty);
+    }
+  }
+
+  if (browserPickedHistoryEl) {
+    browserPickedHistoryEl.textContent = "";
+    if (!state.browserPickerHistory.length) {
+      const empty = document.createElement("p");
+      empty.className = "tools-empty";
+      empty.textContent = "Recent picks will appear here for this session.";
+      browserPickedHistoryEl.appendChild(empty);
+    } else {
+      for (const entry of state.browserPickerHistory) {
+        const row = document.createElement("div");
+        row.className = "tools-item";
+
+        const meta = document.createElement("div");
+        meta.className = "tools-item-meta";
+
+        const hostEl = document.createElement("div");
+        hostEl.className = "tools-item-host";
+        hostEl.textContent = describeBrowserElementTarget(entry);
+        meta.appendChild(hostEl);
+
+        const detail = document.createElement("div");
+        detail.className = "browser-picker-history-detail";
+        detail.textContent = entry.selector;
+        meta.appendChild(detail);
+        row.appendChild(meta);
+
+        const actions = document.createElement("div");
+        actions.className = "tools-item-actions";
+
+        const useBtn = document.createElement("button");
+        useBtn.type = "button";
+        useBtn.className = "ghost small";
+        useBtn.textContent = browserElementMatchesCurrentPage(entry) ? "Use" : "Different Page";
+        useBtn.disabled = state.toolsBusy || Boolean(state.activeRunId) || !browserElementMatchesCurrentPage(entry);
+        useBtn.addEventListener("click", () => {
+          attachBrowserElementForNextMessage(entry);
+        });
+        actions.appendChild(useBtn);
+
+        row.appendChild(actions);
+        browserPickedHistoryEl.appendChild(row);
+      }
+    }
+  }
+}
+
+function renderBrowserAutomationPanel() {
+  if (browserAutomationStatusEl) {
+    browserAutomationStatusEl.textContent = state.browserAutomationStatus.text || "Browser actions are idle.";
+  }
+  if (browserAutomationArmBtn) {
+    browserAutomationArmBtn.textContent = state.browserActionArmed
+      ? "Browser Tools Enabled"
+      : "Use Browser Tools On Next Message";
+    browserAutomationArmBtn.classList.toggle("active", state.browserActionArmed);
+    browserAutomationArmBtn.disabled = state.toolsBusy || Boolean(state.activeRunId);
+  }
+
+  if (browserAutomationSummaryEl) {
+    browserAutomationSummaryEl.textContent = "";
+    const items = [];
+    if (state.activeRunId) {
+      items.push(`Active run: ${state.activeRunId}`);
+    }
+    if (state.browserAutomationLastToolSummary) {
+      items.push(`Last action: ${state.browserAutomationLastToolSummary}`);
+    }
+    if (state.browserAutomationLastToolResult) {
+      items.push(`Last result: ${state.browserAutomationLastToolResult}`);
+    }
+    if (state.browserAutomationLastToolError) {
+      items.push(`Last error: ${state.browserAutomationLastToolError}`);
+    }
+    if (!items.length) {
+      const empty = document.createElement("p");
+      empty.className = "tools-empty";
+      empty.textContent = "No browser automation activity yet.";
+      browserAutomationSummaryEl.appendChild(empty);
+    } else {
+      for (const item of items) {
+        const line = document.createElement("p");
+        line.className = "browser-automation-line";
+        line.textContent = item;
+        browserAutomationSummaryEl.appendChild(line);
+      }
+    }
+  }
+
+  if (browserAutomationApprovalsEl) {
+    browserAutomationApprovalsEl.textContent = "";
+    const approvals = [...state.browserPendingApprovals.values()];
+    if (!approvals.length) {
+      const empty = document.createElement("p");
+      empty.className = "tools-empty";
+      empty.textContent = "No pending browser approvals.";
+      browserAutomationApprovalsEl.appendChild(empty);
+    } else {
+      for (const approval of approvals) {
+        const card = document.createElement("article");
+        card.className = "browser-approval-card";
+
+        const title = document.createElement("p");
+        title.className = "browser-approval-title";
+        title.textContent = approval.summary || "Browser action requires approval.";
+        card.appendChild(title);
+
+        if (approval.host) {
+          const host = document.createElement("p");
+          host.className = "browser-approval-detail";
+          host.textContent = `Host: ${approval.host}`;
+          card.appendChild(host);
+        }
+        if (approval.selector) {
+          const selector = document.createElement("p");
+          selector.className = "browser-approval-detail";
+          selector.textContent = `Selector: ${approval.selector}`;
+          card.appendChild(selector);
+        }
+        if (approval.text_preview) {
+          const preview = document.createElement("p");
+          preview.className = "browser-approval-detail";
+          preview.textContent = `Text: ${approval.text_preview}`;
+          card.appendChild(preview);
+        }
+
+        const status = document.createElement("p");
+        status.className = "browser-approval-status";
+        status.textContent = approval.statusText || "Waiting for your decision.";
+        card.appendChild(status);
+
+        const actions = document.createElement("div");
+        actions.className = "button-row";
+
+        const approveBtn = document.createElement("button");
+        approveBtn.type = "button";
+        approveBtn.textContent = "Approve";
+        approveBtn.disabled = approval.resolved === true;
+        approveBtn.addEventListener("click", async () => {
+          await submitBrowserApprovalDecision(approval, "approve");
+        });
+        actions.appendChild(approveBtn);
+
+        const denyBtn = document.createElement("button");
+        denyBtn.type = "button";
+        denyBtn.className = "ghost";
+        denyBtn.textContent = "Deny";
+        denyBtn.disabled = approval.resolved === true;
+        denyBtn.addEventListener("click", async () => {
+          await submitBrowserApprovalDecision(approval, "deny");
+        });
+        actions.appendChild(denyBtn);
+
+        const cancelBtn = document.createElement("button");
+        cancelBtn.type = "button";
+        cancelBtn.className = "ghost";
+        cancelBtn.textContent = "Cancel Run";
+        cancelBtn.disabled = approval.resolved === true;
+        cancelBtn.addEventListener("click", async () => {
+          await cancelRun(approval.runId);
+        });
+        actions.appendChild(cancelBtn);
+
+        card.appendChild(actions);
+        browserAutomationApprovalsEl.appendChild(card);
+      }
+    }
+  }
+}
+
+async function submitBrowserApprovalDecision(approval, decision) {
+  const approvalId = String(approval?.approval_id || "").trim();
+  const runId = String(approval?.runId || "").trim();
+  if (!approvalId || !runId) {
+    return;
+  }
+  const existing = state.browserPendingApprovals.get(approvalId);
+  if (existing) {
+    existing.statusText = decision === "approve" ? "Submitting approval..." : "Submitting denial...";
+    existing.resolved = true;
+    state.browserPendingApprovals.set(approvalId, existing);
+    renderBrowserAutomationPanel();
+  }
+  try {
+    const result = await sendRuntimeMessage({
+      type: "assistant.run.approval",
+      runId,
+      approvalId,
+      decision
+    });
+    if (!result.ok) {
+      throw new Error(result.error || "Approval request failed.");
+    }
+    const approved = state.browserPendingApprovals.get(approvalId);
+    if (approved) {
+      approved.statusText = decision === "approve" ? "Approved." : "Denied.";
+      approved.resolved = true;
+      state.browserPendingApprovals.set(approvalId, approved);
+      renderBrowserAutomationPanel();
+    }
+  } catch (error) {
+    const pending = state.browserPendingApprovals.get(approvalId);
+    if (pending) {
+      pending.statusText = `Approval failed: ${String(error.message || error)}`;
+      pending.resolved = false;
+      state.browserPendingApprovals.set(approvalId, pending);
+      renderBrowserAutomationPanel();
+    }
+  }
+}
+
+function rememberBrowserApproval(runId, approval) {
+  const approvalId = String(approval?.approval_id || "").trim();
+  if (!approvalId) {
+    return;
+  }
+  state.browserPendingApprovals.set(approvalId, {
+    ...approval,
+    runId,
+    statusText: "Waiting for your decision.",
+    resolved: false
+  });
+  renderBrowserAutomationPanel();
+}
+
+function resolveBrowserApproval(approvalId, statusText) {
+  const approval = state.browserPendingApprovals.get(String(approvalId || ""));
+  if (!approval) {
+    return;
+  }
+  approval.statusText = String(statusText || "Approval updated.");
+  approval.resolved = true;
+  state.browserPendingApprovals.set(approval.approval_id, approval);
+  renderBrowserAutomationPanel();
+}
+
+function clearBrowserApprovalsForRun(runId) {
+  if (!runId) {
+    state.browserPendingApprovals = new Map();
+    renderBrowserAutomationPanel();
+    return;
+  }
+  let changed = false;
+  for (const [approvalId, approval] of state.browserPendingApprovals.entries()) {
+    if (approval.runId === runId) {
+      state.browserPendingApprovals.delete(approvalId);
+      changed = true;
+    }
+  }
+  if (changed) {
+    renderBrowserAutomationPanel();
+  }
+}
+
 
 function setToolsBusy(busy) {
   state.toolsBusy = busy;
@@ -1970,7 +2703,11 @@ function setToolsBusy(busy) {
     toolsAllowActiveBtn,
     toolsAgentMaxStepsEl,
     toolsBrowserApplyBtn,
+    browserPickerStartBtn,
+    browserPickerCancelBtn,
+    browserAutomationArmBtn,
     $("composer-read-explain-btn"),
+    $("composer-read-browser-btn"),
     $("composer-read-guide-btn"),
     $("composer-read-show-btn")
   ];
@@ -1981,6 +2718,15 @@ function setToolsBusy(busy) {
   }
   for (const button of toolsAllowedListEl?.querySelectorAll("button") || []) {
     button.disabled = busy;
+  }
+  for (const button of browserPickedElementEl?.querySelectorAll("button") || []) {
+    button.disabled = busy || Boolean(state.activeRunId);
+  }
+  for (const button of browserPickedHistoryEl?.querySelectorAll("button") || []) {
+    button.disabled = busy || Boolean(state.activeRunId) || button.disabled;
+  }
+  for (const button of browserAutomationApprovalsEl?.querySelectorAll("button") || []) {
+    button.disabled = busy || button.disabled;
   }
   setReadAssistantExplainEnabled();
 }
@@ -2149,7 +2895,7 @@ async function refreshToolsState(showErrors = true, options = {}) {
     }
     const statusParts = [];
     if (state.toolsActiveTab?.host) {
-      const marker = state.toolsActiveTab.allowed ? "allowed" : "not allowed";
+      const marker = isAllowlistedActiveTab(state.toolsActiveTab) ? "allowed" : "not allowed";
       statusParts.push(`Active tab: ${state.toolsActiveTab.host} (${marker})`);
     } else {
       statusParts.push("Allowlist loaded. Active tab host unavailable.");
@@ -2162,14 +2908,18 @@ async function refreshToolsState(showErrors = true, options = {}) {
     }
     updateToolsStatus(statusParts.join(" "));
     await syncPaperContext();
+    syncBrowserWorkspaceToActiveTab();
   } catch (error) {
     console.warn("[secure-panel] tools refresh failed:", String(error?.message || error));
     if (showErrors) {
-      updateToolsStatus(`Tools error: ${String(error.message || error)}`);
+      updateToolsStatus(`Browser error: ${String(error.message || error)}`);
       updatePapersStatus(`Read assistant error: ${String(error.message || error)}`);
+      state.browserPickerError = `Browser error: ${String(error.message || error)}`;
     }
   } finally {
     setToolsBusy(false);
+    renderBrowserPickerPanel();
+    renderBrowserAutomationPanel();
   }
 }
 
@@ -2181,10 +2931,10 @@ async function runHostPolicyAction(message, successStatus) {
       throw new Error(result.error || "Host policy update failed.");
     }
     renderToolsPolicy(result.policy);
-    updateToolsStatus(successStatus || "Tools policy updated.");
+    updateToolsStatus(successStatus || "Browser policy updated.");
     return true;
   } catch (error) {
-    updateToolsStatus(`Tools error: ${String(error.message || error)}`);
+    updateToolsStatus(`Browser error: ${String(error.message || error)}`);
     return false;
   } finally {
     setToolsBusy(false);
@@ -2224,7 +2974,7 @@ async function applyBrowserConfigFromInputs() {
     renderBrowserConfig(result.browser);
     updateToolsStatus(`Browser agent max steps set to ${result.browser?.agent_max_steps ?? parsed}.`);
   } catch (error) {
-    updateToolsStatus(`Tools error: ${String(error.message || error)}`);
+    updateToolsStatus(`Browser error: ${String(error.message || error)}`);
   } finally {
     setToolsBusy(false);
   }
@@ -2285,7 +3035,7 @@ async function allowActiveTabHost() {
       }
     }
   } catch (error) {
-    updateToolsStatus(`Tools error: ${String(error.message || error)}`);
+    updateToolsStatus(`Browser error: ${String(error.message || error)}`);
   } finally {
     setToolsBusy(false);
   }
@@ -2429,6 +3179,9 @@ async function loadConversation(sessionId, options = {}) {
     state.activeRunId = "";
     state.runUi = new Map();
     state.rewriteTargetIndex = null;
+    setBrowserActionArmed(false);
+    clearBrowserElementAttachment();
+    resetBrowserAutomationState();
     resetComposerReadAssistantModes();
     const codex = conversation?.codex && typeof conversation.codex === "object" ? conversation.codex : {};
     setComposerGuidePageContext(
@@ -2599,6 +3352,9 @@ function startNewSession(message = "Started a new chat.") {
   state.runUi = new Map();
   state.rewriteTargetIndex = null;
   state.currentConversationPaper = null;
+  setBrowserActionArmed(false);
+  clearBrowserElementAttachment();
+  resetBrowserAutomationState();
   if (!state.activeBrowserPaper && carryPaper) {
     state.activeBrowserPaper = carryPaper;
   }
@@ -2737,12 +3493,25 @@ async function submitPrompt(confirmed) {
     }
     const rewriteIndex = hasRewriteTarget() ? Number(state.rewriteTargetIndex) : null;
     const isRewrite = Number.isInteger(rewriteIndex);
-    const forceBrowserAction = forceBrowserActionEl?.checked === true || state.composerShowMeWhere;
+    const forceBrowserAction = state.browserActionArmed === true || state.composerShowMeWhere;
+    const browserElementContext = normalizeBrowserElementPayload(state.browserElementContextForNextMessage);
     if (!isRewrite) {
       appendMessage("user", prompt);
     }
     promptEl.value = "";
     resetComposerReadAssistantModes();
+    if (state.browserPickerActive) {
+      try {
+        await sendRuntimeMessage({ type: "assistant.browser.element_picker.cancel" });
+      } catch {
+        // Ignore picker cancellation failures before run start.
+      } finally {
+        state.browserPickerActive = false;
+        state.browserPickerRequestId = "";
+      }
+    }
+
+    const includePageContext = isComposerGuidePageContextEnabled();
 
     request = {
       type: "assistant.run.start",
@@ -2751,10 +3520,13 @@ async function submitPrompt(confirmed) {
       prompt,
       requestPromptSuffix,
       paperContext: getEffectivePaper(),
-      includePageContext: isComposerGuidePageContextEnabled(),
+      includePageContext,
       forceBrowserAction,
       confirmed: false
     };
+    if (browserElementContext && browserElementMatchesCurrentPage(browserElementContext)) {
+      request.browserElementContext = browserElementContext;
+    }
     if (explainSelection) {
       request.highlightContext = {
         kind: "explain_selection",
@@ -2765,6 +3537,8 @@ async function submitPrompt(confirmed) {
     if (isRewrite) {
       request.rewriteMessageIndex = rewriteIndex;
     }
+    setBrowserActionArmed(false);
+    clearBrowserElementAttachment();
     request = applyLlamaThinkingRequestFields(request, backend);
   }
 
@@ -2907,9 +3681,12 @@ async function submitRun(message) {
       state.highlightAutosaveRunIds.delete(runId);
     }
     state.activeRunId = runId;
+    resetBrowserAutomationState();
+    setBrowserAutomationStatus("Queued", "Run started. Waiting for model output.");
     const runBackend = typeof result.backend === "string" ? result.backend : message.backend || "codex";
     const runUi = ensureRunUi(runId, state.sessionId, true, runBackend);
     showRunWaitingIndicator(runUi);
+    renderBrowserAutomationPanel();
     await refreshHistory(state.sessionId);
     void pollRun(runId, state.sessionId);
   } catch (error) {
@@ -2978,6 +3755,7 @@ async function pollRun(runId, conversationId, allowAssistantBubble = true) {
         state.highlightAutosaveRunIds.delete(runId);
         state.activeRunId = "";
         clearRewriteTarget();
+        clearBrowserApprovalsForRun(runId);
         await refreshHistory(state.sessionId);
         await loadConversation(state.sessionId, { preservePaperTab: !allowAssistantBubble });
         if (shouldGlowHighlights) {
@@ -2993,6 +3771,9 @@ async function pollRun(runId, conversationId, allowAssistantBubble = true) {
     }
     appendMessage("system", `Run event polling failed: ${String(error.message || error)}`);
     state.activeRunId = "";
+    clearBrowserApprovalsForRun(runId);
+    setBrowserAutomationStatus("Run Error", `Run event polling failed: ${String(error.message || error)}`);
+    renderBrowserAutomationPanel();
   } finally {
     state.highlightAutosaveRunIds.delete(runId);
     state.pollingRuns.delete(runId);
@@ -3003,12 +3784,15 @@ async function pollRun(runId, conversationId, allowAssistantBubble = true) {
 function renderRunEvents(runId, events) {
   const runUi =
     state.runUi.get(runId) || ensureRunUi(runId, state.sessionId, true);
+  let browserAutomationDirty = false;
   for (const event of events) {
     const seq = Number(event?.seq || 0);
     if (!seq || runUi.renderedSeqs.has(seq)) {
       continue;
     }
     runUi.renderedSeqs.add(seq);
+    const eventSummary = describeRunEvent(event);
+    const eventData = event?.data && typeof event.data === "object" ? event.data : {};
 
     if (event.type === "partial_text" || event.type === "partial_answer_text") {
       clearRunWaitingIndicator(runUi);
@@ -3040,13 +3824,19 @@ function renderRunEvents(runId, events) {
 
     if (event.type === "waiting_approval") {
       renderApprovalCard(runUi, event?.data || {});
-      appendRunStatusCard(describeRunEvent(event));
+      rememberBrowserApproval(runId, eventData);
+      setBrowserAutomationStatus(eventSummary.label, eventSummary.text, eventSummary.detail);
+      browserAutomationDirty = true;
+      appendRunStatusCard(eventSummary);
       continue;
     }
 
     if (event.type === "approval_decision" || event.type === "approval_granted") {
       updateApprovalCard(runUi, event?.data || {}, event.message || "");
-      appendRunStatusCard(describeRunEvent(event));
+      resolveBrowserApproval(eventData.approval_id, event.message || "Approval updated.");
+      setBrowserAutomationStatus(eventSummary.label, eventSummary.text, eventSummary.detail);
+      browserAutomationDirty = true;
+      appendRunStatusCard(eventSummary);
       continue;
     }
 
@@ -3069,14 +3859,19 @@ function renderRunEvents(runId, events) {
         runUi.allowAssistantBubble = false;
       }
       disableApprovalCards(runUi);
+      clearBrowserApprovalsForRun(runId);
+      setBrowserAutomationStatus(eventSummary.label, eventSummary.text, eventSummary.detail);
+      browserAutomationDirty = true;
       if (runUi.backend === "codex" && event.type === "completed" && !assistantText && !reasoningText) {
         continue;
       }
-      appendRunStatusCard(describeRunEvent(event));
+      appendRunStatusCard(eventSummary);
       continue;
     }
 
     if (event.type === "thinking") {
+      setBrowserAutomationStatus(eventSummary.label, eventSummary.text, eventSummary.detail);
+      browserAutomationDirty = true;
       if (runUi.allowAssistantBubble && (runUi.streamedAssistantText || runUi.streamedReasoningText || runUi.assistantNode)) {
         upsertRunAssistantBubble(
           runUi,
@@ -3088,12 +3883,38 @@ function renderRunEvents(runId, events) {
       continue;
     }
 
+    if (event.type === "calling_tool") {
+      state.browserAutomationLastToolSummary = event.message || eventData.summary || eventData.tool_name || "";
+      setBrowserAutomationStatus(eventSummary.label, eventSummary.text, eventSummary.detail);
+      browserAutomationDirty = true;
+    }
+
+    if (event.type === "tool_result") {
+      if (eventData.success === false) {
+        const errorMessage = String(eventData?.error?.message || event.message || "Browser action failed.");
+        state.browserAutomationLastToolError = errorMessage;
+      } else {
+        state.browserAutomationLastToolResult = event.message || "Browser action returned a result.";
+      }
+      setBrowserAutomationStatus(eventSummary.label, eventSummary.text, eventSummary.detail);
+      browserAutomationDirty = true;
+    }
+
+    if (event.type === "cancel_requested") {
+      setBrowserAutomationStatus(eventSummary.label, eventSummary.text, eventSummary.detail);
+      browserAutomationDirty = true;
+    }
+
     if (event.type === "tool_result" || event.type === "calling_tool" || event.type === "thinking" || event.type === "cancel_requested") {
-      appendRunStatusCard(describeRunEvent(event));
+      appendRunStatusCard(eventSummary);
       continue;
     }
 
-    appendRunStatusCard(describeRunEvent(event));
+    appendRunStatusCard(eventSummary);
+  }
+
+  if (browserAutomationDirty) {
+    renderBrowserAutomationPanel();
   }
 }
 
@@ -3252,6 +4073,13 @@ function disableApprovalCards(runUi) {
 }
 
 async function submitApprovalDecision(runUi, approvalId, decision, card) {
+  const pending = state.browserPendingApprovals.get(String(approvalId || ""));
+  if (pending) {
+    pending.statusText = decision === "approve" ? "Submitting approval..." : "Submitting denial...";
+    pending.resolved = true;
+    state.browserPendingApprovals.set(pending.approval_id, pending);
+    renderBrowserAutomationPanel();
+  }
   try {
     setApprovalCardBusy(card, true, decision === "approve" ? "Submitting approval..." : "Submitting denial...");
     const result = await sendRuntimeMessage({
@@ -3264,8 +4092,15 @@ async function submitApprovalDecision(runUi, approvalId, decision, card) {
       throw new Error(result.error || "Approval request failed.");
     }
     updateApprovalCard(runUi, { approval_id: approvalId }, decision === "approve" ? "Approved." : "Denied.");
+    resolveBrowserApproval(approvalId, decision === "approve" ? "Approved." : "Denied.");
   } catch (error) {
     setApprovalCardBusy(card, false, `Approval failed: ${String(error.message || error)}`);
+    if (pending) {
+      pending.statusText = `Approval failed: ${String(error.message || error)}`;
+      pending.resolved = false;
+      state.browserPendingApprovals.set(pending.approval_id, pending);
+      renderBrowserAutomationPanel();
+    }
   }
 }
 
@@ -3282,6 +4117,9 @@ async function cancelRun(runId, card = null) {
       throw new Error(result.error || "Run cancel failed.");
     }
     state.activeRunId = "";
+    clearBrowserApprovalsForRun(runId);
+    setBrowserAutomationStatus("Cancelled", "Run canceled.");
+    renderBrowserAutomationPanel();
     if (card) {
       setApprovalCardBusy(card, true, "Run canceled.");
     }
@@ -3291,6 +4129,8 @@ async function cancelRun(runId, card = null) {
     } else {
       appendMessage("system", `Run cancel failed: ${String(error.message || error)}`);
     }
+    setBrowserAutomationStatus("Cancel Error", `Run cancel failed: ${String(error.message || error)}`);
+    renderBrowserAutomationPanel();
   } finally {
     updateComposerState();
   }
@@ -3489,23 +4329,20 @@ function updateComposerState() {
   const locked = state.busy || Boolean(state.activeRunId);
   const hasActiveRun = Boolean(state.activeRunId);
   const showStop = hasActiveRun;
-  const browserActionSupported = ["codex", "llama", "mlx"].includes(String(backendEl.value || ""));
   const llamaSelected = isLlamaChatBackend();
   sendBtn.disabled = locked;
   promptEl.disabled = locked;
   confirmBtn.disabled = state.busy;
-  if (forceBrowserActionEl) {
-    if (!browserActionSupported && forceBrowserActionEl.checked) {
-      forceBrowserActionEl.checked = false;
-    }
-    forceBrowserActionEl.disabled = locked || !browserActionSupported;
-  }
   if (llamaEnableThinkingEl) {
     llamaEnableThinkingEl.disabled = locked || !llamaSelected;
   }
   const composerGuideBtn = $("composer-read-guide-btn");
   if (composerGuideBtn) {
     composerGuideBtn.disabled = locked || state.toolsBusy;
+  }
+  const composerBrowserBtn = $("composer-read-browser-btn");
+  if (composerBrowserBtn) {
+    composerBrowserBtn.disabled = locked || state.toolsBusy;
   }
   const composerShowBtn = $("composer-read-show-btn");
   if (composerShowBtn) {
@@ -3530,6 +4367,9 @@ function updateComposerState() {
   for (const button of messagesEl.querySelectorAll(".message-edit-btn")) {
     button.disabled = disableEditButtons;
   }
+  renderBrowserPickerPanel();
+  renderBrowserAutomationPanel();
+  renderBrowserNextActionIndicator();
 }
 
 function showRiskConfirm(flags) {

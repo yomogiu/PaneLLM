@@ -503,6 +503,380 @@ class BrowserConfigTest(unittest.TestCase):
         )
 
 
+class BrowserToolCatalogTest(unittest.TestCase):
+    def test_model_browser_tools_expose_compact_catalog(self) -> None:
+        llama_names = {tool["function"]["name"] for tool in local_broker.LLAMA_BROWSER_TOOLS}
+        codex_names = {tool["name"] for tool in local_broker.CODEX_BROWSER_TOOLS}
+
+        self.assertEqual(
+            {"browser.navigate", "browser.tabs", "browser.read", "browser.interact"},
+            llama_names,
+        )
+        self.assertEqual(llama_names, codex_names)
+
+    def test_low_level_browser_tools_remain_available_for_broker_and_mcp(self) -> None:
+        self.assertIn("browser.click", local_broker.BROWSER_COMMAND_METHODS)
+        self.assertIn("browser.find_one", local_broker.PROXIED_BROWSER_TOOL_NAMES)
+        self.assertIn("browser.session_create", local_broker.BROWSER_TOOL_NAMES)
+        self.assertNotIn("browser.tabs", local_broker.BROWSER_TOOL_NAMES)
+        self.assertNotIn("browser.read", local_broker.BROWSER_TOOL_NAMES)
+        self.assertNotIn("browser.interact", local_broker.BROWSER_TOOL_NAMES)
+
+    def test_translate_model_browser_tool_maps_read_find_to_find_one(self) -> None:
+        translated = local_broker.translate_model_browser_tool(
+            "browser.read",
+            {"action": "find", "selector": "#search"},
+        )
+
+        self.assertEqual("browser.find_one", translated["tool_name"])
+        self.assertEqual({"locator": {"selector": "#search"}}, translated["args"])
+        self.assertEqual("auto", translated["approval"])
+
+    def test_translate_model_browser_tool_maps_navigate_new_tab_to_open_tab(self) -> None:
+        translated = local_broker.translate_model_browser_tool(
+            "browser.navigate",
+            {"url": "https://example.com", "newTab": True},
+        )
+
+        self.assertEqual("browser.open_tab", translated["tool_name"])
+        self.assertEqual({"url": "https://example.com"}, translated["args"])
+        self.assertEqual("manual", translated["approval"])
+
+    def test_translate_model_browser_tool_maps_interact_type_to_type(self) -> None:
+        translated = local_broker.translate_model_browser_tool(
+            "browser.interact",
+            {"action": "type", "selector": "#email", "text": "masked-input", "clear": True},
+        )
+
+        self.assertEqual("browser.type", translated["tool_name"])
+        self.assertEqual(
+            {
+                "selector": "#email",
+                "text": "masked-input",
+                "clear": True,
+            },
+            translated["args"],
+        )
+        self.assertEqual("manual", translated["approval"])
+
+
+class BrowserElementContextTest(unittest.TestCase):
+    def test_normalize_browser_element_context_strips_query_and_fragment_from_url(self) -> None:
+        normalized = local_broker.normalize_browser_element_context(
+            {
+                "selector": "#submit",
+                "url": "https://example.com/form?email=masked#submit",
+            }
+        )
+
+        self.assertEqual(
+            {
+                "selector": "#submit",
+                "url": "https://example.com/form",
+            },
+            normalized,
+        )
+
+    def test_normalize_browser_element_context_ignores_textual_payload_fields(self) -> None:
+        normalized = local_broker.normalize_browser_element_context(
+            {
+                "selector": "#submit",
+                "xpath": "//button[@id='submit']",
+                "tagName": "BUTTON",
+                "role": "button",
+                "label": "Save draft",
+                "name": "submit",
+                "placeholder": "Save draft",
+                "url": "https://example.com/form",
+                "title": "Example Form",
+                "tabId": 17,
+                "pickedAt": "2026-03-22T12:00:00Z",
+                "x": 120,
+                "y": 220,
+                "width": 80,
+                "height": 30,
+                "textPreview": "Redacted value",
+                "valuePreview": "Redacted value",
+                "href": "https://example.com/form#submit",
+            }
+        )
+
+        self.assertEqual(
+            {
+                "selector": "#submit",
+                "xpath": "//button[@id='submit']",
+                "tag_name": "button",
+                "role": "button",
+                "label": "Save draft",
+                "name": "submit",
+                "placeholder": "Save draft",
+                "url": "https://example.com/form",
+                "title": "Example Form",
+                "tab_id": 17,
+                "picked_at": "2026-03-22T12:00:00Z",
+                "x": 120,
+                "y": 220,
+                "width": 80,
+                "height": 30,
+            },
+            normalized,
+        )
+
+    def test_format_browser_element_context_is_structural_only(self) -> None:
+        formatted = local_broker.format_browser_element_context(
+            {
+                "selector": "#submit",
+                "xpath": "//button[@id='submit']",
+                "tag_name": "button",
+                "role": "button",
+                "label": "Save draft",
+                "name": "submit",
+                "placeholder": "Save draft",
+                "url": "https://example.com/form",
+                "title": "Example Form",
+                "x": 120,
+                "y": 220,
+                "width": 80,
+                "height": 30,
+                "picked_at": "2026-03-22T12:00:00Z",
+            }
+        )
+
+        self.assertIn("Page title: Example Form", formatted)
+        self.assertIn("Page URL: https://example.com/form", formatted)
+        self.assertIn("CSS selector: #submit", formatted)
+        self.assertIn("XPath: //button[@id='submit']", formatted)
+        self.assertIn("Tag: button", formatted)
+        self.assertIn("Role: button", formatted)
+        self.assertIn("Label: Save draft", formatted)
+        self.assertIn("Name: submit", formatted)
+        self.assertIn("Placeholder: Save draft", formatted)
+        self.assertIn("Bounds: x=120, y=220, width=80, height=30", formatted)
+        self.assertIn("Picked at: 2026-03-22T12:00:00Z", formatted)
+        self.assertNotIn("Text:", formatted)
+        self.assertNotIn("Value:", formatted)
+        self.assertNotIn("Href:", formatted)
+
+    def test_compose_request_prompt_includes_browser_element_context(self) -> None:
+        prompt = local_broker.compose_request_prompt(
+            "Find the submit button.",
+            "Only use the current page.",
+            "Page title: Example",
+            "CSS selector: #submit",
+        )
+
+        self.assertIn("[Selected Browser Element]\nCSS selector: #submit", prompt)
+
+    def test_start_run_stores_normalized_browser_element_context(self) -> None:
+        manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
+
+        with patch.object(local_broker.threading, "Thread", return_value=_FakeThread()):
+            with patch.object(local_broker, "ensure_llama_backend_available", return_value=None):
+                result = manager.start_run(
+                    {
+                        "session_id": "run_browser_element_context",
+                        "backend": "llama",
+                        "prompt": "Click the selected element.",
+                        "browser_element_context": {
+                            "selector": "#submit",
+                            "xpath": "//button[@id='submit']",
+                            "tagName": "BUTTON",
+                            "role": "button",
+                            "label": "Save draft",
+                            "name": "submit",
+                            "placeholder": "Save draft",
+                            "url": "https://example.com/form",
+                            "title": "Example Form",
+                            "tabId": 17,
+                            "pickedAt": "2026-03-22T12:00:00Z",
+                            "x": 120,
+                            "y": 220,
+                            "width": 80,
+                            "height": 30,
+                            "textPreview": "Redacted value",
+                            "valuePreview": "Redacted value",
+                            "href": "https://example.com/form#submit",
+                        },
+                    }
+                )
+
+        run = manager._runs[result["run_id"]]
+        self.assertEqual(
+            {
+                "title": "Example Form",
+                "url": "https://example.com/form",
+                "selector": "#submit",
+                "xpath": "//button[@id='submit']",
+                "tag_name": "button",
+                "role": "button",
+                "label": "Save draft",
+                "name": "submit",
+                "placeholder": "Save draft",
+                "tab_id": 17,
+                "picked_at": "2026-03-22T12:00:00Z",
+                "x": 120,
+                "y": 220,
+                "width": 80,
+                "height": 30,
+            },
+            run["_browser_element_context"],
+        )
+        self.assertNotIn("text_preview", run["_browser_element_context"])
+        self.assertNotIn("value_preview", run["_browser_element_context"])
+        self.assertNotIn("href", run["_browser_element_context"])
+
+    def test_start_run_rejects_invalid_browser_element_context(self) -> None:
+        manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
+
+        with patch.object(local_broker.threading, "Thread", return_value=_FakeThread()):
+            with patch.object(local_broker, "ensure_llama_backend_available", return_value=None):
+                with self.assertRaisesRegex(ValueError, "browser_element_context is invalid"):
+                    manager.start_run(
+                        {
+                            "session_id": "run_invalid_browser_element_context",
+                            "backend": "llama",
+                            "prompt": "Click the selected element.",
+                            "browser_element_context": {"foo": "bar"},
+                        }
+                    )
+
+
+class BrowserRuntimeContextTest(unittest.TestCase):
+    def test_normalize_browser_runtime_context_strips_query_and_fragment_from_url(self) -> None:
+        normalized = local_broker.normalize_browser_runtime_context(
+            {
+                "tabId": "17",
+                "url": "https://example.com/form?search=private#results",
+                "title": "Example Form",
+                "host": "example.com",
+            }
+        )
+
+        self.assertEqual(
+            {
+                "tab_id": 17,
+                "url": "https://example.com/form",
+                "title": "Example Form",
+                "host": "example.com",
+            },
+            normalized,
+        )
+
+    def test_normalize_browser_runtime_context_ignores_content_fields(self) -> None:
+        normalized = local_broker.normalize_browser_runtime_context(
+            {
+                "tabId": "17",
+                "url": "https://example.com/form",
+                "title": "Example Form",
+                "host": "example.com",
+                "allowlisted": True,
+                "active": True,
+                "selection": "sensitive selection",
+                "text_excerpt": "sensitive page text",
+            }
+        )
+
+        self.assertEqual(
+            {
+                "tab_id": 17,
+                "url": "https://example.com/form",
+                "title": "Example Form",
+                "host": "example.com",
+                "allowlisted": True,
+                "active": True,
+            },
+            normalized,
+        )
+
+    def test_format_browser_runtime_context_is_minimal_metadata_only(self) -> None:
+        formatted = local_broker.format_browser_runtime_context(
+            {
+                "tab_id": 17,
+                "url": "https://example.com/form",
+                "title": "Example Form",
+                "host": "example.com",
+                "allowlisted": True,
+                "active": True,
+            }
+        )
+
+        self.assertIn("Tab ID: 17", formatted)
+        self.assertIn("URL: https://example.com/form", formatted)
+        self.assertIn("Title: Example Form", formatted)
+        self.assertIn("Host: example.com", formatted)
+        self.assertIn("Allowlisted: true", formatted)
+        self.assertIn("Active: true", formatted)
+        self.assertNotIn("selection", formatted.lower())
+        self.assertNotIn("text excerpt", formatted.lower())
+
+    def test_compose_request_prompt_includes_browser_runtime_context_without_page_context(self) -> None:
+        runtime_context = local_broker.format_browser_runtime_context(
+            {
+                "tab_id": 17,
+                "url": "https://example.com/form",
+                "title": "Example Form",
+                "host": "example.com",
+                "allowlisted": True,
+                "active": True,
+            }
+        )
+        prompt = local_broker.compose_request_prompt(
+            "Inspect the current page.",
+            "Only use browser tools when needed.",
+            "",
+            "",
+            runtime_context,
+        )
+
+        self.assertIn("https://example.com/form", prompt)
+        self.assertIn("example.com", prompt)
+        self.assertNotIn("[Page Context]", prompt)
+
+    def test_start_run_stores_browser_runtime_context_without_page_context(self) -> None:
+        manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
+
+        with patch.object(local_broker.threading, "Thread", return_value=_FakeThread()):
+            with patch.object(local_broker.EXTENSION_RELAY, "health", return_value={"connected_clients": 1}):
+                with patch.object(local_broker, "ensure_llama_backend_available", return_value=None):
+                    result = manager.start_run(
+                        {
+                            "session_id": "run_browser_runtime_context",
+                            "backend": "llama",
+                            "prompt": "Inspect the current page.",
+                            "allowed_hosts": ["example.com"],
+                            "force_browser_action": True,
+                            "browser_runtime_context": {
+                                "tabId": "17",
+                                "url": "https://example.com/form",
+                                "title": "Example Form",
+                                "host": "example.com",
+                                "allowlisted": True,
+                                "active": True,
+                                "selection": "sensitive selection",
+                                "text_excerpt": "sensitive page text",
+                            },
+                        }
+                    )
+
+        run = manager._runs[result["run_id"]]
+        conversation = local_broker.CONVERSATIONS.get("run_browser_runtime_context")
+
+        self.assertIsNone(run["_page_context"])
+        self.assertEqual(
+            {
+                "tab_id": 17,
+                "url": "https://example.com/form",
+                "title": "Example Form",
+                "host": "example.com",
+                "allowlisted": True,
+                "active": True,
+            },
+            run["_browser_runtime_context"],
+        )
+        self.assertNotIn("browser_runtime_context", conversation["codex"])
+        self.assertIsNone(conversation["codex"].get("page_context_payload"))
+
+
 class CodexRunPersistenceTest(unittest.TestCase):
     def test_run_llama_loop_uses_hidden_prompt_suffix_without_mutating_conversation(self) -> None:
         manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
@@ -552,6 +926,199 @@ class CodexRunPersistenceTest(unittest.TestCase):
             mock_call.call_args.args[0][-1]["content"],
         )
 
+    def test_run_llama_loop_includes_browser_element_context_without_mutating_conversation(self) -> None:
+        manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
+        session_id = "conv_llama_browser_element"
+        prompt = "Use the selected element."
+        conversation = local_broker.CONVERSATIONS.get_or_create(session_id)
+        conversation["messages"] = [{"role": "user", "content": prompt}]
+        stamp = local_broker.now_iso()
+        run = {
+            "run_id": "run_llama_browser_element",
+            "conversation_id": session_id,
+            "backend": "llama",
+            "status": "thinking",
+            "created_at": stamp,
+            "updated_at": stamp,
+            "completed_at": None,
+            "assistant_text": "",
+            "reasoning_text": "",
+            "risk_flags": [],
+            "backend_metadata": {},
+            "pending_approval": None,
+            "events": [],
+            "next_seq": 1,
+            "last_error": None,
+            "cancel_requested": False,
+            "_approval_decision": None,
+            "_prompt": prompt,
+            "_request_prompt_suffix": "",
+            "_page_context": None,
+            "_browser_element_context": {
+                "selector": "#submit",
+                "xpath": "//button[@id='submit']",
+                "tag_name": "button",
+                "role": "button",
+                "label": "Save draft",
+                "name": "submit",
+                "placeholder": "Save draft",
+                "url": "https://example.com/form",
+                "title": "Example Form",
+                "tab_id": 17,
+                "picked_at": "2026-03-22T12:00:00Z",
+                "x": 120,
+                "y": 220,
+                "width": 80,
+                "height": 30,
+            },
+            "_force_browser_action": False,
+            "_allowed_hosts": [],
+            "_llama_request_options": {},
+        }
+
+        with manager._condition:
+            manager._runs[run["run_id"]] = run
+
+        with patch.object(local_broker, "call_llama_stream", return_value=("Final answer.", "")) as mock_call:
+            answer, reasoning = manager._run_llama_loop(run["run_id"])
+
+        self.assertEqual("Final answer.", answer)
+        self.assertEqual("", reasoning)
+        self.assertEqual(prompt, conversation["messages"][-1]["content"])
+        self.assertEqual(
+            (
+                f"{prompt}\n\n[Selected Browser Element]\n"
+                "Tab ID: 17\n"
+                "Page title: Example Form\n"
+                "Page URL: https://example.com/form\n"
+                "CSS selector: #submit\n"
+                "XPath: //button[@id='submit']\n"
+                "Tag: button\n"
+                "Role: button\n"
+                "Label: Save draft\n"
+                "Name: submit\n"
+                "Placeholder: Save draft\n"
+                "Bounds: x=120, y=220, width=80, height=30\n"
+                "Picked at: 2026-03-22T12:00:00Z"
+            ),
+            mock_call.call_args.args[0][-1]["content"],
+        )
+
+    def test_run_llama_loop_includes_browser_runtime_context_without_mutating_conversation(self) -> None:
+        manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
+        session_id = "conv_llama_browser_runtime"
+        prompt = "Inspect the current browser tab."
+        conversation = local_broker.CONVERSATIONS.get_or_create(session_id)
+        conversation["messages"] = [{"role": "user", "content": prompt}]
+        stamp = local_broker.now_iso()
+        run = {
+            "run_id": "run_llama_browser_runtime",
+            "conversation_id": session_id,
+            "backend": "llama",
+            "status": "thinking",
+            "created_at": stamp,
+            "updated_at": stamp,
+            "completed_at": None,
+            "assistant_text": "",
+            "reasoning_text": "",
+            "risk_flags": [],
+            "backend_metadata": {},
+            "pending_approval": None,
+            "events": [],
+            "next_seq": 1,
+            "last_error": None,
+            "cancel_requested": False,
+            "_approval_decision": None,
+            "_prompt": prompt,
+            "_request_prompt_suffix": "",
+            "_page_context": None,
+            "_browser_runtime_context": {
+                "tab_id": 17,
+                "url": "https://example.com/form",
+                "title": "Example Form",
+                "host": "example.com",
+                "allowlisted": True,
+                "active": True,
+            },
+            "_browser_element_context": None,
+            "_force_browser_action": False,
+            "_allowed_hosts": [],
+            "_llama_request_options": {},
+        }
+
+        with manager._condition:
+            manager._runs[run["run_id"]] = run
+
+        with patch.object(local_broker, "call_llama_stream", return_value=("Final answer.", "")) as mock_call:
+            answer, reasoning = manager._run_llama_loop(run["run_id"])
+
+        self.assertEqual("Final answer.", answer)
+        self.assertEqual("", reasoning)
+        self.assertEqual(prompt, conversation["messages"][-1]["content"])
+        self.assertIn("Example Form", mock_call.call_args.args[0][-1]["content"])
+        self.assertIn("https://example.com/form", mock_call.call_args.args[0][-1]["content"])
+        self.assertNotIn("[Page Context]", mock_call.call_args.args[0][-1]["content"])
+
+    def test_run_llama_loop_force_browser_action_does_not_inject_page_context_by_default(self) -> None:
+        manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
+        session_id = "conv_llama_forced_browser_runtime"
+        prompt = "Use browser tools to inspect the current tab."
+        conversation = local_broker.CONVERSATIONS.get_or_create(session_id)
+        conversation["messages"] = [{"role": "user", "content": prompt}]
+        stamp = local_broker.now_iso()
+        run = {
+            "run_id": "run_llama_forced_browser_runtime",
+            "conversation_id": session_id,
+            "backend": "llama",
+            "status": "thinking",
+            "created_at": stamp,
+            "updated_at": stamp,
+            "completed_at": None,
+            "assistant_text": "",
+            "reasoning_text": "",
+            "risk_flags": [],
+            "backend_metadata": {},
+            "pending_approval": None,
+            "events": [],
+            "next_seq": 1,
+            "last_error": None,
+            "cancel_requested": False,
+            "_approval_decision": None,
+            "_prompt": prompt,
+            "_request_prompt_suffix": "",
+            "_page_context": None,
+            "_browser_runtime_context": {
+                "tab_id": 17,
+                "url": "https://example.com/form",
+                "title": "Example Form",
+                "host": "example.com",
+                "allowlisted": True,
+                "active": True,
+            },
+            "_browser_element_context": None,
+            "_force_browser_action": True,
+            "_allowed_hosts": ["example.com"],
+            "_llama_request_options": {},
+        }
+
+        with manager._condition:
+            manager._runs[run["run_id"]] = run
+
+        with patch.object(local_broker.EXTENSION_RELAY, "health", return_value={"connected_clients": 1}):
+            with patch.object(
+                local_broker,
+                "run_llama_browser_agent",
+                return_value="Highlighted the relevant section.",
+            ) as mock_agent:
+                answer, reasoning = manager._run_llama_loop(run["run_id"])
+
+        self.assertEqual("Highlighted the relevant section.", answer)
+        self.assertEqual("", reasoning)
+        self.assertEqual("conv_llama_forced_browser_runtime", mock_agent.call_args.args[0])
+        self.assertIn("Example Form", mock_agent.call_args.args[1][-1]["content"])
+        self.assertIn("https://example.com/form", mock_agent.call_args.args[1][-1]["content"])
+        self.assertNotIn("[Page Context]", mock_agent.call_args.args[1][-1]["content"])
+
     def test_run_llama_loop_wraps_browser_agent_result(self) -> None:
         manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
         conversation = local_broker.CONVERSATIONS.get_or_create("conv_llama_browser_action")
@@ -597,6 +1164,61 @@ class CodexRunPersistenceTest(unittest.TestCase):
         self.assertEqual("", reasoning)
         self.assertEqual("conv_llama_browser_action", mock_agent.call_args.args[0])
 
+    def test_execute_function_call_skips_manual_approval_when_browser_mode_forced(self) -> None:
+        manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
+        stamp = local_broker.now_iso()
+        run = {
+            "run_id": "run_forced_browser_tool",
+            "conversation_id": "conv_forced_browser_tool",
+            "backend": "codex",
+            "status": "thinking",
+            "created_at": stamp,
+            "updated_at": stamp,
+            "completed_at": None,
+            "assistant_text": "",
+            "reasoning_text": "",
+            "risk_flags": [],
+            "backend_metadata": {},
+            "pending_approval": None,
+            "events": [],
+            "next_seq": 1,
+            "last_error": None,
+            "cancel_requested": False,
+            "_approval_decision": None,
+            "_force_browser_action": True,
+            "_browser_session": {"sessionId": "session_1", "capabilityToken": "capability"},
+            "_browser_run": {"runId": "run_remote_1"},
+        }
+
+        with manager._condition:
+            manager._runs[run["run_id"]] = run
+
+        with patch.object(
+            local_broker.BROWSER_AUTOMATION,
+            "execute_tool",
+            return_value={
+                "success": True,
+                "tool": "browser.click",
+                "data": {"ok": True},
+                "error": None,
+                "policy": None,
+            },
+        ) as mock_execute:
+            result = manager._execute_function_call(
+                run["run_id"],
+                {
+                    "name": "browser.interact",
+                    "arguments": json.dumps({"action": "click", "selector": "#submit"}),
+                    "call_id": "call_1",
+                },
+            )
+
+        self.assertEqual("function_call_output", result["type"])
+        self.assertEqual("call_1", result["call_id"])
+        self.assertIsNone(run["pending_approval"])
+        self.assertFalse(any(event["type"] == "waiting_approval" for event in run["events"]))
+        mock_execute.assert_called_once()
+
     def test_finish_run_persists_reasoning_only_assistant_message(self) -> None:
         manager = local_broker.CodexRunManager(local_broker.CONFIG.data_dir)
         stamp = local_broker.now_iso()
@@ -639,6 +1261,135 @@ class CodexRunPersistenceTest(unittest.TestCase):
             ["First thought.", "Second thought."],
             assistant_message["reasoning_blocks"],
         )
+
+
+class BrowserAgentLoopTest(unittest.TestCase):
+    def test_run_local_backend_browser_agent_uses_forced_browser_prompt(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "Done.",
+                        "tool_calls": [],
+                    }
+                }
+            ]
+        }
+
+        with patch.object(local_broker, "ensure_local_backend_available", return_value={"model": "test-model"}):
+            with patch.object(local_broker, "local_backend_settings", return_value={"default_model": "test-model"}):
+                with patch.object(local_broker, "call_local_backend_completion", return_value=response) as mock_call:
+                    with patch.object(local_broker.BROWSER_AUTOMATION, "session_create", return_value={"sessionId": "s1", "capabilityToken": "cap"}):
+                        with patch.object(local_broker.BROWSER_AUTOMATION, "run_start", return_value={"runId": "r1"}):
+                            with patch.object(local_broker.BROWSER_AUTOMATION, "close_session"):
+                                result = local_broker.run_local_backend_browser_agent(
+                                    "session-id",
+                                    [{"role": "user", "content": "Open the page and click the submit button."}],
+                                    ["example.com"],
+                                    1,
+                                    backend="llama",
+                                )
+
+        self.assertEqual("Done.", result)
+        self.assertIn(
+            "Browser action mode is explicitly enabled for this request.",
+            mock_call.call_args.args[1][0]["content"],
+        )
+        self.assertEqual("required", mock_call.call_args.kwargs["tool_choice"])
+        self.assertEqual(
+            local_broker.CONFIG.local_backend_browser_timeout_sec,
+            mock_call.call_args.kwargs["timeout_sec"],
+        )
+
+    def test_run_local_backend_browser_agent_unlimited_mode_allows_multiple_tool_turns(self) -> None:
+        responses = [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "toolcall_1",
+                                    "function": {
+                                        "name": "browser.read",
+                                        "arguments": json.dumps({"action": "page_digest"}),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Done.",
+                            "tool_calls": [],
+                        }
+                    }
+                ]
+            },
+        ]
+
+        with patch.object(local_broker, "ensure_local_backend_available", return_value={"model": "test-model"}):
+            with patch.object(local_broker, "local_backend_settings", return_value={"default_model": "test-model"}):
+                with patch.object(local_broker, "call_local_backend_completion", side_effect=responses) as mock_call:
+                    with patch.object(local_broker.BROWSER_AUTOMATION, "session_create", return_value={"sessionId": "s1", "capabilityToken": "cap"}):
+                        with patch.object(local_broker.BROWSER_AUTOMATION, "run_start", return_value={"runId": "r1"}):
+                            with patch.object(local_broker.BROWSER_AUTOMATION, "execute_tool", return_value={"success": True, "data": {}, "error": None, "policy": None}):
+                                with patch.object(local_broker.BROWSER_AUTOMATION, "close_session"):
+                                    result = local_broker.run_local_backend_browser_agent(
+                                        "session-id",
+                                        [{"role": "user", "content": "Find the page summary."}],
+                                        ["example.com"],
+                                        0,
+                                        backend="llama",
+                                    )
+
+        self.assertEqual("Done.", result)
+        self.assertEqual(2, mock_call.call_count)
+        self.assertEqual("required", mock_call.call_args_list[0].kwargs["tool_choice"])
+        self.assertEqual("auto", mock_call.call_args_list[1].kwargs["tool_choice"])
+
+    def test_run_local_backend_browser_agent_finite_mode_stops_after_one_tool_round(self) -> None:
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "toolcall_1",
+                                "function": {
+                                    "name": "browser.read",
+                                    "arguments": json.dumps({"action": "page_digest"}),
+                                },
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+        with patch.object(local_broker, "ensure_local_backend_available", return_value={"model": "test-model"}):
+            with patch.object(local_broker, "local_backend_settings", return_value={"default_model": "test-model"}):
+                with patch.object(local_broker, "call_local_backend_completion", return_value=response) as mock_call:
+                    with patch.object(local_broker.BROWSER_AUTOMATION, "session_create", return_value={"sessionId": "s1", "capabilityToken": "cap"}):
+                        with patch.object(local_broker.BROWSER_AUTOMATION, "run_start", return_value={"runId": "r1"}):
+                            with patch.object(local_broker.BROWSER_AUTOMATION, "execute_tool", return_value={"success": True, "data": {}, "error": None, "policy": None}):
+                                with patch.object(local_broker.BROWSER_AUTOMATION, "close_session"):
+                                    result = local_broker.run_local_backend_browser_agent(
+                                        "session-id",
+                                        [{"role": "user", "content": "Keep reading."}],
+                                        ["example.com"],
+                                        1,
+                                        backend="llama",
+                                    )
+
+        self.assertEqual("I could not complete the browser task within the allowed number of steps.", result)
+        self.assertEqual(1, mock_call.call_count)
 
 
 if __name__ == "__main__":

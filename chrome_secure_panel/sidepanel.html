@@ -29,10 +29,6 @@
           </select>
         </div>
         <div class="topbar-right">
-          <label class="toggle compact">
-            <input id="force-browser-action" type="checkbox" />
-            <span>Allow page actions</span>
-          </label>
           <span id="context-usage" class="status-badge context-badge hidden">Context: --/--</span>
           <div class="font-scale-controls" role="group" aria-label="Font size">
             <button
@@ -98,13 +94,13 @@
           Chat
         </button>
         <button
-          id="tools-tab-btn"
+          id="browser-tab-btn"
           class="tab-btn"
           role="tab"
           aria-selected="false"
-          aria-controls="tools-view"
+          aria-controls="browser-view"
         >
-          Tools
+          Browser
         </button>
       </nav>
 
@@ -231,6 +227,7 @@
             autocomplete="off"
             placeholder="Message the assistant..."
           ></textarea>
+          <div id="browser-next-action-indicator" class="browser-next-action-indicator hidden" aria-live="polite"></div>
           <div class="composer-row">
             <div id="llama-thinking-controls" class="composer-tools hidden" aria-live="polite">
               <label id="llama-thinking-toggle" class="toggle compact composer-toggle" for="llama-enable-thinking">
@@ -247,11 +244,17 @@
         </footer>
       </section>
 
-      <section id="tools-view" class="view tools-view hidden" role="tabpanel" aria-hidden="true">
+      <section id="browser-view" class="view tools-view hidden" role="tabpanel" aria-hidden="true">
         <section class="tools-card">
           <div class="tools-head">
-            <h2>Tools</h2>
+            <h2>Current Page</h2>
             <button id="tools-refresh-btn" class="ghost small" type="button">Refresh</button>
+          </div>
+          <div class="browser-current-page-meta">
+            <p id="browser-current-page-title" class="browser-current-page-title">No active tab available.</p>
+            <p id="browser-current-page-url" class="browser-current-page-url">
+              Bring a browser tab into focus to inspect the current page.
+            </p>
           </div>
           <p id="tools-policy-status" class="tools-status">Loading page policy...</p>
           <label class="tools-field">
@@ -265,30 +268,53 @@
         </section>
 
         <section class="tools-card">
-          <h3>Browser Agent</h3>
-          <p class="tools-muted">Configure the local llama/MLX browser-agent loop without changing Codex behavior.</p>
-          <label class="tools-field">
-            <span>Agent Max Steps (0 = unlimited)</span>
-            <input id="tools-agent-max-steps" type="number" min="0" step="1" placeholder="0 = unlimited" />
-          </label>
-          <div class="button-row tools-actions">
-            <button id="tools-browser-apply-btn" type="button">Apply Browser Settings</button>
+          <div class="tools-head">
+            <h3>Pick Element</h3>
           </div>
+          <p id="browser-picker-status" class="tools-status">
+            Pick an element on the current allowlisted page to attach browser context to your next message.
+          </p>
+          <div class="button-row tools-actions">
+            <button id="browser-picker-start-btn" type="button">Pick Element</button>
+            <button id="browser-picker-cancel-btn" class="ghost" type="button">Cancel Picker</button>
+          </div>
+          <div id="browser-picked-element" class="browser-picked-element"></div>
+          <div id="browser-picked-history" class="tools-list"></div>
         </section>
 
         <section class="tools-card">
-          <h3>Allowlist</h3>
-          <div id="tools-allowed-list" class="tools-list"></div>
+          <div class="tools-head">
+            <h3>Automation</h3>
+          </div>
+          <p id="browser-automation-status" class="tools-status">Browser actions are idle.</p>
+          <div class="button-row tools-actions">
+            <button id="browser-arm-next-btn" type="button">Use Browser Tools On Next Message</button>
+          </div>
+          <div id="browser-automation-summary" class="browser-automation-summary"></div>
+          <div id="browser-automation-approvals" class="tools-list"></div>
         </section>
 
-        <section class="tools-card">
-          <h3>MCP Servers</h3>
-          <p class="tools-muted">Reserved for MCP server toggles and additional tool controls.</p>
-          <label class="toggle compact">
-            <input id="tools-mcp-placeholder" type="checkbox" disabled />
-            <span>Broker MCP bridge (coming soon)</span>
-          </label>
-        </section>
+        <details class="tools-card browser-advanced-card">
+          <summary class="browser-advanced-summary">Advanced</summary>
+          <div class="browser-advanced-content">
+            <section class="browser-advanced-section">
+              <h3>Browser Agent</h3>
+              <p class="tools-muted">Configure the local llama/MLX browser-agent loop without changing Codex behavior.</p>
+              <label class="tools-field">
+                <span>Agent Max Steps (0 = unlimited)</span>
+                <input id="tools-agent-max-steps" type="number" min="0" step="1" placeholder="0 = unlimited" />
+              </label>
+              <div class="button-row tools-actions">
+                <button id="tools-browser-apply-btn" type="button">Apply Browser Settings</button>
+              </div>
+            </section>
+
+            <section class="browser-advanced-section">
+              <h3>Allowlist</h3>
+              <div id="tools-allowed-list" class="tools-list"></div>
+            </section>
+          </div>
+        </details>
       </section>
     </main>
     <script type="module" src="sidepanel.js"></script>

@@ -808,6 +808,140 @@ body::before {
   color: var(--muted);
 }
 
+.browser-current-page-meta {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid rgba(49, 212, 255, 0.18);
+  border-radius: 12px;
+  background:
+    linear-gradient(145deg, rgba(49, 212, 255, 0.08), rgba(255, 95, 200, 0.05)),
+    rgba(10, 16, 31, 0.92);
+}
+
+.browser-current-page-title,
+.browser-current-page-url {
+  margin: 0;
+}
+
+.browser-current-page-title {
+  font-size: calc(13px * var(--font-scale));
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.browser-current-page-url {
+  margin-top: 4px;
+  font-size: calc(12px * var(--font-scale));
+  line-height: 1.45;
+  color: var(--muted);
+  word-break: break-word;
+}
+
+.browser-picked-element,
+.browser-automation-summary {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.browser-picker-card,
+.browser-approval-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(7, 12, 24, 0.9);
+}
+
+.browser-picker-card {
+  border: 1px solid rgba(49, 212, 255, 0.18);
+}
+
+.browser-approval-card {
+  border: 1px solid rgba(255, 209, 140, 0.28);
+}
+
+.browser-picker-card-title,
+.browser-picker-card-detail,
+.browser-picker-card-meta,
+.browser-approval-title,
+.browser-approval-detail,
+.browser-approval-status,
+.browser-picker-history-detail,
+.browser-automation-line {
+  margin: 0;
+}
+
+.browser-picker-card-title,
+.browser-approval-title {
+  font-size: calc(12px * var(--font-scale));
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.browser-picker-card-detail,
+.browser-picker-history-detail,
+.browser-approval-detail {
+  font-size: calc(12px * var(--font-scale));
+  line-height: 1.45;
+  color: #d7e0fb;
+  word-break: break-word;
+}
+
+.browser-picker-card-meta,
+.browser-approval-status,
+.browser-automation-line {
+  font-size: calc(12px * var(--font-scale));
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.browser-approval-status {
+  color: #ffd8ab;
+}
+
+.browser-advanced-card {
+  padding-top: 0;
+}
+
+.browser-advanced-summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 10px 0;
+  font-size: calc(12px * var(--font-scale));
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #9edfff;
+}
+
+.browser-advanced-summary::-webkit-details-marker {
+  display: none;
+}
+
+.browser-advanced-summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 8px;
+}
+
+.browser-advanced-card[open] .browser-advanced-summary::before {
+  content: "▾";
+}
+
+.browser-advanced-content {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-bottom: 10px;
+}
+
+.browser-advanced-section + .browser-advanced-section {
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
 select,
 textarea,
 button {
@@ -1249,6 +1383,32 @@ button {
   transition: margin-left 180ms ease;
 }
 
+.browser-next-action-indicator {
+  margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.browser-next-action-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(117, 240, 188, 0.34);
+  background:
+    linear-gradient(145deg, rgba(18, 45, 46, 0.96), rgba(13, 29, 38, 0.9)),
+    rgba(255, 255, 255, 0.03);
+  color: #e7fff5;
+  font-size: calc(11px * var(--font-scale));
+  line-height: 1.35;
+}
+
+.browser-next-action-chip .ghost.small {
+  white-space: nowrap;
+}
+
 .composer textarea {
   width: 100%;
   border-radius: 10px;
@@ -1384,6 +1544,17 @@ button.ghost {
 }
 
 button.composer-quick-action.active {
+  border-color: rgba(117, 240, 188, 0.48);
+  background:
+    linear-gradient(145deg, rgba(25, 60, 58, 0.96), rgba(17, 36, 45, 0.9)),
+    rgba(255, 255, 255, 0.03);
+  box-shadow:
+    0 0 0 1px rgba(117, 240, 188, 0.16),
+    0 10px 22px rgba(7, 21, 30, 0.24);
+  color: #e7fff5;
+}
+
+#browser-view button.active {
   border-color: rgba(117, 240, 188, 0.48);
   background:
     linear-gradient(145deg, rgba(25, 60, 58, 0.96), rgba(17, 36, 45, 0.9)),
