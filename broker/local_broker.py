@@ -2103,103 +2103,6 @@ class BrowserProfileStore:
             self._write_json(self._state_path, payload)
             return payload
 
-class AsyncJobStore:
-    def __init__(self, data_dir: Path, kind: str) -> None:
-        self._lock = threading.RLock()
-        self._kind = kind
-        self._root = data_dir / "jobs" / kind
-        self._root.mkdir(parents=True, exist_ok=True)
-
-    def _path(self, job_id: str) -> Path:
-        if not CONVERSATION_ID_RE.match(job_id):
-            raise ValueError("Invalid job id.")
-        return self._root / f"{job_id}.json"
-
-    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
-        tmp.replace(path)
-
-    def _read_json(self, path: Path) -> dict[str, Any]:
-        if not path.exists():
-            raise FileNotFoundError("Job not found.")
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(parsed, dict):
-            raise ValueError("Persisted job payload is invalid.")
-        return parsed
-
-    def create(self, job_type: str, input_summary: dict[str, Any]) -> dict[str, Any]:
-        job_id = f"{self._kind}_job_{uuid.uuid4().hex[:12]}"
-        stamp = now_iso()
-        payload = {
-            "job_id": job_id,
-            "kind": self._kind,
-            "job_type": str(job_type or ""),
-            "status": "queued",
-            "created_at": stamp,
-            "updated_at": stamp,
-            "completed_at": "",
-            "cancel_requested": False,
-            "input_summary": sanitize_value_for_model(input_summary, max_string_chars=6000),
-            "result": None,
-            "error": None,
-        }
-        with self._lock:
-            self._write_json(self._path(job_id), payload)
-        return payload
-
-    def get(self, job_id: str) -> dict[str, Any]:
-        with self._lock:
-            return self._read_json(self._path(job_id))
-
-    def update(self, job_id: str, updates: dict[str, Any]) -> dict[str, Any]:
-        with self._lock:
-            payload = self._read_json(self._path(job_id))
-            payload.update(updates)
-            payload["updated_at"] = now_iso()
-            if payload.get("status") in {"completed", "failed", "cancelled"} and not payload.get("completed_at"):
-                payload["completed_at"] = now_iso()
-            self._write_json(self._path(job_id), payload)
-            return payload
-
-    def cancel(self, job_id: str) -> dict[str, Any]:
-        with self._lock:
-            payload = self._read_json(self._path(job_id))
-            if payload.get("status") in {"completed", "failed", "cancelled"}:
-                return payload
-            payload["cancel_requested"] = True
-            payload["updated_at"] = now_iso()
-            self._write_json(self._path(job_id), payload)
-            return payload
-
-    def is_cancel_requested(self, job_id: str) -> bool:
-        with self._lock:
-            payload = self._read_json(self._path(job_id))
-            return bool(payload.get("cancel_requested"))
-
-    def list_metadata(self, *, status_filter: str = "", limit: int = 20) -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
-        with self._lock:
-            for path in self._root.glob("*.json"):
-                try:
-                    payload = self._read_json(path)
-                except Exception:
-                    continue
-                if status_filter and str(payload.get("status", "")) != status_filter:
-                    continue
-                items.append(payload)
-        items.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)
-        return items[:limit]
-
-    def health(self) -> dict[str, Any]:
-        metadata = self.list_metadata(limit=500)
-        active = sum(1 for item in metadata if str(item.get("status", "")) in {"queued", "running"})
-        return {
-            "total_jobs": len(metadata),
-            "active_jobs": active,
-        }
-
 
 
 
@@ -7095,18 +6998,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
             elif path == "/papers/summary_generate":
                 result = handle_paper_summary_generate(data)
             else:
-                job_cancel_id = self._job_cancel_id_from_path(path)
-                if job_cancel_id:
-                    result = handle_job_cancel(job_cancel_id)
+                run_id, run_action = self._run_parts(path)
+                if run_id and run_action == "approval":
+                    result = handle_run_approval(run_id, data)
+                elif run_id and run_action == "cancel":
+                    result = handle_run_cancel(run_id)
                 else:
-                    run_id, run_action = self._run_parts(path)
-                    if run_id and run_action == "approval":
-                        result = handle_run_approval(run_id, data)
-                    elif run_id and run_action == "cancel":
-                        result = handle_run_cancel(run_id)
-                    else:
-                        self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not Found"})
-                        return
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not Found"})
+                    return
             self._send_json(HTTPStatus.OK, result)
         except Exception as error:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
@@ -7128,12 +7027,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
         if len(parts) == 3 and parts[0] == "runs":
             return parts[1], parts[2]
         return None, None
-
-    def _job_cancel_id_from_path(self, path: str) -> str | None:
-        parts = [unquote(part) for part in path.split("/") if part]
-        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "cancel":
-            return parts[1]
-        return None
 
     def _ensure_trusted(self) -> bool:
         if not is_loopback_client(self.client_address[0]):

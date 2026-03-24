@@ -4921,6 +4921,7 @@ function renderRunEvents(runId, events) {
       runUi.streamedAssistantText = finalAssistantText;
       runUi.streamedReasoningText = finalReasoningText;
       const finalReasoningBlocks = splitReasoningText(finalReasoningText);
+      const hasParsedReasoning = finalReasoningText.trim().length > 0 || finalReasoningBlocks.length > 0;
       if (runUi.allowAssistantBubble && (finalAssistantText || runUi.assistantNode || finalReasoningBlocks.length)) {
         upsertRunAssistantBubble(
           runUi,
@@ -4934,7 +4935,8 @@ function renderRunEvents(runId, events) {
       clearBrowserApprovalsForRun(runId);
       setBrowserAutomationStatus(eventSummary.label, eventSummary.text, eventSummary.detail);
       browserAutomationDirty = true;
-      if (runUi.backend === "codex" && event.type === "completed" && !assistantText && !reasoningText) {
+      if (event.type === "completed" && !hasParsedReasoning) {
+        runUi.allowAssistantBubble = false;
         continue;
       }
       appendRunStatusCard(eventSummary);
