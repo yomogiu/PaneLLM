@@ -6,7 +6,7 @@ Current release target: `v0.1.0`.
 
 ## Demo
 
-- [Watch the demo video](assets/demo.mov)
+- [Watch the demo video](assets/demo.mp4)
 
 ## Architecture
 
