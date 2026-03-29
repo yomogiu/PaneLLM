@@ -24,7 +24,6 @@ BROWSER_LOCATOR_SCHEMA = {
     "additionalProperties": False,
 }
 
-# TODO: deprecate/remove direct low-level model exposure after compact browser tool rollout.
 INTERNAL_BROWSER_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     {
         "name": "browser.navigate",
@@ -343,7 +342,7 @@ INTERNAL_BROWSER_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     },
 )
 
-MODEL_BROWSER_TOOL_SPECS: tuple[dict[str, Any], ...] = (
+LEGACY_MODEL_BROWSER_TOOL_SPECS: tuple[dict[str, Any], ...] = (
     {
         "name": "browser.navigate",
         "description": "Navigate the current tab to an allowlisted absolute URL. Open a new tab only when the user explicitly asks for one or preserving the current page matters.",
@@ -456,6 +455,19 @@ def _copy(value: Any) -> Any:
     return deepcopy(value)
 
 
+def _model_spec_from_internal(spec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": str(spec["name"]),
+        "description": str(spec["description"]),
+        "parameters": _copy(spec["parameters"]),
+    }
+
+
+MODEL_BROWSER_TOOL_SPECS: tuple[dict[str, Any], ...] = tuple(
+    _model_spec_from_internal(spec) for spec in INTERNAL_BROWSER_TOOL_SPECS
+)
+
+
 def proxied_browser_tool_specs() -> list[dict[str, Any]]:
     return [_copy(spec) for spec in INTERNAL_BROWSER_TOOL_SPECS]
 
@@ -463,6 +475,7 @@ def proxied_browser_tool_specs() -> list[dict[str, Any]]:
 PROXIED_BROWSER_TOOL_NAMES = {spec["name"] for spec in INTERNAL_BROWSER_TOOL_SPECS}
 BROWSER_COMMAND_METHODS = {spec["name"]: spec["method"] for spec in INTERNAL_BROWSER_TOOL_SPECS}
 MODEL_BROWSER_TOOL_NAMES = {spec["name"] for spec in MODEL_BROWSER_TOOL_SPECS}
+LEGACY_MODEL_BROWSER_TOOL_NAMES = {spec["name"] for spec in LEGACY_MODEL_BROWSER_TOOL_SPECS}
 INTERNAL_AUTO_APPROVE_TOOL_NAMES = {
     spec["name"] for spec in INTERNAL_BROWSER_TOOL_SPECS if spec["approval"] == "auto"
 }
@@ -524,3 +537,5 @@ def build_mcp_tool_definitions(
 LLAMA_BROWSER_TOOLS = build_openai_function_tools(MODEL_BROWSER_TOOL_SPECS)
 CODEX_BROWSER_TOOLS = build_responses_function_tools(LLAMA_BROWSER_TOOLS)
 PROXIED_TOOL_DEFINITIONS = build_mcp_tool_definitions(INTERNAL_BROWSER_TOOL_SPECS)
+LEGACY_LLAMA_BROWSER_TOOLS = build_openai_function_tools(LEGACY_MODEL_BROWSER_TOOL_SPECS)
+LEGACY_CODEX_BROWSER_TOOLS = build_responses_function_tools(LEGACY_LLAMA_BROWSER_TOOLS)

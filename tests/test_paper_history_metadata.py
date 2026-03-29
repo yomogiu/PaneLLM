@@ -394,6 +394,76 @@ class PaperHistoryMetadataBrokerTest(unittest.TestCase):
         self.assertIn("paper_unversioned", conversation_ids)
         self.assertNotIn("paper_v1", conversation_ids)
 
+    def test_paper_memory_query_filters_to_matching_entries(self) -> None:
+        root = self._make_root("paper-memory-match-filter-")
+        conversations = local_broker.ConversationStore(root)
+        papers = local_broker.PaperStateStore(root)
+        config = replace(local_broker.CONFIG, data_dir=root)
+
+        with patch.object(local_broker, "CONFIG", config):
+            with patch.object(local_broker, "CONVERSATIONS", conversations):
+                with patch.object(local_broker, "PAPERS", papers):
+                    with patch.object(local_broker, "now_iso", side_effect=self._monotonic_now_iso()):
+                        self._seed_versioned_conversation(
+                            conversations,
+                            "paper_v2",
+                            "2507.20534",
+                            "v2",
+                            focus_text="Sparse expert routing keeps compute efficient.",
+                        )
+                        self._seed_versioned_conversation(
+                            conversations,
+                            "paper_unversioned",
+                            "2507.20534",
+                            "",
+                            focus_text="General note about Kimi K2 routing.",
+                        )
+                        papers.store_summary_result(
+                            "arxiv",
+                            "2507.20534",
+                            canonical_url="https://arxiv.org/abs/2507.20534",
+                            title="Kimi K2: Open Agentic Intelligence",
+                            conversation_id="paper_v2",
+                            paper_version="v2",
+                            summary="Sparse expert routing is the key scaling mechanism in v2.",
+                        )
+                        papers.add_highlight(
+                            "arxiv",
+                            "2507.20534",
+                            canonical_url="https://arxiv.org/abs/2507.20534",
+                            title="Kimi K2: Open Agentic Intelligence",
+                            highlight={
+                                "kind": "explain_selection",
+                                "selection": "Sparse expert routing keeps compute efficient.",
+                                "prompt": "Why does sparse expert routing matter?",
+                                "response": "It routes tokens through a smaller active subset of the network.",
+                                "paper_version": "v2",
+                                "conversation_id": "paper_v2",
+                                "created_at": local_broker.now_iso(),
+                            },
+                        )
+
+                        result = local_broker.handle_paper_memory_query(
+                            {
+                                "paper": {
+                                    "source": "arxiv",
+                                    "paper_id": "2507.20534",
+                                    "canonical_url": "https://arxiv.org/abs/2507.20534",
+                                    "title": "Kimi K2: Open Agentic Intelligence",
+                                    "paper_version": "v2",
+                                    "versioned_url": "https://arxiv.org/abs/2507.20534v2",
+                                },
+                                "query": "smaller active subset",
+                                "limit": 10,
+                            }
+                        )
+
+        self.assertEqual(["highlight"], [item["kind"] for item in result["results"]])
+        self.assertEqual(
+            "Sparse expert routing keeps compute efficient. It routes tokens through a smaller active subset of the network.",
+            result["results"][0]["snippet"],
+        )
+
     def test_paper_memory_query_excludes_requested_conversation(self) -> None:
         root = self._make_root("paper-memory-exclude-")
         conversations = local_broker.ConversationStore(root)

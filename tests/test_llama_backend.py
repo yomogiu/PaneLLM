@@ -16,7 +16,7 @@ IMPORT_DATA_DIR = tempfile.mkdtemp(prefix="assist-test-import-broker-")
 atexit.register(shutil.rmtree, IMPORT_DATA_DIR, ignore_errors=True)
 os.environ["BROKER_DATA_DIR"] = IMPORT_DATA_DIR
 
-from broker import local_broker
+from broker import browser_tools, local_broker
 
 
 class _FakeJsonResponse:
@@ -504,14 +504,12 @@ class BrowserConfigTest(unittest.TestCase):
 
 
 class BrowserToolCatalogTest(unittest.TestCase):
-    def test_model_browser_tools_expose_compact_catalog(self) -> None:
+    def test_model_browser_tools_match_canonical_low_level_catalog(self) -> None:
         llama_names = {tool["function"]["name"] for tool in local_broker.LLAMA_BROWSER_TOOLS}
         codex_names = {tool["name"] for tool in local_broker.CODEX_BROWSER_TOOLS}
+        proxied_names = {tool["name"] for tool in browser_tools.PROXIED_TOOL_DEFINITIONS}
 
-        self.assertEqual(
-            {"browser.navigate", "browser.tabs", "browser.read", "browser.interact"},
-            llama_names,
-        )
+        self.assertEqual(proxied_names, llama_names)
         self.assertEqual(llama_names, codex_names)
 
     def test_low_level_browser_tools_remain_available_for_broker_and_mcp(self) -> None:
@@ -521,6 +519,14 @@ class BrowserToolCatalogTest(unittest.TestCase):
         self.assertNotIn("browser.tabs", local_broker.BROWSER_TOOL_NAMES)
         self.assertNotIn("browser.read", local_broker.BROWSER_TOOL_NAMES)
         self.assertNotIn("browser.interact", local_broker.BROWSER_TOOL_NAMES)
+
+    def test_legacy_compact_catalog_remains_available_for_translation_compatibility(self) -> None:
+        legacy_names = {tool["function"]["name"] for tool in browser_tools.LEGACY_LLAMA_BROWSER_TOOLS}
+
+        self.assertEqual(
+            {"browser.navigate", "browser.tabs", "browser.read", "browser.interact"},
+            legacy_names,
+        )
 
     def test_translate_model_browser_tool_maps_read_find_to_find_one(self) -> None:
         translated = local_broker.translate_model_browser_tool(

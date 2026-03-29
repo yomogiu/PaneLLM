@@ -6,7 +6,7 @@ Current release target: `v0.1.0`.
 
 ## Demo
 
-- [Watch the demo video](assets/demo.mp4)
+- [Watch the demo video](https://raw.githubusercontent.com/yomogiu/PaneLLM/main/assets/demo.mp4)
 
 ## Architecture
 
@@ -21,12 +21,16 @@ Chrome Side Panel (UI + user actions)
 ### Core components
 
 - `broker/local_broker.py`
-  - Single-process HTTP control plane and API entrypoint.
-  - Owns run lifecycle, browser tool policy, extension relay, and persistence orchestration.
+  - Single-process HTTP control plane, composition root, and compatibility façade.
+  - Owns run lifecycle, browser tool policy, extension relay, persistence orchestration, and HTTP routing.
+- `broker/backends/`
+  - Backend-specific execution adapters for local models, Codex CLI, and OpenAI Responses.
+  - Keeps transport/protocol logic out of `broker/local_broker.py` while preserving the public broker surface.
 - `broker/browser_tools.py`
   - Canonical browser tool catalog used by broker-native and MCP-exposed tool calls.
 - `chrome_secure_panel/`
-  - MV3 side panel extension (`sidepanel.js`, `background.js`, `manifest.json`).
+  - MV3 side panel extension (`background.js`, `manifest.json`, and plain `src/sidepanel/*` scripts).
+  - UI logic is split by workflow under `src/sidepanel/` instead of one monolithic `sidepanel.js`.
   - Polls broker state, submits runs, manages the relay loop, and renders Chat/Tools/History UI.
 - `tools/mcp-servers/browser-use/server.py`
   - MCP wrapper over broker browser tools (`/browser/tools/call`).

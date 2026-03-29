@@ -5,6 +5,22 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Secure Assistant Chat</title>
     <link rel="stylesheet" href="sidepanel.css" />
+    <script defer src="src/sidepanel/app/state.js"></script>
+    <script defer src="src/sidepanel/app/dom.js"></script>
+    <script defer src="src/sidepanel/paper/workspace.js"></script>
+    <script defer src="src/sidepanel/composer/composer.js"></script>
+    <script defer src="src/sidepanel/browser/workspace.js"></script>
+    <script defer src="src/sidepanel/history/history.js"></script>
+    <script defer src="src/sidepanel/chat/markdown.js"></script>
+    <script defer src="src/sidepanel/chat/messages.js"></script>
+    <script defer src="src/sidepanel/chat/runs.js"></script>
+    <script defer src="src/sidepanel/shared/text.js"></script>
+    <script defer src="src/sidepanel/api/runtime.js"></script>
+    <script defer src="src/sidepanel/paper/model.js"></script>
+    <script defer src="src/sidepanel/browser/profiles.js"></script>
+    <script defer src="src/sidepanel/ui/font_scale.js"></script>
+    <script defer src="src/sidepanel/ui/theme.js"></script>
+    <script defer src="src/sidepanel/app/init.js"></script>
   </head>
   <body>
     <main class="app">
@@ -26,6 +42,11 @@
             <option value="codex" selected>Codex</option>
             <option value="llama">llama.cpp</option>
             <option value="mlx">MLX Local</option>
+          </select>
+          <select id="theme-select" class="topbar-select" autocomplete="off" aria-label="Color theme">
+            <option value="vaporwave">Vaporwave</option>
+            <option value="light">Light</option>
+            <option value="dark" selected>Dark</option>
           </select>
         </div>
         <div class="topbar-right">
@@ -342,6 +363,5 @@
         </details>
       </section>
     </main>
-    <script type="module" src="sidepanel.js"></script>
   </body>
 </html>
