@@ -37,6 +37,7 @@ const state = {
   conversationList: [],
   historyOpen: false,
   historyPinned: false,
+  pinnedConversationIds: [],
   brokerHealth: null,
   availableBackends: [],
   busy: false,

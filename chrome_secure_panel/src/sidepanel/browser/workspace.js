@@ -910,12 +910,33 @@ async function allowActiveTabHost() {
 }
 
 function createHistoryItem(conversation, selectedId) {
-  const button = document.createElement("button");
-  button.className = `history-item${conversation.id === selectedId ? " active" : ""}`;
-  button.addEventListener("click", async () => {
-    await loadConversation(conversation.id);
+  const conversationId = String(conversation?.id || "").trim();
+  const isActive = String(selectedId || "") === conversationId;
+  const isPinned = isConversationPinned(conversationId);
+  const titleText = getConversationHistoryTitle(conversation);
+  const closeAndLoadConversation = async () => {
+    if (!conversationId) {
+      return;
+    }
+    await loadConversation(conversationId);
     if (!state.historyPinned) {
       closeHistoryPanel();
+    }
+  };
+
+  const item = document.createElement("div");
+  item.className = `history-item${isActive ? " active" : ""}${isPinned ? " pinned" : ""}`;
+  item.setAttribute("role", "button");
+  item.setAttribute("tabindex", "0");
+  item.setAttribute("aria-label", `Open chat: ${titleText}`);
+  item.setAttribute("aria-current", String(isActive));
+  item.addEventListener("click", async () => {
+    await closeAndLoadConversation();
+  });
+  item.addEventListener("keydown", async (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      await closeAndLoadConversation();
     }
   });
 
@@ -924,50 +945,71 @@ function createHistoryItem(conversation, selectedId) {
 
   const title = document.createElement("span");
   title.className = "history-title";
-  title.textContent = getConversationHistoryTitle(conversation);
+  title.textContent = titleText;
   header.appendChild(title);
 
-  const metaRow = document.createElement("div");
-  metaRow.className = "history-meta-row";
+  const menu = document.createElement("details");
+  menu.className = "history-item-menu";
 
-  const badges = document.createElement("div");
-  badges.className = "history-badges";
+  const menuToggle = document.createElement("summary");
+  menuToggle.className = "history-item-menu-toggle";
+  menuToggle.textContent = "⋮";
+  menuToggle.setAttribute("aria-label", `Conversation actions for ${titleText}`);
+  menuToggle.setAttribute("title", "Conversation actions");
+  menuToggle.addEventListener("click", (event) => {
+    event.stopPropagation();
+  });
+  menuToggle.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.stopPropagation();
+    }
+  });
+  menu.appendChild(menuToggle);
 
-  const version = getConversationHistoryVersionLabel(conversation);
-  if (version) {
-    const versionBadge = document.createElement("span");
-    versionBadge.className = "status-badge history-badge";
-    versionBadge.textContent = version;
-    badges.appendChild(versionBadge);
-  }
+  menu.addEventListener("toggle", () => {
+    if (!menu.open || !historyListEl) {
+      return;
+    }
+    for (const openMenu of historyListEl.querySelectorAll("details.history-item-menu[open]")) {
+      if (openMenu !== menu) {
+        openMenu.open = false;
+      }
+    }
+  });
 
-  const kind = getConversationHistoryKindLabel(conversation);
-  if (kind) {
-    const kindBadge = document.createElement("span");
-    kindBadge.className = "status-badge history-badge";
-    kindBadge.textContent = kind;
-    badges.appendChild(kindBadge);
-  }
+  const menuList = document.createElement("div");
+  menuList.className = "history-item-menu-list";
 
-  metaRow.appendChild(badges);
+  const pinAction = document.createElement("button");
+  pinAction.type = "button";
+  pinAction.className = "history-item-menu-action ghost small";
+  pinAction.textContent = isPinned ? "Unpin" : "Pin";
+  pinAction.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    menu.open = false;
+    toggleHistoryConversationPin(conversationId);
+    renderHistory(state.sessionId);
+  });
 
-  const meta = document.createElement("span");
-  meta.className = "history-meta";
-  const count = Number(conversation.message_count || 0);
-  meta.textContent = `${count} msg • ${formatTime(conversation.updated_at)}`;
-  metaRow.appendChild(meta);
+  const deleteAction = document.createElement("button");
+  deleteAction.type = "button";
+  deleteAction.className = "history-item-menu-action ghost small history-item-menu-action-danger";
+  deleteAction.textContent = "Delete permanently";
+  deleteAction.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    menu.open = false;
+    await deleteConversationById(conversationId);
+  });
 
-  const detailText = getConversationHistoryDetail(conversation);
-  const detail = document.createElement("span");
-  detail.className = "history-detail";
-  detail.textContent = detailText;
+  menuList.appendChild(pinAction);
+  menuList.appendChild(deleteAction);
+  menu.appendChild(menuList);
 
-  button.appendChild(header);
-  button.appendChild(metaRow);
-  if (detailText) {
-    button.appendChild(detail);
-  }
-  return button;
+  header.appendChild(menu);
+  item.appendChild(header);
+  return item;
 }
 
 function appendHistorySection(label, conversations, selectedId) {
@@ -988,4 +1030,3 @@ function appendHistorySection(label, conversations, selectedId) {
 
   historyListEl.appendChild(section);
 }
-

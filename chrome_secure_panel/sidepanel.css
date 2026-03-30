@@ -943,11 +943,11 @@ input:not([type="checkbox"]) {
   border: 1px solid var(--border-soft);
   border-radius: 10px;
   background: var(--history-item-bg);
-  padding: 8px 9px;
+  padding: 6px 8px;
   color: var(--text);
   text-align: left;
-  display: grid;
-  gap: 5px;
+  display: block;
+  cursor: pointer;
 }
 
 .history-item-header {
@@ -962,9 +962,18 @@ input:not([type="checkbox"]) {
   filter: brightness(1.08);
 }
 
+.history-item:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: 2px;
+}
+
 .history-item.active {
   border-color: var(--history-item-active-border);
   background: var(--history-item-active-bg);
+}
+
+.history-item.pinned {
+  border-color: var(--history-item-active-border);
 }
 
 .history-title {
@@ -975,9 +984,90 @@ input:not([type="checkbox"]) {
   text-overflow: ellipsis;
 }
 
-.history-meta-row {
-  display: flex;
+.history-item-menu {
+  position: relative;
+  align-self: flex-start;
+  flex-shrink: 0;
+}
+
+.history-item-menu,
+.history-item-menu summary {
+  list-style: none;
+}
+
+.history-item-menu summary::-webkit-details-marker {
+  display: none;
+}
+
+.history-item-menu-toggle {
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 8px;
+  display: inline-flex;
   align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0;
+  background: transparent;
+}
+
+.history-item-menu-toggle:hover {
+  background: var(--button-bg);
+  color: var(--text);
+}
+
+.history-item-menu-toggle:focus-visible {
+  outline: 2px solid var(--focus-outline);
+  outline-offset: 1px;
+}
+
+.history-item-menu-list {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 30;
+  width: max-content;
+  min-width: 150px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--history-panel-bg);
+  box-shadow: var(--shadow-popover);
+  display: none;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.history-item-menu[open] .history-item-menu-list {
+  display: flex;
+}
+
+.history-item-menu-action {
+  width: 100%;
+  justify-content: flex-start;
+  text-align: left;
+  border: none;
+  border-radius: 8px;
+}
+
+.history-item-menu-action-danger {
+  color: var(--text-danger);
+}
+
+.history-item-menu-action:hover {
+  filter: brightness(1.08);
+}
+
+.history-badges,
+.history-meta-row,
+.history-meta,
+.history-detail {
+  display: none;
+}
   justify-content: space-between;
   gap: 8px;
   min-width: 0;

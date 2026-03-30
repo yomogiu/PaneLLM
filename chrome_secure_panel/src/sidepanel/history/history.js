@@ -1,5 +1,76 @@
+function normalizeHistoryConversationId(rawId) {
+  return String(rawId || "").trim();
+}
+
+function getConversationPinStateSet() {
+  const source = Array.isArray(state.pinnedConversationIds) ? state.pinnedConversationIds : [];
+  const pinnedIds = new Set();
+  for (const pinnedId of source) {
+    const normalized = normalizeHistoryConversationId(pinnedId);
+    if (normalized) {
+      pinnedIds.add(normalized);
+    }
+  }
+  return pinnedIds;
+}
+
+function isConversationPinned(conversationId) {
+  return getConversationPinStateSet().has(normalizeHistoryConversationId(conversationId));
+}
+
+function setConversationPinned(conversationId, pinned) {
+  const id = normalizeHistoryConversationId(conversationId);
+  if (!id) {
+    return;
+  }
+  const pinnedIds = getConversationPinStateSet();
+  if (pinned) {
+    pinnedIds.add(id);
+  } else {
+    pinnedIds.delete(id);
+  }
+  state.pinnedConversationIds = [...pinnedIds];
+}
+
+function syncConversationPinnedState() {
+  const conversationIds = new Set(
+    (Array.isArray(state.conversationList) ? state.conversationList : [])
+      .map((conversation) => normalizeHistoryConversationId(conversation?.id))
+      .filter(Boolean)
+  );
+  const pinnedIds = getConversationPinStateSet();
+  const nextPinnedIds = [...pinnedIds].filter((id) => conversationIds.has(id));
+  if (nextPinnedIds.length !== pinnedIds.size) {
+    state.pinnedConversationIds = nextPinnedIds;
+  }
+}
+
+function prioritizePinnedConversations(conversations = []) {
+  const pinnedSet = getConversationPinStateSet();
+  if (!Array.isArray(conversations) || conversations.length === 0) {
+    return [];
+  }
+  const seen = new Set();
+  const pinned = [];
+  const unpinned = [];
+  for (const conversation of conversations) {
+    const id = normalizeHistoryConversationId(conversation?.id);
+    if (!id || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    if (pinnedSet.has(id)) {
+      pinned.push(conversation);
+    } else {
+      unpinned.push(conversation);
+    }
+  }
+  return [...pinned, ...unpinned];
+}
+
 function renderHistory(selectedId) {
   historyListEl.textContent = "";
+  syncConversationPinnedState();
   const visibleWorkspace = getVisiblePaperWorkspace();
   const relatedPaperChats = Array.isArray(visibleWorkspace?.conversations) ? visibleWorkspace.conversations : [];
   const relatedIds = new Set(relatedPaperChats.map((conversation) => String(conversation?.id || "")));
@@ -24,12 +95,13 @@ function renderHistory(selectedId) {
       const version = normalizePaperVersionLabel(paper?.paper_version || "");
       return version !== activeVersion;
     });
-    appendHistorySection("This Version", sameVersionChats, selectedId);
-    appendHistorySection("Same Paper", samePaperOtherVersionChats, selectedId);
+    appendHistorySection("This Version", prioritizePinnedConversations(sameVersionChats), selectedId);
+    appendHistorySection("Same Paper", prioritizePinnedConversations(samePaperOtherVersionChats), selectedId);
   } else {
-    appendHistorySection("This Paper", relatedPaperChats, selectedId);
+    appendHistorySection("This Paper", prioritizePinnedConversations(relatedPaperChats), selectedId);
   }
-  appendHistorySection(relatedPaperChats.length ? "All Chats" : "Chats", remainingChats.length ? remainingChats : state.conversationList, selectedId);
+  const otherChats = remainingChats.length ? remainingChats : state.conversationList;
+  appendHistorySection(relatedPaperChats.length ? "All Chats" : "Chats", prioritizePinnedConversations(otherChats), selectedId);
 }
 
 async function loadConversation(sessionId, options = {}) {
@@ -80,16 +152,22 @@ async function loadConversation(sessionId, options = {}) {
   }
 }
 
-async function deleteCurrentConversation() {
-  const id = state.sessionId;
-  const exists = state.conversationList.some((item) => item.id === id);
+async function deleteConversationById(conversationId) {
+  const id = normalizeHistoryConversationId(conversationId);
+  const exists = state.conversationList.some((item) => normalizeHistoryConversationId(item?.id) === id);
   if (!exists) {
-    startNewSession("Current chat is unsaved. Started a new chat.");
+    if (id === normalizeHistoryConversationId(state.sessionId)) {
+      startNewSession("Current chat is unsaved. Started a new chat.");
+    } else {
+      appendMessage("system", "Conversation not found.");
+    }
     return;
   }
+  const selectedConversation = state.conversationList.find((item) => normalizeHistoryConversationId(item?.id) === id) || null;
+  const title = selectedConversation ? getConversationHistoryTitle(selectedConversation) : "this conversation";
   const accepted = await requestActionConfirm({
     title: "Delete Chat?",
-    text: "Delete this conversation permanently? This cannot be undone.",
+    text: `Delete "${title}" permanently? This cannot be undone.`,
     confirmLabel: "Delete"
   });
   if (!accepted) {
@@ -103,15 +181,30 @@ async function deleteCurrentConversation() {
     if (!result.ok) {
       throw new Error(result.error || "Delete failed.");
     }
+    setConversationPinned(id, false);
     await refreshHistory();
-    if (state.conversationList.length > 0) {
-      await loadConversation(state.conversationList[0].id);
-    } else {
-      startNewSession("Conversation deleted.");
+    if (id === state.sessionId) {
+      if (state.conversationList.length > 0) {
+        await loadConversation(state.conversationList[0].id);
+      } else {
+        startNewSession("Conversation deleted.");
+      }
     }
   } catch (error) {
     appendMessage("system", `Delete failed: ${String(error.message || error)}`);
   }
+}
+
+async function deleteCurrentConversation() {
+  await deleteConversationById(state.sessionId);
+}
+
+function toggleHistoryConversationPin(conversationId) {
+  const id = normalizeHistoryConversationId(conversationId);
+  if (!id) {
+    return;
+  }
+  setConversationPinned(id, !isConversationPinned(id));
 }
 
 function getConversationBubbleCount() {
@@ -247,4 +340,3 @@ function startNewSession(message = "Started a new chat.") {
   updateComposerState();
   void refreshPaperState();
 }
-
