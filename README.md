@@ -138,7 +138,19 @@ You need three things before the side panel will answer:
 python3 scripts/check_macos.py
 ```
 
-### 2) Configure and start a backend
+### 2) Quick launch (recommended)
+
+From the repo root:
+
+```bash
+./scripts/launch_assist.sh
+```
+
+The script checks prerequisites, prints backend guidance, and starts `broker/local_broker.py`.
+
+Then configure one backend as needed and restart the script:
+
+### 3) Configure and start a backend
 
 Codex Responses:
 
@@ -171,7 +183,7 @@ python3 broker/local_broker.py
 
 If your MLX server requires auth, also set `MLX_API_KEY`.
 
-### 3) Verify broker health
+### 4) Verify broker health
 
 ```bash
 curl -i \
@@ -185,14 +197,14 @@ Expected response clues:
 - `codex_backend: cli_ready` when logged-in local `codex` CLI is available
 - `codex_backend: disabled` if no Codex path is configured
 
-### 4) Load Chrome extension
+### 5) Load Chrome extension
 
 1. Open `chrome://extensions`
 2. Enable **Developer mode**
 3. Click **Load unpacked**
 4. Select `chrome_secure_panel/`
 
-### 5) First run
+### 6) First run
 
 Open side panel, confirm broker status is online, and send a prompt. If browser actions will be used, confirm host allowlist in **Tools** first.
 
