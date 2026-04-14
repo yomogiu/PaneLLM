@@ -4,10 +4,6 @@ Local-first assistant stack with a localhost broker, a Chrome side panel UI, and
 
 Current release target: `v0.1.0`.
 
-## Demo
-
-- [Watch the demo video](https://raw.githubusercontent.com/yomogiu/PaneLLM/main/assets/demo.mp4)
-
 ## Architecture
 
 ```
